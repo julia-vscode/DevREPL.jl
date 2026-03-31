@@ -15,6 +15,9 @@ using .TestItemControllers.JSON
 using .PrecompileTools: @compile_workload, @setup_workload
 using Logging
 using Dates
+import UUIDs
+
+include("dashboard.jl")
 
 # ── Logging filter (suppress TestItemControllers below Warn) ──────────
 
@@ -59,9 +62,9 @@ end
 struct TestrunResultTestitemProfile
     profile_name::String
     status::Symbol
-    duration::Union{Float64,Missing}
-    messages::Union{Vector{TestrunResultMessage},Missing}
-    output::Union{String,Missing}
+    duration::Union{Nothing,Float64}
+    messages::Union{Nothing,Vector{TestrunResultMessage}}
+    output::Union{Nothing,String}
 end
 
 struct TestrunResultTestitem
@@ -99,6 +102,7 @@ mutable struct RunContext
     responses::Vector{Any}
     outputs::Dict{String,Vector{String}}
     launch_header_printed::Bool
+    dashboard_state::Union{Nothing,DashboardState}
 end
 
 # ── Run history ───────────────────────────────────────────────────────
@@ -125,6 +129,7 @@ mutable struct TestItemRunner
     run_counter::Ref{Int}
     max_history::Int
     reactor_task::Union{Nothing,Task}
+    test_env_by_id::Dict{String,TestItemControllers.TestEnvironment}
 end
 
 function TestItemRunner(controller::TestItemController; max_history::Int=20)
@@ -138,6 +143,7 @@ function TestItemRunner(controller::TestItemController; max_history::Int=20)
         Ref(0),
         max_history,
         nothing,
+        Dict{String,TestItemControllers.TestEnvironment}(),
     )
 end
 
@@ -223,8 +229,8 @@ function _build_result_from_context(runner::TestItemRunner, testrun_id::String, 
                 ti.testenvironment.name,
                 ti.result.status,
                 ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === missing ? URI("") : URI(msg.uri), coalesce(msg.line, 0), coalesce(msg.column, 0)) for msg in ti.result.messages],
-                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
+                ti.result.messages === nothing ? nothing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
+                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : nothing
             )]
         ) for ti in ctx.responses
     ]
@@ -253,50 +259,108 @@ function get_runner()
         _g_runner[] !== nothing && return _g_runner[]
 
         callbacks = TestItemControllers.ControllerCallbacks(
-            on_testitem_started = (testrun_id, testitem_id) -> nothing,
-            on_testitem_passed = (testrun_id, testitem_id, duration) -> begin
+            on_testitem_started = (testrun_id, testitem_id, test_env_id) -> begin
+                ctx = get_run_context(testrun_id)
+                ctx === nothing && return
+                ds = ctx.dashboard_state
+                if ds !== nothing
+                    testitem = ctx.testitems_by_id[testitem_id]
+                    dashboard_push_testitem!(ds, DashboardTestItem(
+                        testitem.label, string(testitem.uri), ctx.environment_name,
+                        :running, nothing, String[], ""))
+                end
+            end,
+            on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_success += 1
                 testitem = ctx.testitems_by_id[testitem_id]
                 if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
+                    duration_string = duration !== nothing ? " ($(duration)ms)" : ""
                     println("✓ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → passed$duration_string")
                 end
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:passed, messages=missing, duration=duration)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:passed, messages=nothing, duration=duration)))
+                ds = ctx.dashboard_state
+                if ds !== nothing
+                    lock(ds.lock) do
+                        ds.count_success = ctx.count_success
+                        idx = findlast(t -> t.name == testitem.label && t.status == :running, ds.testitems)
+                        if idx !== nothing
+                            ds.testitems[idx].status = :passed
+                            ds.testitems[idx].duration = duration !== nothing ? Float64(duration) : nothing
+                        end
+                    end
+                    dashboard_push_log_entry!(ds, DashboardLogEntry(
+                        testitem.label, ctx.environment_name, :passed,
+                        duration !== nothing ? Float64(duration) : nothing, ""))
+                end
             end,
-            on_testitem_failed = (testrun_id, testitem_id, messages, duration) -> begin
+            on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_fail += 1
                 testitem = ctx.testitems_by_id[testitem_id]
                 if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
+                    duration_string = duration !== nothing ? " ($(duration)ms)" : ""
                     println("✗ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → failed$duration_string")
                 end
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
                 push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:failed, messages=messages, duration=duration)))
+                ds = ctx.dashboard_state
+                if ds !== nothing
+                    msg_strs = messages !== nothing ? [string(m.message) for m in messages] : String[]
+                    lock(ds.lock) do
+                        ds.count_fail = ctx.count_fail
+                        idx = findlast(t -> t.name == testitem.label && t.status == :running, ds.testitems)
+                        if idx !== nothing
+                            ds.testitems[idx].status = :failed
+                            ds.testitems[idx].duration = duration !== nothing ? Float64(duration) : nothing
+                            ds.testitems[idx].messages = msg_strs
+                        end
+                    end
+                    summary_msg = isempty(msg_strs) ? "" : first(split(msg_strs[1], '\n'))
+                    dashboard_push_log_entry!(ds, DashboardLogEntry(
+                        testitem.label, ctx.environment_name, :failed,
+                        duration !== nothing ? Float64(duration) : nothing, summary_msg))
+                end
             end,
-            on_testitem_errored = (testrun_id, testitem_id, messages, duration) -> begin
+            on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_error += 1
                 testitem = ctx.testitems_by_id[testitem_id]
                 if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
+                    duration_string = duration !== nothing ? " ($(duration)ms)" : ""
                     println("✗ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → errored$duration_string")
                 end
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
                 push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:errored, messages=messages, duration=duration)))
+                ds = ctx.dashboard_state
+                if ds !== nothing
+                    msg_strs = messages !== nothing ? [string(m.message) for m in messages] : String[]
+                    lock(ds.lock) do
+                        ds.count_error = ctx.count_error
+                        idx = findlast(t -> t.name == testitem.label && t.status == :running, ds.testitems)
+                        if idx !== nothing
+                            ds.testitems[idx].status = :errored
+                            ds.testitems[idx].duration = duration !== nothing ? Float64(duration) : nothing
+                            ds.testitems[idx].messages = msg_strs
+                        end
+                    end
+                    summary_msg = isempty(msg_strs) ? "" : first(split(msg_strs[1], '\n'))
+                    dashboard_push_log_entry!(ds, DashboardLogEntry(
+                        testitem.label, ctx.environment_name, :errored,
+                        duration !== nothing ? Float64(duration) : nothing, summary_msg))
+                end
             end,
-            on_testitem_skipped = (testrun_id, testitem_id) -> begin
+            on_testitem_skipped = (testrun_id, testitem_id, test_env_id) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_skipped += 1
@@ -307,9 +371,21 @@ function get_runner()
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:skipped, messages=missing, duration=missing)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:skipped, messages=nothing, duration=nothing)))
+                ds = ctx.dashboard_state
+                if ds !== nothing
+                    lock(ds.lock) do
+                        ds.count_skipped = ctx.count_skipped
+                        idx = findlast(t -> t.name == testitem.label && t.status == :running, ds.testitems)
+                        if idx !== nothing
+                            ds.testitems[idx].status = :skipped
+                        end
+                    end
+                    dashboard_push_log_entry!(ds, DashboardLogEntry(
+                        testitem.label, ctx.environment_name, :skipped, nothing, ""))
+                end
             end,
-            on_append_output = (testrun_id, testitem_id, output) -> begin
+            on_append_output = (testrun_id, testitem_id, test_env_id, output) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 testitem_id === nothing && return  # process-level output; captured by on_process_output
@@ -317,12 +393,35 @@ function get_runner()
                     ctx.outputs[testitem_id] = String[]
                 end
                 push!(ctx.outputs[testitem_id], output)
+                ds = ctx.dashboard_state
+                if ds !== nothing && testitem_id !== nothing
+                    testitem = get(ctx.testitems_by_id, testitem_id, nothing)
+                    if testitem !== nothing
+                        lock(ds.lock) do
+                            idx = findlast(t -> t.name == testitem.label, ds.testitems)
+                            if idx !== nothing
+                                ds.testitems[idx].output *= output
+                            end
+                        end
+                    end
+                end
             end,
             on_attach_debugger = (testrun_id, debug_pipename) -> nothing,
-            on_process_created = (id, package_name, package_uri, project_uri, coverage, env) -> begin
+            on_process_created = (id, test_env_id) -> begin
                 runner = _g_runner[]
+                env = lock(runner.lock) do
+                    get(runner.test_env_by_id, test_env_id, nothing)
+                end
+                package_name = env !== nothing ? env.package_name : ""
                 lock(runner.lock) do
                     runner.processes[id] = ProcessInfo(id, package_name, "Launching")
+                end
+                # Update all active dashboard states
+                lock(runner.lock) do
+                    for ctx in values(runner.run_contexts)
+                        ds = ctx.dashboard_state
+                        ds !== nothing && dashboard_update_process!(ds, id, package_name, "Launching")
+                    end
                 end
             end,
             on_process_terminated = (id) -> begin
@@ -330,13 +429,28 @@ function get_runner()
                 lock(runner.lock) do
                     delete!(runner.processes, id)
                 end
+                lock(runner.lock) do
+                    for ctx in values(runner.run_contexts)
+                        ds = ctx.dashboard_state
+                        ds !== nothing && dashboard_remove_process!(ds, id)
+                    end
+                end
             end,
             on_process_status_changed = (id, status) -> begin
                 runner = _g_runner[]
+                pkg_name = ""
                 lock(runner.lock) do
                     if haskey(runner.processes, id)
                         old = runner.processes[id]
+                        pkg_name = old.package_name
                         runner.processes[id] = ProcessInfo(old.id, old.package_name, status)
+                    end
+                end
+                # Update dashboard states
+                lock(runner.lock) do
+                    for ctx in values(runner.run_contexts)
+                        ds = ctx.dashboard_state
+                        ds !== nothing && dashboard_update_process!(ds, id, pkg_name, status)
                     end
                 end
                 if status == "Launching"
@@ -360,6 +474,13 @@ function get_runner()
                         runner.process_outputs[id] = String[]
                     end
                     push!(runner.process_outputs[id], output)
+                end
+                # Push to dashboard states (per-process output)
+                lock(runner.lock) do
+                    for ctx in values(runner.run_contexts)
+                        ds = ctx.dashboard_state
+                        ds !== nothing && dashboard_push_process_line!(ds, id, output)
+                    end
                 end
             end,
         )
@@ -393,7 +514,8 @@ function run_tests(
             environments=[RunProfile("Default", false, Dict{String,Any}())],
             julia_cmd::String="julia",
             julia_args::Vector{String}=String[],
-            token=nothing
+            token=nothing,
+            dashboard_state::Union{Nothing,DashboardState}=nothing
         )
     if progress_ui == :none
         print_summary = false
@@ -477,6 +599,8 @@ function run_tests(
         Logging.with_logger(debuglogger) do
 
             testitems_to_run_by_id = Dict{String, TestItemControllers.TestItemDetail}()
+                    # Collect package info per item for building per-package TestEnvironments
+                    item_package_info = Dict{String, NamedTuple{(:package_name, :package_uri, :project_uri, :env_content_hash), Tuple{String, String, Union{Nothing,String}, Union{Nothing,String}}}}()
                     for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
                         project_details = JuliaWorkspaces.get_test_env(jw, uri)
                         textfile = JuliaWorkspaces.get_text_file(jw, uri)
@@ -487,8 +611,6 @@ function run_tests(
                                 item.name,
                                 project_details.package_name,
                                 string(project_details.package_uri),
-                                project_details.project_uri === nothing ? nothing : string(project_details.project_uri),
-                                string(project_details.env_content_hash),
                                 item.option_default_imports,
                                 string.(item.option_setup),
                                 JuliaWorkspaces.position_at(textfile.content, item.code_range.start)[1],
@@ -496,7 +618,12 @@ function run_tests(
                                 textfile.content.content[item.code_range],
                                 JuliaWorkspaces.position_at(textfile.content, item.code_range.stop)[1],
                                 JuliaWorkspaces.position_at(textfile.content, item.code_range.stop)[2],
-                                Float64(timeout)
+                            )
+                            item_package_info[item.id] = (
+                                package_name = project_details.package_name,
+                                package_uri = string(project_details.package_uri),
+                                project_uri = project_details.project_uri === nothing ? nothing : string(project_details.project_uri),
+                                env_content_hash = project_details.env_content_hash === nothing ? nothing : string(project_details.env_content_hash),
                             )
                         end
                     end
@@ -525,7 +652,16 @@ function run_tests(
                 responses,
                 Dict{String,Vector{String}}(),
                 false,
+                dashboard_state,
             )
+
+            # Update dashboard state with discovered totals
+            if dashboard_state !== nothing
+                lock(dashboard_state.lock) do
+                    dashboard_state.run_id = testrun_id
+                    dashboard_state.n_total = n_total
+                end
+            end
 
             ctx.progressbar_next = () -> begin
                 if ctx.launch_header_printed
@@ -557,44 +693,85 @@ function run_tests(
             end
 
             ret = try
+                # Collect unique packages from the discovered test items
+                unique_packages = Dict{String, NamedTuple}()
+                for (item_id, pkg) in item_package_info
+                    haskey(testitems_to_run_by_id, item_id) || continue
+                    key = pkg.package_uri
+                    if !haskey(unique_packages, key)
+                        unique_packages[key] = pkg
+                    end
+                end
+
+                # Create one TestEnvironment per (package × profile) combination
+                test_envs = TestItemControllers.TestEnvironment[]
+                env_id_for_item = Dict{String, String}()  # item_id → env_id
+                for profile in environments
+                    env_vars = Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k,v) in profile.env)
+                    mode = profile.coverage ? "Coverage" : "Normal"
+                    for (pkg_uri, pkg) in unique_packages
+                        env = TestItemControllers.TestEnvironment(
+                            string(UUIDs.uuid4()),
+                            julia_cmd,
+                            julia_args,
+                            nothing,
+                            env_vars,
+                            mode,
+                            pkg.package_name,
+                            pkg.package_uri,
+                            pkg.project_uri,
+                            pkg.env_content_hash,
+                        )
+                        push!(test_envs, env)
+                        # Map items from this package to this env
+                        for (item_id, item_pkg) in item_package_info
+                            if item_pkg.package_uri == pkg_uri && haskey(testitems_to_run_by_id, item_id)
+                                env_id_for_item[item_id] = env.id
+                            end
+                        end
+                    end
+                end
+
+                # Register test environments for on_process_created callback
+                lock(runner.lock) do
+                    for env in test_envs
+                        runner.test_env_by_id[env.id] = env
+                    end
+                end
+
+                test_items = collect(TestItemControllers.TestItemDetail, values(testitems_to_run_by_id))
+                work_units = [
+                    TestItemControllers.TestRunItem(item.id, env_id_for_item[item.id], nothing, :Info)
+                    for item in test_items
+                ]
+                test_setups = let
+                    setups = TestItemControllers.TestSetupDetail[]
+                    for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
+                        project_details = JuliaWorkspaces.get_test_env(jw, uri)
+                        project_details.package_uri === nothing && continue
+                        textfile = JuliaWorkspaces.get_text_file(jw, uri)
+                        for setup in file_info.testsetups
+                            push!(setups, TestItemControllers.TestSetupDetail(
+                                string(project_details.package_uri),
+                                string(setup.name),
+                                string(setup.kind),
+                                string(uri),
+                                JuliaWorkspaces.position_at(textfile.content, setup.code_range.start)[1],
+                                JuliaWorkspaces.position_at(textfile.content, setup.code_range.start)[2],
+                                textfile.content.content[setup.code_range]
+                            ))
+                        end
+                    end
+                    setups
+                end
                 TestItemControllers.execute_testrun(
                     tic,
                     testrun_id,
-                    [
-                        TestItemControllers.TestProfile(
-                            i.name,
-                            "$(i.name) Profile",
-                            julia_cmd,
-                            julia_args,
-                            missing,
-                            Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k,v) in i.env),
-                            max_workers,
-                            i.coverage ? "Coverage" : "Normal",
-                            nothing,
-                            :Info
-                        ) for i in environments
-                    ],
-                    collect(TestItemControllers.TestItemDetail, values(testitems_to_run_by_id)),
-                    let
-                        setups = TestItemControllers.TestSetupDetail[]
-                        for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
-                            project_details = JuliaWorkspaces.get_test_env(jw, uri)
-                            project_details.package_uri === nothing && continue
-                            textfile = JuliaWorkspaces.get_text_file(jw, uri)
-                            for setup in file_info.testsetups
-                                push!(setups, TestItemControllers.TestSetupDetail(
-                                    string(project_details.package_uri),
-                                    string(setup.name),
-                                    string(setup.kind),
-                                    string(uri),
-                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start)[1],
-                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start)[2],
-                                    textfile.content.content[setup.code_range]
-                                ))
-                            end
-                        end
-                        setups
-                    end,
+                    test_envs,
+                    test_items,
+                    work_units,
+                    test_setups,
+                    max_workers,
                     token,
                 )
             catch err
@@ -603,6 +780,20 @@ function run_tests(
             finally
                 # Safety-net: clear progress bar in case of cancellation/error/zero tests
                 try; ProgressMeter.cancel(p, ""; keep=false); catch; end
+                # Mark dashboard as completed
+                if dashboard_state !== nothing
+                    try
+                        ds_status = if token !== nothing && CancellationTokens.is_cancelled(token)
+                            :cancelled
+                        elseif ctx.count_error > 0 || ctx.count_fail > 0
+                            :completed
+                        else
+                            :completed
+                        end
+                        dashboard_set_completed!(dashboard_state, ds_status)
+                    catch
+                    end
+                end
                 try
                     partial = _build_result_from_context(runner, testrun_id, ctx)
                     lock(runner.lock) do
@@ -618,7 +809,7 @@ function run_tests(
                 end
             end
 
-            if any(env -> env.coverage, environments) && ret !== missing && ret !== nothing
+            if any(env -> env.coverage, environments) && ret !== nothing
                 @info "Coverage data collected but not yet processed"
             end
 
@@ -664,11 +855,11 @@ function run_tests(
                 println()
                 label = i.result.status == :failed ? "FAIL" : "ERROR"
                 printstyled("  [$label] $(i.testitem.label)"; color=:red, bold=true)
-                if i.result.duration !== missing
+                if i.result.duration !== nothing
                     print(" ($(i.result.duration)ms)")
                 end
                 println()
-                if i.result.messages!==missing                
+                if i.result.messages!==nothing                
                     for j in i.result.messages
                         println("    ", replace(j.message, "\n"=>"\n    "))
                     end
@@ -689,8 +880,8 @@ function run_tests(
                 ti.testenvironment.name,
                 ti.result.status,
                 ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === missing ? URI("") : URI(msg.uri), coalesce(msg.line, 0), coalesce(msg.column, 0)) for msg in ti.result.messages],
-                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
+                ti.result.messages === nothing ? nothing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
+                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : nothing
             )]
         ) for ti in responses
     ]
@@ -800,6 +991,8 @@ mutable struct BackgroundRun
     result::Union{Nothing,TestrunResult}
     error::Union{Nothing,Exception}
     start_time::Float64
+    dashboard_state::Union{Nothing,DashboardState}
+    run_id::Union{Nothing,String}
 end
 
 const _bg_run = Ref{Union{Nothing,BackgroundRun}}(nothing)
@@ -835,13 +1028,14 @@ function cmd_help()
     println("  help                          Show this help message")
     println("  list [path]                   List discovered test items")
     println("  list --tags=tag1,tag2         Filter by tags")
-    println("  run [+channel] [path|name]    Run tests (blocking, ESC to cancel)")
+    println("  run [+channel] [path|name]    Run tests (interactive dashboard)")
     println("  run +lts                      Run tests using a Juliaup channel")
     println("  run --tags=t1,t2              Filter by tags")
     println("  run --workers=N               Max parallel workers (default: min(nthreads,8))")
     println("  run --timeout=S               Timeout in seconds (default: 300)")
     println("  run --coverage                Enable coverage")
     println("  run& [same options]           Run tests in background")
+    println("  showrun                       Attach dashboard to background run")
     println("  status                        Show background run status")
     println("  cancel [id]                   Cancel background run (or run by id)")
     println("  results [id]                  Show results (last run, or run #id)")
@@ -979,84 +1173,81 @@ function cmd_run(args; juliaup_channel::Union{Nothing,String}=nothing)
     cts = CancellationTokenSource()
     run_kwargs[:token] = get_token(cts)
     run_kwargs[:return_results] = false
-    run_kwargs[:print_failed_results] = true
-    run_kwargs[:print_summary] = true
+    run_kwargs[:print_failed_results] = false
+    run_kwargs[:print_summary] = false
 
-    printstyled("Starting test run...\n"; color=:cyan)
+    ds = DashboardState()
+    run_kwargs[:dashboard_state] = ds
+    run_kwargs[:progress_ui] = :none
 
-    # Run tests in a task so we can monitor for ESC key
+    # Run tests in a background task
     test_task = @async try
         run_tests(path; run_kwargs...)
     catch e
         e
     end
 
-    cancelled = Ref(false)
+    # Launch interactive dashboard — blocks until user quits
     try
-        # Try to set terminal to raw mode for ESC detection
-        term = nothing
-        raw_set = false
-        try
-            if isdefined(Base, :active_repl) && stdin isa Base.TTY
-                term = stdin
-                ccall(:jl_tty_set_mode, Int32, (Ptr{Nothing}, Int32), term.handle, Int32(1))  # raw mode
-                Base.start_reading(stdin)
-                raw_set = true
-            end
-        catch
-            # Fall through — ESC detection won't work but Ctrl+C still will
+        launch_dashboard(ds, cts)
+    catch e
+        if !(e isa InterruptException)
+            @error "Dashboard error" exception=(e, catch_backtrace())
         end
+    end
 
-        try
-            while !istaskdone(test_task)
-                if raw_set && bytesavailable(stdin) > 0
-                    b = read(stdin, UInt8)
-                    if b == 0x1b  # ESC
-                        cancel(cts)
-                        cancelled[] = true
-                        printstyled("\nTest run cancelled (ESC).\n"; color=:yellow)
-                        break
-                    end
-                end
-                sleep(0.05)
-            end
-        finally
-            if raw_set
-                try
-                    Base.stop_reading(stdin)
-                    ccall(:jl_tty_set_mode, Int32, (Ptr{Nothing}, Int32), term.handle, Int32(0))  # normal mode
-                catch
-                end
-            end
-        end
-
-        # Retrieve run ID from return value (run_tests returns testrun_id when return_results=false)
-        if !cancelled[]
+    # After dashboard exits: collect results or promote to background
+    if !istaskdone(test_task)
+        # Run is still going — promote to background run
+        bg = BackgroundRun(
+            test_task,
+            cts,
+            nothing,
+            nothing,
+            time(),
+            ds,
+            nothing,
+        )
+        @async begin
             raw = try
-                fetch(test_task)
+                fetch(bg.task)
             catch e
                 e
             end
-            if raw isa String
+            if raw isa Exception
+                bg.error = raw
+            elseif raw isa TestrunResult
+                bg.result = raw
+                _last_result[] = raw
+            elseif raw isa String
                 _last_run_id[] = raw
                 result = get_run_result(raw)
                 if result !== nothing
+                    bg.result = result
                     _last_result[] = result
                 end
-            elseif raw isa Exception
-                # Store run ID even if errored
-                last_id = get_last_run_id()
-                if last_id !== nothing
-                    _last_run_id[] = last_id
-                    result = get_run_result(last_id)
-                    if result !== nothing
-                        _last_result[] = result
-                    end
-                end
-                throw(raw)
             end
-        else
-            # Still retrieve the run ID even if cancelled
+        end
+        _bg_run[] = bg
+        last_id = get_last_run_id()
+        if last_id !== nothing
+            _last_run_id[] = last_id
+        end
+        printstyled("Run detached to background. Use 'showrun' to reattach.\n"; color=:cyan)
+    else
+        # Run finished — collect results
+        raw = try
+            fetch(test_task)
+        catch e
+            e
+        end
+        if raw isa String
+            _last_run_id[] = raw
+            result = get_run_result(raw)
+            if result !== nothing
+                _last_result[] = result
+            end
+        elseif raw isa Exception
             last_id = get_last_run_id()
             if last_id !== nothing
                 _last_run_id[] = last_id
@@ -1065,13 +1256,9 @@ function cmd_run(args; juliaup_channel::Union{Nothing,String}=nothing)
                     _last_result[] = result
                 end
             end
-        end
-    catch e
-        if e isa InterruptException
-            cancel(cts)
-            printstyled("\nTest run cancelled.\n"; color=:yellow)
-        else
-            rethrow()
+            if !(raw isa InterruptException)
+                @error "Test run error" exception=raw
+            end
         end
     end
     nothing
@@ -1099,6 +1286,9 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     run_kwargs[:print_summary] = false
     run_kwargs[:print_failed_results] = false
 
+    ds = DashboardState()
+    run_kwargs[:dashboard_state] = ds
+
     bg = BackgroundRun(
         @async(try
             run_tests(path; run_kwargs...)
@@ -1109,6 +1299,8 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
         nothing,
         nothing,
         time(),
+        ds,
+        nothing,
     )
 
     @async begin
@@ -1141,6 +1333,28 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     end
     id_str = _last_run_id[] !== nothing ? " #$(_last_run_id[])" : ""
     printstyled("Test run$(id_str) started in background.\n"; color=:green)
+    nothing
+end
+
+function cmd_showrun()
+    _check_bg_completion()
+    bg = _bg_run[]
+    if bg === nothing
+        printstyled("No background test run to show.\n"; color=:yellow)
+        return nothing
+    end
+    if bg.dashboard_state === nothing
+        printstyled("Background run has no dashboard state.\n"; color=:yellow)
+        return nothing
+    end
+    cts = istaskdone(bg.task) ? nothing : bg.cts
+    try
+        launch_dashboard(bg.dashboard_state, cts)
+    catch e
+        if !(e isa InterruptException)
+            @error "Dashboard error" exception=(e, catch_backtrace())
+        end
+    end
     nothing
 end
 
@@ -1355,11 +1569,11 @@ function cmd_results(args=String[])
                 println()
                 label = prof.status == :failed ? "FAIL" : "ERROR"
                 printstyled("  [$label] $(ti.name)"; color=:red, bold=true)
-                if prof.duration !== missing
+                if prof.duration !== nothing
                     print(" ($(prof.duration)ms)")
                 end
                 println()
-                if prof.messages !== missing
+                if prof.messages !== nothing
                     for msg in prof.messages
                         println("    ", replace(msg.message, "\n" => "\n    "))
                     end
@@ -1373,7 +1587,7 @@ function cmd_results(args=String[])
         timed = Tuple{String,Float64}[]
         for ti in testitems
             for prof in ti.profiles
-                if prof.duration !== missing
+                if prof.duration !== nothing
                     push!(timed, (ti.name, prof.duration))
                 end
             end
@@ -1462,19 +1676,19 @@ function _print_testitem_details(ti)
             :default
         end
         printstyled("  [$(prof.profile_name)] $(prof.status)"; color=status_color, bold=true)
-        if prof.duration !== missing
+        if prof.duration !== nothing
             print(" ($(prof.duration)ms)")
         end
         println()
 
-        if prof.messages !== missing
+        if prof.messages !== nothing
             for msg in prof.messages
                 println("    $(uri2filepath(msg.uri)):$(msg.line)")
                 println("    ", replace(msg.message, "\n" => "\n    "))
             end
         end
 
-        if prof.output !== missing && !isempty(prof.output)
+        if prof.output !== nothing && !isempty(prof.output)
             printstyled("    Output:\n"; color=:cyan)
             for line in split(prof.output, '\n')
                 println("      ", line)
@@ -1487,7 +1701,7 @@ function _print_testitem_output(ti)
     printstyled("Output for $(ti.name):\n"; bold=true)
     has_output = false
     for prof in ti.profiles
-        if prof.output !== missing && !isempty(prof.output)
+        if prof.output !== nothing && !isempty(prof.output)
             if length(ti.profiles) > 1
                 printstyled("  [$(prof.profile_name)]\n"; color=:cyan)
             end
@@ -1654,6 +1868,8 @@ function repl_parser(input::String)
         else
             return cmd_run(remaining_args; juliaup_channel)
         end
+    elseif cmd == "showrun"
+        return cmd_showrun()
     elseif cmd == "status" || cmd == "st"
         return cmd_status()
     elseif cmd == "cancel"
