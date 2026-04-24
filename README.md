@@ -14,7 +14,7 @@ Install into your global environment:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/julia-testitem/TestItemREPL.jl")
+Pkg.add(url="https://github.com/julia-testitems/TestItemREPL.jl")
 ```
 
 Then load it and press `)` to enter the test REPL mode:
