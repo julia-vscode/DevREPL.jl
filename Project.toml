@@ -1,4 +1,4 @@
-name = "TestItemREPL"
+name = "DevREPL"
 uuid = "462b4204-f666-42ae-9f53-51a1a4278609"
 version = "0.1.0"
 authors = ["David Anthoff <anthoff@berkeley.edu>"]

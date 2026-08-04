@@ -1,4 +1,4 @@
-module TestItemREPL
+module DevREPL
 
 include("pkg_imports.jl")
 
@@ -29,7 +29,7 @@ Logging.catch_exceptions(logger::ModuleFilterLogger) = Logging.catch_exceptions(
 function Logging.handle_message(logger::ModuleFilterLogger, level, message, _module, group, id, filepath, line; kwargs...)
     # Suppress TestItemControllers logs below Warn
     mod_name = string(parentmodule(_module))
-    if (mod_name == "TestItemREPL.TestItemControllers" || string(_module) == "TestItemREPL.TestItemControllers") && level < Logging.Warn
+    if (mod_name == "DevREPL.TestItemControllers" || string(_module) == "DevREPL.TestItemControllers") && level < Logging.Warn
         return nothing
     end
     Logging.handle_message(logger.wrapped, level, message, _module, group, id, filepath, line; kwargs...)
@@ -831,7 +831,7 @@ end
 # ── Commands ──────────────────────────────────────────────────────────
 
 function cmd_help()
-    printstyled("TestItemREPL commands:\n\n"; bold=true)
+    printstyled("DevREPL commands:\n\n"; bold=true)
     println("  help                          Show this help message")
     println("  list [path]                   List discovered test items")
     println("  list --tags=tag1,tag2         Filter by tags")
@@ -1724,4 +1724,4 @@ function __init__()
     end
 end
 
-end # module TestItemREPL
+end # module DevREPL
