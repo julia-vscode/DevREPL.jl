@@ -9,8 +9,8 @@ struct ShutdownMsg <: ReactorMessage end
 
 struct GetProcsForTestRunMsg <: ReactorMessage
     testrun_id::String
-    proc_count_by_env::Dict{TestEnvironment,Int}
-    env_content_hash_by_env::Dict{TestEnvironment,Union{Nothing,String}}
+    proc_count_by_env::Dict{ProcessEnv,Int}
+    env_content_hash_by_env::Dict{ProcessEnv,Union{Nothing,String}}
     test_setups::Vector{TestItemServerProtocol.TestsetupDetails}
     coverage_root_uris::Union{Nothing,Vector{String}}
     log_level::Symbol
@@ -18,12 +18,19 @@ end
 
 struct ReturnToPoolMsg <: ReactorMessage
     testprocess_id::String
-    env::TestEnvironment
+    env::ProcessEnv
 end
 
+# Posted from the per-process IO task in `start()` after the process has fully
+# exited. Carries enough context to drive both run-level redistribution
+# (testrun_id, skip_remaining) and controller-level pool cleanup in one handler,
+# so callers never need to coordinate two messages.
 struct TestProcessTerminatedMsg <: ReactorMessage
     testprocess_id::String
+    testrun_id::Union{Nothing,String}   # nothing if the process died outside any test run
+    skip_remaining::Bool                # only meaningful when testrun_id !== nothing
 end
+TestProcessTerminatedMsg(id::String) = TestProcessTerminatedMsg(id, nothing, false)
 
 struct TestProcessStatusChangedMsg <: ReactorMessage
     testprocess_id::String
@@ -41,7 +48,7 @@ end
 
 struct ProcsAcquiredMsg <: ReactorMessage
     testrun_id::String
-    procs::Dict{TestEnvironment,Vector{String}}  # env → process IDs
+    procs::Dict{ProcessEnv,Vector{String}}  # env → process IDs
 end
 
 struct TestRunCancelledMsg <: ReactorMessage
@@ -55,7 +62,7 @@ end
 
 struct PrecompileDoneMsg <: ReactorMessage
     testrun_id::String
-    env::TestEnvironment
+    env::ProcessEnv
     testprocess_id::String
 end
 
@@ -75,7 +82,7 @@ struct TestItemPassedMsg <: ReactorMessage
     testprocess_id::String
     testitem_id::String
     duration::Float64
-    coverage::Union{Missing,Vector{Any}}  # Missing or Vector{FileCoverage}
+    coverage::Union{Nothing,Vector{Any}}
 end
 
 struct TestItemFailedMsg <: ReactorMessage
@@ -83,7 +90,7 @@ struct TestItemFailedMsg <: ReactorMessage
     testprocess_id::String
     testitem_id::String
     messages::Vector{Any}
-    duration::Union{Float64,Missing}
+    duration::Union{Nothing,Float64}
 end
 
 struct TestItemErroredMsg <: ReactorMessage
@@ -91,7 +98,7 @@ struct TestItemErroredMsg <: ReactorMessage
     testprocess_id::String
     testitem_id::String
     messages::Vector{Any}
-    duration::Union{Float64,Missing}
+    duration::Union{Nothing,Float64}
 end
 
 struct TestItemSkippedStolenMsg <: ReactorMessage
@@ -105,12 +112,6 @@ struct AppendOutputMsg <: ReactorMessage
     testprocess_id::String
     testitem_id::Union{Nothing,String}
     output::String
-end
-
-struct TestProcessTerminatedInRunMsg <: ReactorMessage
-    testrun_id::String
-    testprocess_id::String
-    skip_remaining::Bool
 end
 
 struct TestItemTimeoutMsg <: ReactorMessage
@@ -145,7 +146,10 @@ end
 struct TestProcessIOErrorMsg <: ReactorMessage
     testprocess_id::String
     error_type::Symbol  # :restart or :fatal
+    exit_code::Union{Nothing,Int}
+    term_signal::Union{Nothing,Int}
 end
+TestProcessIOErrorMsg(id::String, error_type::Symbol) = TestProcessIOErrorMsg(id, error_type, nothing, nothing)
 
 struct ActivationFailedMsg <: ReactorMessage
     testprocess_id::String

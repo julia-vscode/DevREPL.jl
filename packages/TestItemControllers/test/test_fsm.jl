@@ -90,12 +90,6 @@ end
     transition!(fsm5, ProcessReviseOrStart)
     @test state(fsm5) == ProcessReviseOrStart
 
-    # Path: Revising → Starting (revise failed, need restart)
-    fsm6 = testprocess_fsm("proc-6")
-    transition!(fsm6, ProcessReviseOrStart)
-    transition!(fsm6, ProcessRevising)
-    transition!(fsm6, ProcessStarting)
-    @test state(fsm6) == ProcessStarting
 end
 
 @testitem "testprocess_fsm ProcessDead from every state" begin
@@ -152,57 +146,62 @@ end
     end
 end
 
-@testitem "testprocess_fsm ProcessStarting from every state (error recovery)" begin
+@testitem "testprocess_fsm ProcessStarting only from launch states" begin
     using TestItemControllers: testprocess_fsm, state, transition!,
-        ProcessCreated, ProcessIdle, ProcessReviseOrStart, ProcessRevising,
-        ProcessStarting, ProcessWaitingForPrecompile, ProcessActivatingEnv,
-        ProcessConfiguringTestRun, ProcessReadyToRun, ProcessRunning
+        ProcessCreated, ProcessIdle, ProcessReviseOrStart, ProcessRevising, ProcessStarting,
+        ProcessWaitingForPrecompile, ProcessActivatingEnv, ProcessConfiguringTestRun,
+        ProcessReadyToRun, ProcessRunning
 
-    # Every state except ProcessDead should be able to transition to ProcessStarting
-    all_phases = [ProcessCreated, ProcessIdle, ProcessReviseOrStart, ProcessRevising,
-                  ProcessStarting, ProcessWaitingForPrecompile, ProcessActivatingEnv,
-                  ProcessConfiguringTestRun, ProcessReadyToRun, ProcessRunning]
+    fsm = testprocess_fsm("proc-starting-created")
+    transition!(fsm, ProcessStarting)
+    @test state(fsm) == ProcessStarting
 
-    for phase in all_phases
-        fsm = testprocess_fsm("proc-restart-test")
-        # Get to the target state (same logic as Dead test)
-        if phase == ProcessCreated
-            # Already there
-        elseif phase == ProcessIdle
-            transition!(fsm, ProcessIdle)
-        elseif phase == ProcessReviseOrStart
-            transition!(fsm, ProcessReviseOrStart)
+    fsm2 = testprocess_fsm("proc-starting-reviseorstart")
+    transition!(fsm2, ProcessReviseOrStart)
+    transition!(fsm2, ProcessStarting)
+    @test state(fsm2) == ProcessStarting
+
+    invalid_states = [
+        ProcessIdle,
+        ProcessRevising,
+        ProcessWaitingForPrecompile,
+        ProcessActivatingEnv,
+        ProcessConfiguringTestRun,
+        ProcessReadyToRun,
+        ProcessRunning,
+    ]
+
+    for phase in invalid_states
+        fsm_invalid = testprocess_fsm("proc-starting-invalid")
+        if phase == ProcessIdle
+            transition!(fsm_invalid, ProcessIdle)
         elseif phase == ProcessRevising
-            transition!(fsm, ProcessReviseOrStart)
-            transition!(fsm, ProcessRevising)
-        elseif phase == ProcessStarting
-            transition!(fsm, ProcessStarting)
+            transition!(fsm_invalid, ProcessReviseOrStart)
+            transition!(fsm_invalid, ProcessRevising)
         elseif phase == ProcessWaitingForPrecompile
-            transition!(fsm, ProcessStarting)
-            transition!(fsm, ProcessWaitingForPrecompile)
+            transition!(fsm_invalid, ProcessStarting)
+            transition!(fsm_invalid, ProcessWaitingForPrecompile)
         elseif phase == ProcessActivatingEnv
-            transition!(fsm, ProcessStarting)
-            transition!(fsm, ProcessActivatingEnv)
+            transition!(fsm_invalid, ProcessStarting)
+            transition!(fsm_invalid, ProcessActivatingEnv)
         elseif phase == ProcessConfiguringTestRun
-            transition!(fsm, ProcessStarting)
-            transition!(fsm, ProcessActivatingEnv)
-            transition!(fsm, ProcessConfiguringTestRun)
+            transition!(fsm_invalid, ProcessStarting)
+            transition!(fsm_invalid, ProcessActivatingEnv)
+            transition!(fsm_invalid, ProcessConfiguringTestRun)
         elseif phase == ProcessReadyToRun
-            transition!(fsm, ProcessStarting)
-            transition!(fsm, ProcessActivatingEnv)
-            transition!(fsm, ProcessConfiguringTestRun)
-            transition!(fsm, ProcessReadyToRun)
+            transition!(fsm_invalid, ProcessStarting)
+            transition!(fsm_invalid, ProcessActivatingEnv)
+            transition!(fsm_invalid, ProcessConfiguringTestRun)
+            transition!(fsm_invalid, ProcessReadyToRun)
         elseif phase == ProcessRunning
-            transition!(fsm, ProcessStarting)
-            transition!(fsm, ProcessActivatingEnv)
-            transition!(fsm, ProcessConfiguringTestRun)
-            transition!(fsm, ProcessReadyToRun)
-            transition!(fsm, ProcessRunning)
+            transition!(fsm_invalid, ProcessStarting)
+            transition!(fsm_invalid, ProcessActivatingEnv)
+            transition!(fsm_invalid, ProcessConfiguringTestRun)
+            transition!(fsm_invalid, ProcessReadyToRun)
+            transition!(fsm_invalid, ProcessRunning)
         end
 
-        @test state(fsm) == phase
-        transition!(fsm, ProcessStarting)
-        @test state(fsm) == ProcessStarting
+        @test_throws ErrorException transition!(fsm_invalid, ProcessStarting)
     end
 end
 
@@ -357,5 +356,48 @@ end
     catch e
         @test e isa ErrorException
         @test occursin("test reason", e.msg)
+    end
+end
+
+@testitem "testprocess_fsm ProcessIdle from intermediate states (cancellation)" begin
+    using TestItemControllers: testprocess_fsm, state, transition!,
+        ProcessCreated, ProcessIdle, ProcessReviseOrStart, ProcessRevising,
+        ProcessStarting, ProcessWaitingForPrecompile, ProcessActivatingEnv,
+        ProcessConfiguringTestRun, ProcessReadyToRun, ProcessRunning
+
+    # When a test run is cancelled, processes in any intermediate setup state
+    # must be able to transition back to ProcessIdle (returned to pool).
+    intermediate_states = [ProcessReviseOrStart, ProcessRevising,
+                           ProcessWaitingForPrecompile, ProcessActivatingEnv,
+                           ProcessConfiguringTestRun, ProcessReadyToRun]
+
+    for phase in intermediate_states
+        fsm = testprocess_fsm("proc-idle-cancel-test")
+        # Navigate to the target state
+        if phase == ProcessReviseOrStart
+            transition!(fsm, ProcessReviseOrStart)
+        elseif phase == ProcessRevising
+            transition!(fsm, ProcessReviseOrStart)
+            transition!(fsm, ProcessRevising)
+        elseif phase == ProcessWaitingForPrecompile
+            transition!(fsm, ProcessStarting)
+            transition!(fsm, ProcessWaitingForPrecompile)
+        elseif phase == ProcessActivatingEnv
+            transition!(fsm, ProcessStarting)
+            transition!(fsm, ProcessActivatingEnv)
+        elseif phase == ProcessConfiguringTestRun
+            transition!(fsm, ProcessStarting)
+            transition!(fsm, ProcessActivatingEnv)
+            transition!(fsm, ProcessConfiguringTestRun)
+        elseif phase == ProcessReadyToRun
+            transition!(fsm, ProcessStarting)
+            transition!(fsm, ProcessActivatingEnv)
+            transition!(fsm, ProcessConfiguringTestRun)
+            transition!(fsm, ProcessReadyToRun)
+        end
+
+        @test state(fsm) == phase
+        transition!(fsm, ProcessIdle; reason="returned to pool")
+        @test state(fsm) == ProcessIdle
     end
 end

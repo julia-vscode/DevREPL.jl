@@ -82,7 +82,11 @@ function read_from_cache(pkgdata::PkgData, file::AbstractString)
             Base._read_dependency_src(io, filec)
         end
     end
-    Base.read_dependency_src(fi.cachefile, filep)
+    # `read_dependency_src` matches paths by exact string equality, so look the source
+    # up by the filename the cache was indexed with rather than one reconstructed from
+    # `basedir` (which can diverge in form, e.g. across symlinks; see #1033).
+    lookup = isempty(fi.cachefilename) ? filep : fi.cachefilename
+    Base.read_dependency_src(fi.cachefile, lookup)
 end
 
 function maybe_parse_from_cache!(pkgdata::PkgData, file::AbstractString)
@@ -323,18 +327,20 @@ function watch_files_via_dir(dirname::AbstractString)
                 push!(latestfiles, file=>id)
                 continue
             elseif !file_exists(fullpath)
-                # File may have been deleted. But be very sure.
+                # File may have been deleted. But check again after a very brief pause.
                 sleep(0.1)
                 if !file_exists(fullpath)
                     push!(latestfiles, file=>id)
+                    wf.file_ctimes[file] = 0.0
                     continue
                 end
             end
-            if newer(mtime(fullpath), wf.timestamp)
+            current_ctime = ctime(fullpath)
+            if current_ctime != get(wf.file_ctimes, file, current_ctime - 1)
                 push!(latestfiles, file=>id)
+                wf.file_ctimes[file] = current_ctime
             end
         end
-        isempty(latestfiles) || updatetime!(wf)  # ref issue #341
     end
     return latestfiles, stillwatching
 end

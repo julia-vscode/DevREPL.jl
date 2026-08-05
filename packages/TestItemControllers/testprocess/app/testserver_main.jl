@@ -31,11 +31,10 @@ let
             ARGS[2],
             has_error_handler ? (err, bt) -> Base.invokelatest(global_err_handler, err, bt, Base.ARGS[4], "Test Process") : nothing)
     catch err
-        bt = catch_backtrace()
         if has_error_handler
-            Base.invokelatest(global_err_handler, err, bt, Base.ARGS[4], "Test Process")
-        else
-            Base.display_error(err, bt)
+            Base.invokelatest(global_err_handler, err, catch_backtrace(), Base.ARGS[4], "Test Process")
         end
+        
+        rethrow()
     end
 end

@@ -1,5 +1,5 @@
 @testitem "Output capture from test items" setup=[TestHelpers] begin
-    using TestItemControllers: TestItemController, execute_testrun, shutdown, ControllerCallbacks
+    using TestItemControllers: TestItemController, TestRunItem, execute_testrun, shutdown, ControllerCallbacks
     import UUIDs
     @info "[test] Output capture from test items: starting"
 
@@ -19,22 +19,22 @@
     events_lock = ReentrantLock()
 
     callbacks = ControllerCallbacks(
-        on_testitem_started = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_started = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:started, testitem_id=item_id))
         end,
-        on_testitem_passed = (run_id, item_id, duration) -> lock(events_lock) do
+        on_testitem_passed = (run_id, item_id, test_env_id, duration) -> lock(events_lock) do
             push!(events, (event=:passed, testitem_id=item_id))
         end,
-        on_testitem_failed = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_failed = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:failed, testitem_id=item_id))
         end,
-        on_testitem_errored = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_errored = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:errored, testitem_id=item_id))
         end,
-        on_testitem_skipped = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_skipped = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:skipped, testitem_id=item_id))
         end,
-        on_append_output = (run_id, item_id, output) -> lock(outputs_lock) do
+        on_append_output = (run_id, item_id, test_env_id, output) -> lock(outputs_lock) do
             push!(outputs, (testitem_id=item_id, output=output))
         end,
         on_attach_debugger = (run_id, pipe_name) -> nothing,
@@ -44,8 +44,10 @@
     )
 
     controller = TestItemController(callbacks; log_level=:Debug)
-    profile = TestHelpers.make_test_profile()
+    test_env = TestHelpers.make_test_environment(; TestHelpers._env_kwargs(discovered)...)
     testrun_id = string(UUIDs.uuid4())
+
+    work_units = [TestRunItem(item.id, test_env.id, nothing, :Debug) for item in output_items]
 
     controller_task = @async try
         run(controller)
@@ -55,8 +57,8 @@
 
     @info "[test] Output capture: executing testrun"
     execute_testrun(
-        controller, testrun_id, [profile],
-        output_items, discovered.setups, nothing
+        controller, testrun_id, [test_env],
+        output_items, work_units, discovered.setups, 1, nothing
     )
 
     @info "[test] Output capture: shutting down"

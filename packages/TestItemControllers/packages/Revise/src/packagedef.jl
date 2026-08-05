@@ -79,12 +79,21 @@ function wait_changed(file)
     try
         polling_files[] ? poll_file(file) : watch_file(file)
     catch err
-        if Sys.islinux() && err isa Base.IOError && err.code == -28  # ENOSPC
-            @warn """Your operating system has run out of inotify capacity.
-            Check the current value with `cat /proc/sys/fs/inotify/max_user_watches`.
-            Set it to a higher level with, e.g., `echo 65536 | sudo tee -a /proc/sys/fs/inotify/max_user_watches`.
-            This requires having administrative privileges on your machine (or talk to your sysadmin).
-            See https://github.com/timholy/Revise.jl/issues/26 for more information."""
+        if Sys.islinux() && err isa Base.IOError && err.code == -28  # ENOSPC; issue #1010
+            @warn """Revise was unable to watch files for changes via inotify (ENOSPC).
+            This can happen because:
+            - the filesystem does not support inotify (e.g., a WSL `/mnt/...` drive or
+              some network mounts);
+            - a per-user-namespace limit is in effect (common inside containers,
+              snaps, or Flatpaks), in which case `cat /proc/sys/fs/inotify/max_user_watches`
+              may report a large value that is not the limit actually enforced;
+            - the per-user `max_user_watches` limit is genuinely exhausted.
+            As a workaround, set the environment variable `JULIA_REVISE_POLL=1` before
+            `using Revise` to poll the filesystem instead of using inotify.
+            If `max_user_watches` is genuinely the cause, raise it with, e.g.,
+            `echo 65536 | sudo tee /proc/sys/fs/inotify/max_user_watches` (administrative
+            privileges required).
+            See https://github.com/timholy/Revise.jl/issues/26 for more information.""" maxlog=1
         end
         rethrow(err)
     end
@@ -153,8 +162,9 @@ Global variable, maps `(pkgdata, filename)` pairs that errored upon last revisio
 """
 const queue_errors = Dict{Tuple{PkgData,String},Tuple{Exception, Any}}() # locking is covered by revision_queue_lock
 
-# Can we revise types?
-const __bpart__ = Base.VERSION >= v"1.12.0-DEV.2047"
+# Can we revise types? This is assigned in __init__() based on the Julia version
+# and preference.
+const __bpart__ = Ref(false)
 
 """
     Revise.NOPACKAGE
@@ -209,8 +219,9 @@ Julia's top-level directory when Julia was built, as recorded by the entries in
 `Base._included_files`.
 """
 const basebuilddir = begin
-    sysimg = filter(x->endswith(x[2], "sysimg.jl"), Base._included_files)[1][2]
-    dirname(dirname(sysimg))
+    # issue #1045: non-incremental PackageCompiler sysimages have no sysimg.jl entry
+    idx = findfirst(x -> endswith(x[2], "sysimg.jl"), Base._included_files)
+    idx === nothing ? expected_juliadir() : dirname(dirname(Base._included_files[idx][2]))
 end
 
 function fallback_juliadir(candidate = expected_juliadir())
@@ -343,7 +354,7 @@ function delete_missing!(
             for exinfo in exinfos
                 if exinfo isa SigInfo
                     handle_method_deletion!(exinfo, rex, world)
-                elseif __bpart__
+                elseif __bpart__[]
                     handle_type_deletion!(exinfo::TypeInfo, reeval_list, handled_types, world)
                 end
             end
@@ -607,17 +618,17 @@ function init_watching(pkgdata::PkgData, files=srcfiles(pkgdata))
         if new_id != NOPACKAGE || current_id === nothing
             # Allow the package id to be updated
             push!(watchlist, basename=>pkgdata)
+            # Record the current ctime as baseline so only future changes are detected
+            watchlist.file_ctimes[basename] = ctime(joinpath(dirfull, basename))
             if watching_files[]
                 fwatcher = TaskThunk(revise_file_queued, (pkgdata, file))
                 schedule(Task(fwatcher))
             else
-                already_watching_dir || push!(udirs, dir)
+                already_watching_dir || push!(udirs, dirfull)
             end
         end
     end
-    for dir in udirs
-        dirfull = joinpath(basedir(pkgdata), dir)
-        @lock watched_files_lock updatetime!(watched_files[dirfull])
+    for dirfull in udirs
         if !watching_files[]
             dwatcher = TaskThunk(revise_dir_queued, (dirfull,))
             schedule(Task(dwatcher))
@@ -751,6 +762,7 @@ function handle_deletions(
         wl = get(watched_files, basedir(pkgdata), nothing)
         if isa(wl, WatchList)
             delete!(wl.trackedfiles, file)
+            delete!(wl.file_ctimes, file)
         end
     end
     return mod_exs_infos_new, mod_exs_infos_old
@@ -1007,7 +1019,7 @@ function revise(; throw::Bool=false)
         end
 
         # Do binding redefinitions
-        if __bpart__
+        if __bpart__[]
             redefine_bindings!(revision_errors, reeval_list, world)
         end
 
@@ -1398,7 +1410,8 @@ end
 function add_definitions_from_repl(filename::String)
     hist_idx = parse(Int, filename[6:end-1])
     hp = (Base.active_repl::REPL.LineEditREPL).interface.modes[1].hist::REPL.REPLHistoryProvider
-    src = hp.history[hp.start_idx+hist_idx]
+    entry = hp.history[hp.start_idx+hist_idx]
+    src = entry isa AbstractString ? entry : entry.content
     id = PkgId(nothing, "@REPL")
     pkgdata = pkgdatas[id]
     mod_exs_infos = ModuleExprsInfos(Main::Module)
@@ -1498,6 +1511,13 @@ function revise_first(ex)
                 exu = exu.args[2]
             end
         end
+
+        # Try to detect shell mode in the REPL. Might also falsely trigger for certain
+        # `julia>` mode commands, but 🤷
+        if isexpr(exu, :call, 3) && exu.args[1] == :(Base.repl_cmd)
+            return ex
+        end
+
         if isa(exu, Expr)
             exu.head === :call && length(exu.args) == 1 && exu.args[1] === :exit && return ex
             lhsrhs = LoweredCodeUtils.get_lhs_rhs(exu)
@@ -1588,6 +1608,7 @@ function __init__()
     for pkg in silenced
         push!(silence_pkgs, pkg)
     end
+    __bpart__[] = Base.VERSION >= v"1.12.0-DEV.2047" && Preferences.@load_preference("revise_structs", false)
     polling = get(ENV, "JULIA_REVISE_POLL", "0")
     if polling == "1"
         polling_files[] = watching_files[] = true
@@ -1657,7 +1678,7 @@ function __init__()
     # This feature needs to be disabled on Apple Silicon for Julia v1.12 and earlier
     # due to the Julia runtime side issue (https://github.com/JuliaLang/julia/issues/60721)
     @static if !(VERSION < v"1.13-" && Sys.isapple())
-        if __bpart__ && (isnothing(distributed_module) || distributed_module.myid() == 1)
+        if __bpart__[] && (isnothing(distributed_module) || distributed_module.myid() == 1)
             Threads.@spawn :default foreach_subtype(Any) do @nospecialize type
                 # Populating this cache can be time consuming (eg, 30s on an
                 # i7-7700HQ) so do this incrementally and yield() to the scheduler

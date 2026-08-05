@@ -29,6 +29,46 @@ end
     @test true
 end
 
+@testitem "erroring test deep stack" begin
+    function inner()
+        error("deep error")
+    end
+    function middle()
+        inner()
+    end
+    function outer()
+        middle()
+    end
+    outer()
+end
+
+@testitem "erroring test via package" begin
+    using BasicPackage
+    buggy_func()
+end
+
+@testitem "failing test multiple" begin
+    @test 1 == 2
+    @test 3 == 4
+end
+
+@testitem "test error inside @test" begin
+    @test error("inside test macro")
+end
+
+@testitem "test error inside @test deep stack" begin
+    function inner_test_func()
+        error("deep @test error")
+    end
+    function middle_test_func()
+        inner_test_func()
+    end
+    function outer_test_func()
+        middle_test_func()
+    end
+    @test outer_test_func()
+end
+
 @testitem "exit crash" begin
     exit()
 end

@@ -4,7 +4,7 @@
 
     passing_items = filter(i -> i.label == "add works", discovered.items)
 
-    result = TestHelpers.run_testrun(passing_items, discovered.setups)
+    result = TestHelpers.run_testrun(passing_items, discovered.setups, discovered)
 
     # Test run should complete successfully
     passed_events = filter(e -> e.event == :passed, result.events)
@@ -21,14 +21,14 @@ end
     process_events = NamedTuple[]
 
     callbacks = ControllerCallbacks(
-        on_testitem_started = (run_id, item_id) -> nothing,
-        on_testitem_passed = (run_id, item_id, duration) -> nothing,
-        on_testitem_failed = (run_id, item_id, messages, duration) -> nothing,
-        on_testitem_errored = (run_id, item_id, messages, duration) -> nothing,
-        on_testitem_skipped = (run_id, item_id) -> nothing,
-        on_append_output = (run_id, item_id, output) -> nothing,
+        on_testitem_started = (run_id, item_id, test_env_id) -> nothing,
+        on_testitem_passed = (run_id, item_id, test_env_id, duration) -> nothing,
+        on_testitem_failed = (run_id, item_id, test_env_id, messages, duration) -> nothing,
+        on_testitem_errored = (run_id, item_id, test_env_id, messages, duration) -> nothing,
+        on_testitem_skipped = (run_id, item_id, test_env_id) -> nothing,
+        on_append_output = (run_id, item_id, test_env_id, output) -> nothing,
         on_attach_debugger = (run_id, pipe_name) -> nothing,
-        on_process_created = (id, pkg_name, pkg_uri, proj_uri, coverage, env) -> push!(process_events, (event=:created, id=id)),
+        on_process_created = (id, test_env_id) -> push!(process_events, (event=:created, id=id)),
         on_process_terminated = id -> push!(process_events, (event=:terminated, id=id)),
     )
 

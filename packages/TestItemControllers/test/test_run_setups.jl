@@ -11,7 +11,7 @@
     relevant_setups = filter(s -> s.name in setup_items[1].test_setups, discovered.setups)
     @test length(relevant_setups) >= 1
 
-    result = TestHelpers.run_testrun(setup_items, discovered.setups)
+    result = TestHelpers.run_testrun(setup_items, discovered.setups, discovered)
 
     passed_events = filter(e -> e.event == :passed, result.events)
     failed_events = filter(e -> e.event == :failed, result.events)
@@ -30,7 +30,7 @@ end
     snippet_items = filter(i -> i.label == "uses snippet setup", discovered.items)
     @test length(snippet_items) == 1
 
-    result = TestHelpers.run_testrun(snippet_items, discovered.setups)
+    result = TestHelpers.run_testrun(snippet_items, discovered.setups, discovered)
 
     passed_events = filter(e -> e.event == :passed, result.events)
     @test length(passed_events) == 1

@@ -7,7 +7,7 @@
     items = filter(i -> i.label in original_labels, discovered.items)
     @test length(items) == 4
 
-    result = TestHelpers.run_testrun(items, discovered.setups)
+    result = TestHelpers.run_testrun(items, discovered.setups, discovered)
 
     started_events = filter(e -> e.event == :started, result.events)
     passed_events = filter(e -> e.event == :passed, result.events)
