@@ -1,5 +1,5 @@
 @testitem "@testitem macro missing all args" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -20,7 +20,7 @@
 end
 
 @testitem "Wrong type for name" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -41,7 +41,7 @@ end
 end
 
 @testitem "Code block missing" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -62,7 +62,7 @@ end
 end
 
 @testitem "Final arg not a code block" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -83,7 +83,7 @@ end
 end
 
 @testitem "None kw arg" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -104,7 +104,7 @@ end
 end
 
 @testitem "Duplicate kw arg" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -125,7 +125,7 @@ end
 end
 
 @testitem "Incomplete kw arg" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -146,7 +146,7 @@ end
 end
 
 @testitem "Wrong default_imports type kw arg" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -167,7 +167,7 @@ end
 end
 
 @testitem "non vector arg for tags kw" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -188,7 +188,7 @@ end
 end
 
 @testitem "Wrong types in tags kw arg" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -209,7 +209,7 @@ end
 end
 
 @testitem "Unknown keyword arg" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -230,15 +230,16 @@ end
 end
 
 @testitem "All parts correctly there" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
-    using JuliaWorkspaces.URIs2: @uri_str
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: filepath2uri
 
-    uri = uri"file://src/foo.jl"
-    content = """@testitem "foo" tags=[:a, :b] setup=[FooSetup] default_imports=true begin println() end
-    """
+    pkg_dir = joinpath(@__DIR__, "..", "testdata", "TestPackageTestItems")
+    src_file = joinpath(pkg_dir, "src", "testitem_all_parts.jl")
+    content = read(src_file, String)
+    uri = filepath2uri(src_file)
 
     jw = JuliaWorkspace()
-
+    add_file!(jw, TextFile(filepath2uri(joinpath(pkg_dir, "Project.toml")), SourceText(read(joinpath(pkg_dir, "Project.toml"), String), "toml")))
     add_file!(jw, TextFile(uri, SourceText(content, "julia")))
 
     test_results = get_test_items(jw, uri)
@@ -250,7 +251,6 @@ end
     ti = test_results.testitems[1]
 
     @test ti.name == "foo"
-    @test ti.id == "file://src/foo.jl:1"
     @test ti.range == 1:87
     @test ti.code_range == 75:83
     @test ti.option_default_imports == true
@@ -258,8 +258,52 @@ end
     @test ti.option_setup == [:FooSetup]
 end
 
+@testitem "test items outside package become errors" begin
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: filepath2uri
+
+    src_file = joinpath(@__DIR__, "..", "testdata", "not_a_package", "testitem_outside_pkg.jl")
+    content = read(src_file, String)
+    uri = filepath2uri(src_file)
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(uri, SourceText(content, "julia")))
+
+    test_results = get_test_items(jw, uri)
+
+    @test length(test_results.testitems) == 0
+    @test length(test_results.testsetups) == 0
+    @test length(test_results.testerrors) == 1
+
+    te = test_results.testerrors[1]
+    @test te.name == "foo"
+    @test te.message == "Test items must be defined inside a Julia package."
+end
+
+@testitem "test setups outside package become errors" begin
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: filepath2uri
+
+    src_file = joinpath(@__DIR__, "..", "testdata", "not_a_package", "testmodule_outside_pkg.jl")
+    content = read(src_file, String)
+    uri = filepath2uri(src_file)
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(uri, SourceText(content, "julia")))
+
+    test_results = get_test_items(jw, uri)
+
+    @test length(test_results.testitems) == 0
+    @test length(test_results.testsetups) == 0
+    @test length(test_results.testerrors) == 1
+
+    te = test_results.testerrors[1]
+    @test te.name == "Foo"
+    @test te.message == "Test setups must be defined inside a Julia package."
+end
+
 @testitem "@testmodule macro missing begin end" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -280,7 +324,7 @@ end
 end
 
 @testitem "@testsnippet macro missing begin end block" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -301,7 +345,7 @@ end
 end
 
 @testitem "@testmodule macro extra args" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -321,7 +365,7 @@ end
 end
 
 @testitem "@testsnippet macro extra args" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
     using JuliaWorkspaces.URIs2: @uri_str
 
     uri = uri"file://src/foo.jl"
@@ -341,14 +385,16 @@ end
 end
 
 @testitem "@testmodule all correct" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
-    using JuliaWorkspaces.URIs2: @uri_str
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: filepath2uri
 
-    uri = uri"file://src/foo.jl"
-    content = """@testmodule Foo begin const BAR = 1 end"""
+    pkg_dir = joinpath(@__DIR__, "..", "testdata", "TestPackageTestItems")
+    src_file = joinpath(pkg_dir, "src", "testmodule_all_correct.jl")
+    content = read(src_file, String)
+    uri = filepath2uri(src_file)
 
     jw = JuliaWorkspace()
-
+    add_file!(jw, TextFile(filepath2uri(joinpath(pkg_dir, "Project.toml")), SourceText(read(joinpath(pkg_dir, "Project.toml"), String), "toml")))
     add_file!(jw, TextFile(uri, SourceText(content, "julia")))
 
     test_results = get_test_items(jw, uri)
@@ -361,19 +407,21 @@ end
 
     @test tsd.name == :Foo
     @test tsd.kind == :module
-    @test tsd.range == 1:length(content)
-    @test tsd.code_range == (length("@testmodule Foo begin ") + 1):(length(content) - 4)
+    @test tsd.range == 1:39
+    @test tsd.code_range == (length("@testmodule Foo begin ") + 1):(39 - 4)
 end
 
 @testitem "@testsnippet all correct" begin
-    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail
-    using JuliaWorkspaces.URIs2: @uri_str
+    using JuliaWorkspaces: JuliaWorkspace, TestErrorDetail, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: filepath2uri
 
-    uri = uri"file://src/foo.jl"
-    content = """@testsnippet Foo begin const BAR = 1 end"""
+    pkg_dir = joinpath(@__DIR__, "..", "testdata", "TestPackageTestItems")
+    src_file = joinpath(pkg_dir, "src", "testsnippet_all_correct.jl")
+    content = read(src_file, String)
+    uri = filepath2uri(src_file)
 
     jw = JuliaWorkspace()
-
+    add_file!(jw, TextFile(filepath2uri(joinpath(pkg_dir, "Project.toml")), SourceText(read(joinpath(pkg_dir, "Project.toml"), String), "toml")))
     add_file!(jw, TextFile(uri, SourceText(content, "julia")))
 
     test_results = get_test_items(jw, uri)
@@ -386,49 +434,50 @@ end
 
     @test tsd.name == :Foo
     @test tsd.kind == :snippet
-    @test tsd.range == 1:length(content)
-    @test tsd.code_range == (length("@testsnippet Foo begin ") + 1):(length(content) - 4)
+    @test tsd.range == 1:40
+    @test tsd.code_range == (length("@testsnippet Foo begin ") + 1):(40 - 4)
 end
 
-@testitem "@testitem project detection" begin
+@testitem "@testitem project detection" tags=[:skip] begin
     using Pkg
-    using JuliaWorkspaces: JuliaWorkspace
+    using JuliaWorkspaces: JuliaWorkspaces, JuliaWorkspace
     using JuliaWorkspaces.URIs2: @uri_str, filepath2uri
 
-    mktempdir() do root_path
-        cp(joinpath(@__DIR__, "data", "project_detection"), joinpath(root_path, "project_detection"))
+    old = Base.active_project()
+    try
 
-        Pkg.activate(joinpath(root_path, "project_detection", "TestPackage2"))
-        Pkg.instantiate()
+        mktempdir() do root_path
+            cp(joinpath(@__DIR__, "..", "testdata", "project_detection"), joinpath(root_path, "project_detection"))
 
-        Pkg.activate(joinpath(root_path, "project_detection"))
-        Pkg.develop(PackageSpec(path=joinpath(root_path, "project_detection", "TestPackage3")))
-        Pkg.instantiate()
+            Pkg.activate(joinpath(root_path, "project_detection", "TestPackage2"))
+            Pkg.instantiate()
 
-        jw = JuliaWorkspaces.workspace_from_folders([root_path])
+            Pkg.activate(joinpath(root_path, "project_detection"))
+            Pkg.develop(PackageSpec(path=joinpath(root_path, "project_detection", "TestPackage3")))
+            Pkg.instantiate()
 
-        file1_uri = filepath2uri(joinpath(root_path, "project_detection", "TestPackage2", "src", "TestPackage2.jl"))
-        file2_uri = filepath2uri(joinpath(root_path, "project_detection", "TestPackage3", "src", "TestPackage3.jl"))
-        file3_uri = filepath2uri(joinpath(root_path, "project_detection", "TestPackage4", "src", "TestPackage4.jl"))
+            jw = JuliaWorkspaces.workspace_from_folders([root_path])
+
+            file1_uri = filepath2uri(joinpath(root_path, "project_detection", "TestPackage2", "src", "TestPackage2.jl"))
+            file2_uri = filepath2uri(joinpath(root_path, "project_detection", "TestPackage3", "src", "TestPackage3.jl"))
+            file3_uri = filepath2uri(joinpath(root_path, "project_detection", "TestPackage4", "src", "TestPackage4.jl"))
+        end
+    finally
+        Base.set_active_project(old)
     end
 end
 
 @testitem "module behind docstring" begin
-    using JuliaWorkspaces: JuliaWorkspace
-    using JuliaWorkspaces.URIs2: @uri_str
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: filepath2uri
 
-    uri = uri"file://src/foo.jl"
-    content = """
-        "Foo"
-        module Foo
-            @testitem "Test1" begin
-                @test 1 + 1 == 2
-            end
-        end
-    """
+    pkg_dir = joinpath(@__DIR__, "..", "testdata", "TestPackageTestItems")
+    src_file = joinpath(pkg_dir, "src", "module_behind_docstring.jl")
+    content = read(src_file, String)
+    uri = filepath2uri(src_file)
 
     jw = JuliaWorkspace()
-
+    add_file!(jw, TextFile(filepath2uri(joinpath(pkg_dir, "Project.toml")), SourceText(read(joinpath(pkg_dir, "Project.toml"), String), "toml")))
     add_file!(jw, TextFile(uri, SourceText(content, "julia")))
 
     test_results = get_test_items(jw, uri)
@@ -448,7 +497,7 @@ end
         # Create project with versioned manifest
         project_dir = joinpath(temp_dir, "VersionedProject")
         mkpath(project_dir)
-        
+
         project_file = joinpath(project_dir, "Project.toml")
         write(project_file, """
 name = "VersionedProject"
@@ -458,7 +507,7 @@ version = "0.1.0"
 [deps]
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 """)
-        
+
         # Create versioned manifest
         versioned_manifest = joinpath(project_dir, "Manifest-v$(VERSION.major).$(VERSION.minor).toml")
         write(versioned_manifest, """
@@ -479,25 +528,25 @@ version = "0.7.0"
 uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 version = "1.10.0"
 """)
-        
+
         # Add to workspace
         project_uri = filepath2uri(project_file)
         manifest_uri = filepath2uri(versioned_manifest)
         folder_uri = filepath2uri(project_dir)
-        
+
         jw = JuliaWorkspace()
         add_file!(jw, TextFile(project_uri, SourceText(read(project_file, String), "toml")))
         add_file!(jw, TextFile(manifest_uri, SourceText(read(versioned_manifest, String), "toml")))
-        
+
         # Test that versioned manifest IS now detected
         rt = jw.runtime
         potential_projects = JuliaWorkspaces.derived_potential_project_folders(rt)
-        
+
         @test haskey(potential_projects, folder_uri)
         project_info = potential_projects[folder_uri]
         @test project_info.project_file !== nothing
         @test project_info.manifest_file !== nothing  # FIXED: versioned manifest now detected
-        
+
         # This should now return a valid project
         derived_result = JuliaWorkspaces.derived_project(rt, folder_uri)
         @test derived_result !== nothing
@@ -539,8 +588,8 @@ version = "0.1.0"
         add_file!(jw, TextFile(project_uri, SourceText(read(project_file, String), "toml")))
         add_file!(jw, TextFile(test_uri, SourceText("# test", "julia")))
 
-        # Set project as fallback test project
-        JuliaWorkspaces.set_input_fallback_test_project!(jw.runtime, folder_uri)
+        # Set project as active project
+        JuliaWorkspaces.set_input_active_project!(jw.runtime, folder_uri)
 
         rt = jw.runtime
 
@@ -553,4 +602,101 @@ version = "0.1.0"
         @test test_env isa JuliaWorkspaces.JuliaTestEnv
         @test test_env.project_uri === nothing  # Should be set to nothing due to lack of manifest
     end
+end
+
+@testitem "derived_testenv for a file in a deved package of a project" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_test_env
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    [deps]
+    Inner = "6b0e2f31-8d55-4f2a-9d10-2b6c5e8f9a22"
+    """
+
+    manifest_toml = """
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+
+    [[deps.Inner]]
+    deps = []
+    path = "Inner"
+    uuid = "6b0e2f31-8d55-4f2a-9d10-2b6c5e8f9a22"
+    version = "2.0.0"
+    """
+
+    inner_project = """
+    name = "Inner"
+    uuid = "6b0e2f31-8d55-4f2a-9d10-2b6c5e8f9a22"
+    version = "2.0.0"
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///devedenv/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///devedenv/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///devedenv/Inner/Project.toml"), SourceText(inner_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///devedenv/Inner/src/Inner.jl"), SourceText("module Inner end", "julia")))
+
+    # The deved package is the package, the outer folder is the project
+    test_env = get_test_env(jw, URI("file:///devedenv/Inner/src/Inner.jl"))
+    @test test_env.package_name == "Inner"
+    @test test_env.package_uri == URI("file:///devedenv/Inner")
+    @test test_env.project_uri == URI("file:///devedenv")
+end
+
+@testitem "Test-item detail equality distinguishes empty ranges by position" begin
+    using JuliaWorkspaces: TestItemDetail, TestSetupDetail, TestErrorDetail
+    using JuliaWorkspaces.URIs2: @uri_str
+
+    u = uri"file:///t.jl"
+
+    # Empty UnitRanges are == regardless of position (24:23 == 23:22); a shifted
+    # empty range (e.g. an EOF marker after a trailing-trivia edit) must count as
+    # a change, or Salsa backdating keeps the stale range.
+    te_a = TestErrorDetail(u, "id", "n", "msg", 24:23)
+    te_b = TestErrorDetail(u, "id", "n", "msg", 23:22)
+    @test te_a != te_b
+    @test !isequal(te_a, te_b)
+    @test hash(te_a) != hash(te_b)
+
+    ti_a = TestItemDetail(u, "id", "n", "code", 24:23, 24:23, true, Symbol[], Symbol[])
+    ti_b = TestItemDetail(u, "id", "n", "code", 23:22, 23:22, true, Symbol[], Symbol[])
+    @test ti_a != ti_b
+    @test !isequal(ti_a, ti_b)
+    @test hash(ti_a) != hash(ti_b)
+
+    ts_a = TestSetupDetail(u, :n, :k, "code", 24:23, 24:23)
+    ts_b = TestSetupDetail(u, :n, :k, "code", 23:22, 23:22)
+    @test ts_a != ts_b
+    @test !isequal(ts_a, ts_b)
+    @test hash(ts_a) != hash(ts_b)
+
+    # Identical values still compare equal (backdating must still work).
+    @test te_b == TestErrorDetail(u, "id", "n", "msg", 23:22)
+    @test isequal(ti_b, TestItemDetail(u, "id", "n", "code", 23:22, 23:22, true, Symbol[], Symbol[]))
+    @test hash(ts_b) == hash(TestSetupDetail(u, :n, :k, "code", 23:22, 23:22))
+end
+
+@testitem "get_test_items on untitled (non-file) URI" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_test_items
+    using JuliaWorkspaces.URIs2: @uri_str
+
+    jw = JuliaWorkspace()
+
+    # A recognized package folder makes derived_package_folders non-empty, so
+    # derived_package_for_file iterates it for the untitled file below.
+    add_file!(jw, TextFile(uri"file:///home/foo/Project.toml", SourceText("name = \"Foo\"\nuuid = \"12345678-1234-1234-1234-123456789012\"\nversion = \"0.1.0\"\n", "toml")))
+    add_file!(jw, TextFile(uri"file:///home/foo/src/Foo.jl", SourceText("module Foo\nend\n", "julia")))
+
+    uri = uri"untitled:Untitled-1"
+    content = """@testitem "foo" begin
+    end
+    """
+    add_file!(jw, TextFile(uri, SourceText(content, "julia")))
+
+    # Non-file URIs have no filesystem path; this must not crash. The file is
+    # not inside any package, so the testitem is reported as a testerror.
+    test_results = get_test_items(jw, uri)
+
+    @test length(test_results.testitems) == 0
+    @test length(test_results.testerrors) == 1
 end

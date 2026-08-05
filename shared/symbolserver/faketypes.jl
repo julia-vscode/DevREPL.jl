@@ -1,0 +1,248 @@
+########## Fake type-system
+
+
+# Used to label all objects
+struct VarRef
+    parent::Union{VarRef,Nothing}
+    name::Symbol
+end
+VarRef(m::Module) = VarRef((parentmodule(m) == Main || parentmodule(m) == m) ? nothing : VarRef(parentmodule(m)), nameof(m))
+
+# These mirror Julia types (w/o the Fake prefix)
+struct FakeTypeName
+    name::VarRef
+    parameters::Vector{Any}
+end
+
+# Type parameters are expanded recursively so cached signatures keep their
+# structure, but a few types expand into huge trees — type-domain packages
+# whose types recurse into themselves (naturals as nested `NonnegativeInteger`,
+# rationals as continued fractions), and even some Base/LinearAlgebra
+# signatures whose `where`-bounded `Union`s reach tens of thousands of nodes —
+# which unbounded would produce multi-gigabyte caches that exhaust memory on
+# read. To prevent that, `budget` caps how many `DataType`s are expanded while
+# building one type: once it is spent, a type keeps only its name and a single
+# `Unserializable` parameter marking the aborted expansion (displayed as `…`,
+# same sentinel the cache writer uses). The limit sits far above any ordinary
+# type, so only these outliers are truncated; the serializer's own MAX_DEPTH
+# guard is a separate cycle check, not a size bound.
+const MAX_EXPANDED_TYPES = 256
+
+mutable struct ExpandBudget
+    remaining::Int
+end
+ExpandBudget() = ExpandBudget(MAX_EXPANDED_TYPES)
+
+function FakeTypeName(@nospecialize(x), budget::ExpandBudget=ExpandBudget())
+    @static if !(Vararg isa Type)
+        # Pass the budget on: expansion below a `Vararg` counts against the same
+        # cap as everything else.
+        x isa typeof(Vararg) && return _fake_vararg(x, budget)
+    end
+    if x isa DataType
+        xname = x.name
+        ft = FakeTypeName(VarRef(VarRef(xname.module), xname.name), [])
+        if isempty(x.parameters)
+            # leaf type, nothing to expand
+        elseif budget.remaining > 0
+            budget.remaining -= 1
+            for p in x.parameters
+                push!(ft.parameters, _parameter(p, budget))
+            end
+        else
+            push!(ft.parameters, Unserializable())
+        end
+        ft
+    elseif x isa Union
+        FakeUnion(x, budget)
+    elseif x isa UnionAll
+        FakeUnionAll(x, budget)
+    elseif x isa TypeVar
+        FakeTypeVar(x, budget)
+    elseif x isa Core.TypeofBottom
+        FakeTypeofBottom()
+    elseif x isa Module
+        VarRef(x)
+    else
+        # Reached only for a non-type value that isn't a type parameter (those
+        # go through `_parameter`). Report the value so the culprit binding is
+        # identifiable instead of the bare `(x, typeof(x))` tuple.
+        v = try
+            s = repr(x)
+            length(s) > 100 ? first(s, 100) * "…" : s
+        catch
+            "<unprintable>"
+        end
+        error("FakeTypeName: expected a type/TypeVar/Union/UnionAll/Module, got $v::$(typeof(x))")
+    end
+end
+
+struct FakeTypeofBottom end
+# stands in for values the cache writer could not serialize (oversized tuples,
+# over-deep/cyclic subtrees)
+struct Unserializable end
+Base.show(io::IO, ::Unserializable) = print(io, "…")
+struct FakeUnion
+    a
+    b
+end
+FakeUnion(u::Union, budget::ExpandBudget=ExpandBudget()) = FakeUnion(FakeTypeName(u.a, budget), FakeTypeName(u.b, budget))
+struct FakeTypeVar
+    name::Symbol
+    lb
+    ub
+end
+FakeTypeVar(tv::TypeVar, budget::ExpandBudget=ExpandBudget()) = FakeTypeVar(tv.name, FakeTypeName(tv.lb, budget), FakeTypeName(tv.ub, budget))
+struct FakeUnionAll
+    var::FakeTypeVar
+    body::Any
+end
+FakeUnionAll(ua::UnionAll, budget::ExpandBudget=ExpandBudget()) = FakeUnionAll(FakeTypeVar(ua.var, budget), FakeTypeName(ua.body, budget))
+
+function _parameter(@nospecialize(p), budget::ExpandBudget=ExpandBudget())
+    if p isa Union{Int,Symbol,Bool,Char}
+        p
+    elseif !(p isa Type) && isbitstype(typeof(p))
+        0
+    elseif p isa Tuple
+        map(pp -> _parameter(pp, budget), p)
+    else
+        FakeTypeName(p, budget)
+    end
+end
+
+function Base.show(io::IO, vr::VarRef)
+    if vr.parent === nothing
+        print(io, vr.name)
+    else
+        # An `:ss_shorten` predicate in the IOContext may request dropping the
+        # module qualifier (e.g. `Core.Any` -> `Any`) for names it deems
+        # unambiguous
+        pred = get(io, :ss_shorten, nothing)
+        if pred !== nothing && pred(vr)
+            print(io, vr.name)
+        else
+            print(io, vr.parent, ".", vr.name)
+        end
+    end
+end
+function Base.show(io::IO, tn::FakeTypeName)
+    print(io, tn.name)
+    if !isempty(tn.parameters)
+        print(io, "{")
+        for i = 1:length(tn.parameters)
+            print(io, tn.parameters[i])
+            i != length(tn.parameters) && print(io, ",")
+        end
+        print(io, "}")
+    end
+end
+function Base.show(io::IO, x::FakeUnionAll)
+    vars = get(io, :_fake_unionall_vars, Symbol[])::Vector{Symbol}
+    body_io = IOContext(io, :_fake_unionall_vars => push!(copy(vars), x.var.name))
+    print(body_io, x.body)
+    print(io, " where ", x.var)
+end
+function Base.show(io::IO, x::FakeUnion; inunion=false)
+    !inunion && print(io, "Union{")
+    print(io, x.a, ",")
+    if x.b isa FakeUnion
+        Base.show(io, x.b; inunion=true)
+    else
+        print(io, x.b, "}")
+    end
+end
+function Base.show(io::IO, x::FakeTypeVar)
+    if x.name in get(io, :_fake_unionall_vars, Symbol[])::Vector{Symbol}
+        print(io, x.name)
+    elseif isfakebottom(x.lb)
+        if isfakeany(x.ub)
+            print(io, x.name)
+        else
+            print(io, x.name, "<:", x.ub)
+        end
+    elseif isfakeany(x.ub)
+        print(io, x.lb, "<:", x.name)
+    else
+        print(io, x.lb, "<:", x.name, "<:", x.ub)
+    end
+end
+
+isfakeany(t) = false
+isfakeany(t::FakeTypeName) = isfakeany(t.name)
+isfakeany(vr::VarRef) = vr.name === :Any && vr.parent isa VarRef && vr.parent.name === :Core && vr.parent.parent === nothing
+
+isfakebottom(t) = false
+isfakebottom(t::FakeTypeofBottom) = true
+
+Base.:(==)(a::FakeTypeName, b::FakeTypeName) = a.name == b.name && a.parameters == b.parameters
+Base.:(==)(a::VarRef, b::VarRef) = a.parent == b.parent && a.name == b.name
+Base.:(==)(a::FakeTypeVar, b::FakeTypeVar) = a.lb == b.lb && a.name == b.name && a.ub == b.ub
+Base.:(==)(a::FakeUnionAll, b::FakeUnionAll) = a.var == b.var && a.body == b.body
+Base.:(==)(a::FakeUnion, b::FakeUnion) = a.a == b.a && a.b == b.b
+Base.:(==)(a::FakeTypeofBottom, b::FakeTypeofBottom) = true
+
+Base.hash(a::FakeTypeName, h::UInt) = hash(a.name, hash(a.parameters, hash(:FakeTypeName, h)))
+Base.hash(a::VarRef, h::UInt) = hash(a.name, hash(a.parent, hash(:VarRef, h)))
+Base.hash(a::FakeTypeVar, h::UInt) = hash(a.name, hash(a.lb, hash(a.ub, hash(:FakeTypeVar, h))))
+Base.hash(a::FakeUnionAll, h::UInt) = hash(a.var, hash(a.body, hash(:FakeUnionAll, h)))
+Base.hash(a::FakeUnion, h::UInt) = hash(a.a, hash(a.b, hash(:FakeUnion, h)))
+Base.hash(::FakeTypeofBottom, h::UInt) = hash(:FakeTypeofBottom, h)
+
+@static if !(Vararg isa Type)
+    struct FakeTypeofVararg
+        T
+        N
+        FakeTypeofVararg() = new()
+        FakeTypeofVararg(T) = (new(T))
+        FakeTypeofVararg(T, N) = new(T, N)
+    end
+    # Convert a `Vararg` instance. Both slots go through `_parameter`: `T` is a
+    # type in ordinary varargs but a bare value in ones like `NTuple{N,2}`
+    # (`Vararg{2,N}`), and `N` is either an `Int` or a `TypeVar`.
+    function _fake_vararg(va::typeof(Vararg), budget::ExpandBudget)
+        if isdefined(va, :N)
+            FakeTypeofVararg(_parameter(va.T, budget), _parameter(va.N, budget))
+        elseif isdefined(va, :T)
+            FakeTypeofVararg(_parameter(va.T, budget))
+        else
+            FakeTypeofVararg()
+        end
+    end
+    # Entry point for callers outside the recursion; without this method a
+    # `Vararg` would land in the field constructor below and be stored raw.
+    FakeTypeofVararg(va::typeof(Vararg)) = _fake_vararg(va, ExpandBudget())
+    function Base.print(io::IO, va::FakeTypeofVararg)
+        print(io, "Vararg")
+        if isdefined(va, :T)
+            print(io, "{", va.T)
+            if isdefined(va, :N)
+                print(io, ",", va.N)
+            end
+            print(io, "}")
+        end
+    end
+    # Mirrors `==` below: which fields are defined is part of the identity, so a
+    # bare `Vararg`, a `Vararg{T}` and a `Vararg{T,N}` hash differently.
+    function Base.hash(a::FakeTypeofVararg, h::UInt)
+        h = hash(:FakeTypeofVararg, h)
+        isdefined(a, :T) || return h
+        h = hash(a.T, h)
+        return isdefined(a, :N) ? hash(a.N, h) : h
+    end
+    function Base.:(==)(a::FakeTypeofVararg, b::FakeTypeofVararg)
+        if isdefined(a, :T)
+            if isdefined(b, :T) && a.T == b.T
+                if isdefined(a, :N)
+                    isdefined(b, :N) && a.N == b.N
+                else
+                    !isdefined(b, :N)
+                end
+            else
+                false
+            end
+        else
+            !isdefined(b, :T)
+        end
+    end
+end

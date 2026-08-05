@@ -1,0 +1,446 @@
+# Per-module extended-method contributions, cached by store `objectid`. A
+# store's contents are immutable once loaded, so its contributions never
+# change. Stdlib stores are const, but PACKAGE stores are re-created on
+# re-index — so the cache holds only a `WeakRef` to each store (keyed by
+# `objectid`, a value that does not pin the store): once a re-created/dropped
+# store is otherwise unreferenced, its entry — and the whole symbol table it
+# would have pinned — can be collected. The `=== m` guard rejects a stale
+# entry should an `objectid` be reused after collection. Dead entries are
+# swept opportunistically so the map can't grow without bound across
+# re-indexes.
+const _EXTENDS_CACHE = Dict{UInt,Tuple{WeakRef,Vector{Pair{SymbolServer.VarRef,SymbolServer.VarRef}}}}()
+const _EXTENDS_CACHE_LOCK = ReentrantLock()
+const _EXTENDS_CACHE_SWEEP_AT = 512
+
+function _module_extends_contributions(m::SymbolServer.ModuleStore)
+    oid = objectid(m)
+    @lock _EXTENDS_CACHE_LOCK begin
+        hit = get(_EXTENDS_CACHE, oid, nothing)
+        hit !== nothing && hit[1].value === m && return hit[2]
+    end
+    tmp = Dict{SymbolServer.VarRef,Vector{SymbolServer.VarRef}}()
+    SymbolServer.collect_extended_methods(m, tmp, m.name)
+    # collect_extended_methods seeds each vector with `extends.parent`; keep
+    # only the per-module contributions so they can be merged per environment
+    contribs = Pair{SymbolServer.VarRef,SymbolServer.VarRef}[]
+    for (ext, vec) in tmp
+        for mn in @view vec[2:end]
+            push!(contribs, ext => mn)
+        end
+    end
+    @lock _EXTENDS_CACHE_LOCK begin
+        if length(_EXTENDS_CACHE) >= _EXTENDS_CACHE_SWEEP_AT
+            filter!(kv -> kv.second[1].value !== nothing, _EXTENDS_CACHE)
+        end
+        _EXTENDS_CACHE[oid] = (WeakRef(m), contribs)
+    end
+    return contribs
+end
+
+# Equivalent to `SymbolServer.collect_extended_methods(store)`, but assembled
+# from the per-module cache so shared module stores are only ever walked once.
+function _collect_extended_methods_shared(store)
+    extendeds = Dict{SymbolServer.VarRef,Vector{SymbolServer.VarRef}}()
+    for (_, m) in store
+        for (ext, mn) in _module_extends_contributions(m)
+            push!(get!(() -> SymbolServer.VarRef[ext.parent], extendeds, ext), mn)
+        end
+    end
+    return extendeds
+end
+
+function _stdlib_only_env()
+    # Shallow copy: the entries alias the immutable baked stdlib stores.
+    # Nothing mutates store contents after construction (scopes and other
+    # environments already alias these instances).
+    new_store = copy(SymbolServer.stdlibs)
+    return StaticLint.ExternalEnv(new_store, _collect_extended_methods_shared(new_store), collect(keys(new_store)))
+end
+
+# ─── Per-key readiness wrappers ──────────────────────────────────────────────
+#
+# These memoized derived functions expose the per-key readiness state held in
+# the `input_ready_*` collection inputs. Reading the collection directly from a
+# gate would make *every* readiness query depend on the single collection
+# input, so any update would invalidate all of them. By funnelling each key
+# through its own derived function, Salsa's early-cutoff means a collection
+# update only invalidates downstream queries whose specific key's result
+# actually changed — restoring fine-grained invalidation.
+
+"""
+    derived_project_environment_ready(rt, project_uri, content_hash) -> Bool
+
+Whether the environment for `project_uri` (at `content_hash`) has been indexed.
+"""
+Salsa.@derived function derived_project_environment_ready(rt, project_uri, content_hash::UInt64)
+    key = WatchEnvironmentKey(uri2filepath(project_uri), content_hash)
+    return key in input_ready_project_environments(rt)
+end
+
+"""
+    derived_project_requires_indexing(rt, project_uri, content_hash) -> Bool
+
+Whether a dynamic process is scheduled to index `project_uri` (at
+`content_hash`). A project no work item covers — e.g. one without a manifest —
+can never become "ready", so readiness gates must not wait for it.
+
+Its own derived function so per-file gates depend on this per-project `Bool`
+instead of on the workspace-wide required set: when an unrelated workspace
+change recomputes the set, this key's answer usually does not change and
+Salsa's early cutoff stops the invalidation here.
+"""
+Salsa.@derived function derived_project_requires_indexing(rt, project_uri, content_hash::UInt64)
+    key = WatchEnvironmentKey(uri2filepath(project_uri), content_hash)
+    return key in derived_required_dynamic_projects(rt)
+end
+
+"""
+    derived_test_environment_pending(rt, key::WatchTestEnvironmentKey) -> Bool
+
+Whether the test-environment work item `key` is scheduled and can still produce
+a result. False when none is scheduled and false once the item failed
+terminally — waiting for either would gate forever.
+"""
+Salsa.@derived function derived_test_environment_pending(rt, key::WatchTestEnvironmentKey)
+    key in input_failed_dynamic_keys(rt) && return false
+    return key in derived_required_dynamic_projects(rt)
+end
+
+"""
+    derived_ready_test_environment(rt, key::WatchTestEnvironmentKey) -> Union{Nothing,URI}
+
+The ready test-project URI recorded for the test-environment work item `key`, or
+`nothing` if that environment has not been indexed yet.
+"""
+Salsa.@derived function derived_ready_test_environment(rt, key::WatchTestEnvironmentKey)
+    return get(input_ready_test_environments(rt), key, nothing)
+end
+
+"""
+    derived_ready_standalone_project(rt, package_folder_uri, content_hash) -> Union{Nothing,URI}
+
+The created standalone-project URI for `package_folder_uri`, or `nothing` if it
+has not been created yet.
+"""
+Salsa.@derived function derived_ready_standalone_project(rt, package_folder_uri, content_hash::UInt64)
+    key = CreateStandaloneProjectKey(uri2filepath(package_folder_uri), content_hash)
+    return get(input_standalone_projects(rt), key, nothing)
+end
+
+# Salsa-memoized stdlib-only env. Sharing a single env instance is required
+# because `SymbolServer` stores compare by identity: refs resolved against this
+# env during the semantic pass must point at the same instance that later
+# read-only queries (hover, completions, tests) retrieve.
+Salsa.@derived function derived_stdlib_only_env(rt)
+    @debug "derived_stdlib_only_env"
+    return _stdlib_only_env()
+end
+
+Salsa.@derived function derived_environment(rt, uri)
+    @debug "derived_environment" uri=uri
+
+    project = derived_project(rt, uri)
+
+    if project === nothing
+        # Reuse the memoized instance instead of building a fresh env per key.
+        return derived_stdlib_only_env(rt)
+    end
+
+    metadata_packages = SymbolServer.Package[]
+    for (k,v) in project.regular_packages
+        x = input_package_metadata(rt, Symbol(v.name), v.uuid, parse(VersionNumber, v.version), v.git_tree_sha1)
+        if x!==nothing
+            push!(metadata_packages, x)
+        end
+    end
+
+    for (k,v) in project.stdlib_packages
+        v.version === nothing && continue
+        x = input_package_metadata(rt, Symbol(v.name), v.uuid, parse(VersionNumber, v.version), nothing)
+        if x!==nothing
+            push!(metadata_packages, x)
+        end
+    end
+
+    # Shallow copy: stdlib entries alias the shared baked stores, package
+    # entries alias the memoized metadata inputs (which were always shared
+    # across environments). Only the top-level Dict is per-project.
+    new_store = copy(SymbolServer.stdlibs)
+
+    for i in metadata_packages
+        new_store[Symbol(i.name)] = i.val
+    end
+
+    project_deps = collect(keys(new_store))
+
+    # Add in-workspace deved packages to project_deps so import resolution considers them valid
+    for (k,v) in project.deved_packages
+        entry_uri = filepath2uri(joinpath(uri2filepath(v.uri), "src", "$(v.name).jl"))
+        if derived_has_file(rt, entry_uri)
+            push!(project_deps, Symbol(v.name))
+        end
+    end
+
+    return StaticLint.ExternalEnv(new_store, _collect_extended_methods_shared(new_store), project_deps)
+end
+
+Salsa.@derived function derived_workspace_deved_packages(rt, project_uri)
+    @debug "derived_workspace_deved_packages" project_uri=project_uri
+
+    project = derived_project(rt, project_uri)
+    project === nothing && return Dict{String, URI}()
+
+    result = Dict{String, URI}()
+    for (k, v) in project.deved_packages
+        entry_uri = filepath2uri(joinpath(uri2filepath(v.uri), "src", "$(v.name).jl"))
+        if derived_has_file(rt, entry_uri)
+            result[v.name] = entry_uri
+        end
+    end
+    return result
+end
+
+Salsa.@derived function derived_project_uri_for_root(rt, uri)
+    @debug "derived_project_uri_for_root" uri=uri
+
+    active_project = input_active_project(rt)
+
+    # Check if the file is inside a project folder (has both Project.toml and Manifest.toml).
+    # If this project folder is more specific (deeper) than the enclosing package folder,
+    # use it directly. This handles cases like benchmark/ sub-projects that aren't packages
+    # but define their own environment.
+    project_folder_uri = derived_project_for_file(rt, uri)
+    package_folder_uri = derived_package_for_file(rt, uri)
+
+    if project_folder_uri !== nothing
+        project_is_more_specific = package_folder_uri === nothing ||
+            length(uri2filepath(project_folder_uri)) > length(uri2filepath(package_folder_uri))
+        if project_is_more_specific
+            return project_folder_uri
+        end
+    end
+
+    if package_folder_uri!==nothing
+        package_folder = uri2filepath(package_folder_uri)
+        runtests_path = joinpath(package_folder, "test", "runtests.jl")
+
+        pkg = derived_package(rt, package_folder_uri)
+        pkg_content_hash = pkg === nothing ? UInt64(0) : pkg.content_hash
+
+        # TODO Is this lowercase the right move? On Windows for sure, not clear about other platforms
+        file_needs_test_env = lowercase(uri2filepath(uri)) == lowercase(runtests_path) ||
+            _file_has_testitems(rt, uri)
+
+        if file_needs_test_env && pkg !== nothing
+            test_env_key = _test_environment_key(rt, package_folder_uri, pkg)
+
+            if test_env_key !== nothing
+                test_project_uri = derived_ready_test_environment(rt, test_env_key)
+
+                if test_project_uri !== nothing
+                    return test_project_uri
+                end
+            end
+        end
+
+        # If the file belongs to a workspace package, use the package's own project
+        if package_folder_uri in derived_project_folders(rt)
+            return package_folder_uri
+        end
+
+        # If the package is not a project (no manifest) and not dev'd into any workspace project,
+        # trigger creation of a standalone project for it
+        deving_project = derived_deving_project(rt, package_folder_uri)
+        if deving_project === nothing
+            standalone_uri = derived_ready_standalone_project(rt, package_folder_uri, pkg_content_hash)
+            if standalone_uri !== nothing
+                return standalone_uri
+            end
+        else
+            # Package IS deved in a workspace project (possibly the standalone project
+            # that was created for it) — use that project
+            return deving_project
+        end
+    end
+
+    # TODO This needs to handle multi env
+    return active_project
+end
+
+"""
+    derived_deving_project(rt, package_folder_uri) -> Union{Nothing,URI}
+
+The workspace project that `dev`s the package at `package_folder_uri`, or
+`nothing` if no project does.
+
+Memoized because the scan touches *every* project in the workspace: called
+inline, each caller (one per file, via `derived_project_uri_for_root`) would
+take a dependency on all of them, so the number of edges the incremental engine
+walks would grow as files × projects.
+"""
+Salsa.@derived function derived_deving_project(rt, package_folder_uri)
+    for project_folder_uri in derived_project_folders(rt)
+        project = derived_project(rt, project_folder_uri)
+        project === nothing && continue
+        for (_, v) in project.deved_packages
+            if v.uri == package_folder_uri
+                return project_folder_uri
+            end
+        end
+    end
+    return nothing
+end
+
+_is_package_deved_in_workspace(rt, package_folder_uri) =
+    derived_deving_project(rt, package_folder_uri) !== nothing
+
+"""
+    _test_environment_key(rt, package_folder_uri, pkg) -> Union{Nothing,WatchTestEnvironmentKey}
+
+The identity of the test-environment work item for the package `pkg` at
+`package_folder_uri`, or `nothing` if no project can provide that environment.
+
+Single source of truth for that identity: the required set (which schedules the
+item), the result recorder and every readiness query must derive the same key, or
+a recorded result is looked up under a key nobody ever produced.
+
+The environment comes from the package's own folder when the package is a project
+itself, and likewise when no workspace project `dev`s it (a standalone project is
+fabricated for it under that same folder). Only for a deved package does the
+active project provide it.
+"""
+function _test_environment_key(rt, package_folder_uri, pkg)
+    project_for_test = if package_folder_uri in derived_project_folders(rt) ||
+            !_is_package_deved_in_workspace(rt, package_folder_uri)
+        package_folder_uri
+    else
+        input_active_project(rt)
+    end
+    project_for_test === nothing && return nothing
+
+    project = derived_project(rt, project_for_test)
+    return WatchTestEnvironmentKey(
+        uri2filepath(project_for_test),
+        pkg.name,
+        project === nothing ? UInt64(0) : project.content_hash,
+    )
+end
+
+"""
+    derived_file_env_ready(rt, uri)
+
+Return true if this file's effective environment is ready for static-lint
+analysis that depends on environment data (e.g. missing-reference checks).
+
+Per-project gating: each file's *own* project must be settled — either its
+environment finished indexing (or failed, which is terminal too), or no work
+item is scheduled for it at all, in which case there is nothing to wait for.
+
+Files that need a test environment (`test/runtests.jl` or files with
+`@testitem`) additionally require the test-env work item to have produced a
+merged test project URI, unless that item is not scheduled or failed
+terminally. Otherwise missing-ref diagnostics for test-only deps
+(TestItemRunner, Test, @testitem, @test, …) would flash as false positives
+until indexing finishes.
+
+The global `input_env_ready` flag is honored as a manual override for tests: it
+pretends every environment is ready.
+"""
+Salsa.@derived function derived_file_env_ready(rt, uri)
+    input_env_ready(rt) && return true
+
+    # Determine the file's effective project URI and require its env to be
+    # settled.
+    project_uri = derived_project_uri_for_root(rt, uri)
+    if project_uri !== nothing
+        project = derived_project(rt, project_uri)
+        project_hash = project === nothing ? UInt64(0) : project.content_hash
+        if !derived_project_environment_ready(rt, project_uri, project_hash) &&
+                derived_project_requires_indexing(rt, project_uri, project_hash)
+            return false
+        end
+    end
+
+    package_folder_uri = derived_package_for_file(rt, uri)
+    package_folder_uri === nothing && return true
+
+    pkg = derived_package(rt, package_folder_uri)
+    pkg === nothing && return true
+
+    runtests_path = joinpath(uri2filepath(package_folder_uri), "test", "runtests.jl")
+    file_needs_test_env = lowercase(uri2filepath(uri)) == lowercase(runtests_path) ||
+        _file_has_testitems(rt, uri)
+    file_needs_test_env || return true
+
+    test_env_key = _test_environment_key(rt, package_folder_uri, pkg)
+    test_env_key === nothing && return true
+
+    derived_ready_test_environment(rt, test_env_key) === nothing || return true
+    # No test project yet: only gate while one can still arrive.
+    return !derived_test_environment_pending(rt, test_env_key)
+end
+
+"""
+    _file_has_testitems(rt, uri)
+
+Check whether a file contains `@testitem` macros by looking at the
+already-computed test item detection results (which use JuliaSyntax, not CSTParser).
+"""
+function _file_has_testitems(rt, uri)
+    try
+        details = derived_testitems(rt, uri)
+        return !isempty(details.testitems)
+    catch
+        return false
+    end
+end
+
+Salsa.@derived function derived_required_dynamic_projects(rt)
+    @debug "derived_required_dynamic_projects"
+
+    required = Set{DJPKey}()
+
+    # Every project folder needs a :watch_environment DJP
+    for project_uri in derived_project_folders(rt)
+        project = derived_project(rt, project_uri)
+        project === nothing && continue
+        push!(required, WatchEnvironmentKey(
+            uri2filepath(project_uri),
+            project.content_hash,
+        ))
+    end
+
+    # Standalone projects and test environments are fabricated only when
+    # workspace-environment resolution is enabled.
+    input_resolve_workspace_environments(rt) || return required
+
+    # Package folders that aren't project folders and aren't deved need a standalone project DJP
+    for package_uri in derived_package_folders(rt)
+        package_uri in derived_project_folders(rt) && continue
+        _is_package_deved_in_workspace(rt, package_uri) && continue
+
+        pkg = derived_package(rt, package_uri)
+        pkg === nothing && continue
+        push!(required, CreateStandaloneProjectKey(
+            uri2filepath(package_uri),
+            pkg.content_hash,
+        ))
+    end
+
+    # Test environments: for each package folder with a test/runtests.jl, the test env DJP
+    for package_uri in derived_package_folders(rt)
+        package_folder = uri2filepath(package_uri)
+        runtests_path = joinpath(package_folder, "test", "runtests.jl")
+        isfile(runtests_path) || continue
+
+        pkg = derived_package(rt, package_uri)
+        pkg === nothing && continue
+
+        test_env_key = _test_environment_key(rt, package_uri, pkg)
+        test_env_key === nothing && continue
+
+        push!(required, test_env_key)
+    end
+
+    return required
+end

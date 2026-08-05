@@ -1,7 +1,7 @@
 @testitem "Julia workspace" begin
     using JuliaWorkspaces: filepath2uri, JuliaWorkspace
 
-    pkg_root = abspath(joinpath(@__DIR__, "data", "TestPackage1"))
+    pkg_root = abspath(joinpath(@__DIR__, "..", "testdata", "TestPackage1"))
     project_file_path = joinpath(pkg_root, "Project.toml")
     project_path = dirname(project_file_path)
     project_file_uri = filepath2uri(project_file_path)
@@ -41,7 +41,7 @@ end
 @testitem "add_workspace_folder" begin
     using JuliaWorkspaces: filepath2uri
 
-    pkg_root = abspath(joinpath(@__DIR__, "data", "TestPackage1"))
+    pkg_root = abspath(joinpath(@__DIR__, "..", "testdata", "TestPackage1"))
     project_file_path = joinpath(pkg_root, "Project.toml")
     project_path = dirname(project_file_path)
     project_file_uri = filepath2uri(project_file_path)
@@ -82,7 +82,7 @@ end
 @testitem "add_workspace_folder and remove_workspace_folder" begin
     using JuliaWorkspaces: filepath2uri
 
-    pkg_root = abspath(joinpath(@__DIR__, "data", "TestPackage1"))
+    pkg_root = abspath(joinpath(@__DIR__, "..", "testdata", "TestPackage1"))
     pkg_root_uri = filepath2uri(pkg_root)
     project_file_path = joinpath(pkg_root, "Project.toml")
     project_path = dirname(project_file_path)
@@ -93,7 +93,7 @@ end
     jl_file_with_error_file_path = joinpath(pkg_root, "src", "file_with_error.jl")
     jl_file_with_error_file_uri = filepath2uri(jl_file_with_error_file_path)
 
-    second_folder = joinpath(@__DIR__, "data", "project_detection", "TestPackage2", "src")
+    second_folder = joinpath(@__DIR__, "..", "testdata", "project_detection", "TestPackage2", "src")
 
     jw = JuliaWorkspace()
     add_folder_from_disc!(jw, pkg_root)
@@ -128,7 +128,7 @@ end
 @testitem "add_file" begin
     using JuliaWorkspaces: filepath2uri
 
-    pkg_root = abspath(joinpath(@__DIR__, "data", "TestPackage1"))
+    pkg_root = abspath(joinpath(@__DIR__, "..", "testdata", "TestPackage1"))
     pkg_root_uri = filepath2uri(pkg_root)
     project_file_path = joinpath(pkg_root, "Project.toml")
     project_path = dirname(project_file_path)
@@ -163,7 +163,7 @@ end
 @testitem "update_file" begin
     using JuliaWorkspaces: filepath2uri
 
-    pkg_root = abspath(joinpath(@__DIR__, "data", "TestPackage1"))
+    pkg_root = abspath(joinpath(@__DIR__, "..", "testdata", "TestPackage1"))
     pkg_root_uri = filepath2uri(pkg_root)
     project_file_path = joinpath(pkg_root, "Project.toml")
     project_path = dirname(project_file_path)
@@ -199,7 +199,7 @@ end
 @testitem "delete_file" begin
     using JuliaWorkspaces: filepath2uri
 
-    pkg_root = abspath(joinpath(@__DIR__, "data", "TestPackage1"))
+    pkg_root = abspath(joinpath(@__DIR__, "..", "testdata", "TestPackage1"))
     pkg_root_uri = filepath2uri(pkg_root)
     project_file_path = joinpath(pkg_root, "Project.toml")
     project_path = dirname(project_file_path)
@@ -222,4 +222,48 @@ end
 
     projects = get_projects(jw)
     @test length(projects) == 0
+end
+
+@testitem "is_ready after a failed dynamic process" begin
+    using JuliaWorkspaces: JuliaWorkspace, DynamicIndexingOnly, FailedResult,
+        WatchEnvironmentKey, CreateStandaloneProjectKey, process_from_dynamic, is_ready
+
+    jw = JuliaWorkspace(dynamic=DynamicIndexingOnly, store_path=mktempdir())
+    df = jw.dynamic_feature
+
+    # Nothing pending, but no environment round has completed yet.
+    @test !is_ready(jw)
+
+    # A failed work item must still flip readiness (best-effort), so consumers
+    # of `wait_until_ready`/`is_ready` don't block forever on a broken project.
+    put!(df.out_channel, FailedResult(WatchEnvironmentKey("/some/project", UInt64(1))))
+    process_from_dynamic(jw)
+    @test is_ready(jw)
+
+    # Work kinds without a produced project (test envs, standalone projects)
+    # also unblock readiness when they fail.
+    jw2 = JuliaWorkspace(dynamic=DynamicIndexingOnly, store_path=mktempdir())
+    @test !is_ready(jw2)
+    put!(jw2.dynamic_feature.out_channel, FailedResult(CreateStandaloneProjectKey("/some/package", UInt64(1))))
+    process_from_dynamic(jw2)
+    @test is_ready(jw2)
+end
+
+@testitem "is_ready is independent of the manual env-ready override" begin
+    using JuliaWorkspaces: JuliaWorkspace, DynamicIndexingOnly, EnvironmentReadyResult,
+        process_from_dynamic, is_ready, input_env_ready, set_input_env_ready!
+
+    jw = JuliaWorkspace(dynamic=DynamicIndexingOnly, store_path=mktempdir())
+
+    # The override is a per-file diagnostics gate only; it must not make the
+    # dynamic feature look done.
+    set_input_env_ready!(jw.runtime, true)
+    @test !is_ready(jw)
+
+    # And completed dynamic work must not set the override.
+    jw2 = JuliaWorkspace(dynamic=DynamicIndexingOnly, store_path=mktempdir())
+    put!(jw2.dynamic_feature.out_channel, EnvironmentReadyResult("/some/project", UInt64(1)))
+    process_from_dynamic(jw2)
+    @test is_ready(jw2)
+    @test !input_env_ready(jw2.runtime)
 end

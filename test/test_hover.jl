@@ -1,0 +1,1384 @@
+@testitem "Hover: basic identifiers and nothing cases" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    name = "HoverTest"
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    source = """
+    module HoverTest
+
+    1234
+    Base
+    +
+    vari = 1234
+    \"\"\"
+        Text
+    \"\"\"
+    function func(arg) end
+    func() = nothing
+    module M end
+    struct T end
+    mutable struct T2 end
+    for i = 1:1 end
+    while true end
+    begin end
+    sin()
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///hovertest/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hovertest/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hovertest/src/HoverTest.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///hovertest/src/HoverTest.jl")
+
+    # Helper: get 1-based string index for (1-based line, 1-based col)
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1  # +1 for newline
+        end
+        return idx + col
+    end
+
+    # Hovering over a bare integer literal should return nothing
+    @test get_hover_text(jw, uri, index_of(source, 3, 2)) === nothing
+
+    # Regression: hovering a blank/whitespace position resolves to no expr
+    # (`get_expr1` returns `nothing`); it must return nothing, not crash. The
+    # per-file-meta migration widened the `_get_hover` call to 7 args but left
+    # the `::Any` fallback at 5 args, so a `nothing` expr had no matching method.
+    @test get_hover_text(jw, uri, index_of(source, 2, 1)) === nothing
+
+    # Hovering over `Base` should produce hover text (it's a known module)
+    result = get_hover_text(jw, uri, index_of(source, 4, 1))
+    @test result !== nothing
+
+    # Hovering over `+` operator should produce text
+    result = get_hover_text(jw, uri, index_of(source, 5, 1))
+    @test result !== nothing
+
+    # Hovering over `vari` identifier should produce text
+    result = get_hover_text(jw, uri, index_of(source, 6, 1))
+    @test result !== nothing
+
+    # Hovering over `func` in function definition should produce text
+    result = get_hover_text(jw, uri, index_of(source, 10, 10))
+    @test result !== nothing
+
+    # Hovering over `func` in second method should produce text
+    result = get_hover_text(jw, uri, index_of(source, 11, 1))
+    @test result !== nothing
+end
+
+@testitem "Hover: lists a workspace overload of a store-backed function" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    jw = JuliaWorkspace()
+    root = URI("file:///hoverext/src/M.jl")
+    a = URI("file:///hoverext/src/a.jl")
+    b = URI("file:///hoverext/src/b.jl")
+    add_file!(jw, TextFile(root, SourceText("module M\ninclude(\"a.jl\")\ninclude(\"b.jl\")\nend\n", "julia")))
+    add_file!(jw, TextFile(a, SourceText("struct P end\nBase.relpath(x::AbstractString, p::P) = x\n", "julia")))
+    bsrc = "f(x::AbstractString, p::P) = relpath(x, p)\n"
+    add_file!(jw, TextFile(b, SourceText(bsrc, "julia")))
+
+    # hover on the `relpath` call in b.jl must list the sibling a.jl overload
+    # alongside Base's methods (it lives in the per-file scope, not the env store).
+    h = get_hover_text(jw, b, first(findfirst("relpath", bsrc)))
+    @test h !== nothing
+    @test occursin("relpath(x::AbstractString, p::P)", h)
+    # the overload is defined on line 2 of a.jl — both the label and the link
+    @test occursin("[a.jl:2]", h)
+    @test occursin("#2)", h)
+end
+
+@testitem "Hover: workspace overload listed for a store function reached through the tree" setup=[HoverCrossWS] begin
+    # `partition` is brought in by `using Base.Iterators` in the ENTRY file, so
+    # in per-file mode b.jl's ref is a `TreeRef` of kind `:external_symbol`.
+    # The sibling a.jl overload must be listed on this resolution path too, not
+    # only when the name resolves directly to the env `FunctionStore`.
+    a_src = "struct P end\nBase.Iterators.partition(x::P, n::Int) = x\n"
+    b_src = "puse(p) = partition(p, 2)\n"
+    jw = hoverx_workspace(a_src, b_src; entry_extra="using Base.Iterators\n")
+
+    result = hover_at(jw, b_src, "puse(p) = partition")
+    @test result !== nothing
+    @test occursin("is a function with", result)
+    @test occursin("partition(x::P, n::Int)", result)
+end
+
+@testitem "Hover: workspace overload via an unqualified import is listed" setup=[HoverCrossWS] begin
+    # `import Base: relpath` then a bare `relpath(...) = ...` extends Base.relpath
+    # without a qualifier; hover must still list the sibling overload.
+    a_src = "struct P end\nimport Base: relpath\nrelpath(x::AbstractString, p::P) = x\n"
+    b_src = "duse(x::AbstractString, p::P) = relpath(x, p)\n"
+    jw = hoverx_workspace(a_src, b_src)
+
+    result = hover_at(jw, b_src, "= relpath")
+    @test result !== nothing
+    @test occursin("is a function with", result)
+    @test occursin("relpath(x::AbstractString, p::P)", result)
+end
+
+@testitem "Hover: workspace constructor extension of a store-backed type is listed" setup=[HoverCrossWS] begin
+    # A sibling extends a store TYPE's constructor (`Base.Dict(::P)`); the
+    # method-call lint already declines for it, so hover must surface it too.
+    a_src = "struct P end\nBase.Dict(p::P) = Dict{Int,Int}()\n"
+    b_src = "duse(p) = Dict(p)\n"
+    jw = hoverx_workspace(a_src, b_src)
+
+    result = hover_at(jw, b_src, "duse(p) = Dict")
+    @test result !== nothing
+    @test occursin("Dict(p::P)", result)
+    @test occursin("[a.jl:2]", result)
+end
+
+@testitem "Hover: closer keywords" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    name = "HoverCloser"
+    uuid = "22345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    source = """
+    module HoverCloser
+
+    function foo(x)
+        x + 1
+    end
+
+    for i = 1:10
+        i
+    end
+
+    while true
+        break
+    end
+
+    module Inner
+    end
+
+    struct MyStruct
+        a
+    end
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///hovercloser/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hovercloser/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hovercloser/src/HoverCloser.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///hovercloser/src/HoverCloser.jl")
+
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # Hover on `end` of function definition (line 5)
+    result = get_hover_text(jw, uri, index_of(source, 5, 1))
+    @test result !== nothing
+    @test occursin("foo", result)
+
+    # Hover on `end` of for loop (line 9)
+    result = get_hover_text(jw, uri, index_of(source, 9, 1))
+    @test result !== nothing
+    @test occursin("for", result)
+
+    # Hover on `end` of while loop (line 13)
+    result = get_hover_text(jw, uri, index_of(source, 13, 1))
+    @test result !== nothing
+    @test occursin("while", result)
+
+    # Hover on `end` of module Inner (line 16)
+    result = get_hover_text(jw, uri, index_of(source, 16, 1))
+    @test result !== nothing
+    @test occursin("Inner", result)
+end
+
+@testitem "Hover: docstrings" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    name = "HoverDocs"
+    uuid = "32345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    source = """
+    module HoverDocs
+
+    "I have a docstring"
+    Base.@kwdef struct SomeStruct
+        a
+    end
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///hoverdocs/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverdocs/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverdocs/src/HoverDocs.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///hoverdocs/src/HoverDocs.jl")
+
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # Hovering over SomeStruct should include the docstring
+    result = get_hover_text(jw, uri, index_of(source, 4, 22))
+    @test result !== nothing
+    @test occursin("I have a docstring", result)
+end
+
+@testitem "Hover: struct field position" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    name = "HoverFields"
+    uuid = "42345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    source = """
+    module HoverFields
+
+    struct S
+        a
+        b
+        c
+        d
+        e
+        f
+        g
+    end
+    S(1,2,3,4,5,6,7)
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///hoverfields/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverfields/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverfields/src/HoverFields.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///hoverfields/src/HoverFields.jl")
+
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # Hovering over argument in S(1,...) constructor call — the `1` is arg 1 which corresponds to field `a`
+    result = get_hover_text(jw, uri, index_of(source, 12, 3))
+    @test result !== nothing
+    @test occursin("a", result) || occursin("Argument 1", result)
+end
+
+@testitem "Hover: qualified function argument position" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    name = "HoverQual"
+    uuid = "52345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    source = """
+    module HoverQual
+
+    module M
+        f(a,b,c,d,e) = 1
+    end
+    M.f(1,2,3,4,5)
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///hoverqual/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverqual/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverqual/src/HoverQual.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///hoverqual/src/HoverQual.jl")
+
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # Hovering over the first argument `1` in `M.f(1,2,3,4,5)` line 6
+    result = get_hover_text(jw, uri, index_of(source, 6, 5))
+    @test result !== nothing
+    @test occursin("Argument `a` (1 of 5)", result) && occursin("M.f", result)
+end
+
+@testitem "Hover: argument parameter names in call position" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    project_toml = """
+    name = "HoverArgNames"
+    uuid = "72345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    source = """
+    module HoverArgNames
+
+    f(alpha, beta, gamma, delta, epsilon) = 1
+    f(1, 2, 3, 4, 5)
+
+    g(x::Int, aaa, bbb, ccc) = 1
+    g(x::String, ddd, eee, fff) = 2
+    g(1, 2, 3, 4)
+    g("s", 2, 3, 4)
+
+    struct T
+        fa
+        fb
+        fc
+        fd
+        fe
+    end
+    T(w, x, y, z) = T(w, x, y, z, 0)
+    T(1, 2, 3, 4)
+
+    h(1, 2, 3, 4, 5)
+
+    arr1 = [1, 2, 3]
+    arr2 = [4, 5, 6]
+    copyto!(arr1, 1, arr2, 1, 3)
+
+    q(x::Int, qaa, qbb, qcc) = 1
+    q(x::String, qdd, qee, qff) = 2
+    qval = 1.5
+    q(qval, 2, 3, 4)
+
+    sv(sa, sb, sc, sd, sxs...) = 1
+    svt = (4, 5)
+    sv(1, 2, 3, svt..., 9)
+
+    kh(alpha, beta, gamma, delta; opt = 1) = 1
+    kh(1, 2, 3, 4; opt = 5)
+
+    va(x, y, z, a, b, c...) = x + y
+    va(1, 2, 3, 4, 5, 6, 7, 8)
+
+    struct P{X}
+        pa::X
+        pb::X
+        pc::X
+        pd::X
+        pe::X
+    end
+    P{X}(w, x, y, z) where X = P{X}(w, x, y, z, zero(X))
+    P{Int}(1, 2, 3, 4)
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///hoverargnames/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverargnames/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///hoverargnames/src/HoverArgNames.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///hoverargnames/src/HoverArgNames.jl")
+
+    hover_at(needle) = get_hover_text(jw, uri, findfirst(needle, source).stop)
+
+    # Workspace function: parameter name from the method definition
+    result = hover_at("f(1, 2")
+    @test result !== nothing
+    @test occursin("Argument `beta` (2 of 5) in call to `f`", result)
+
+    # Two same-arity methods: the Int literal selects the ::Int method
+    result = hover_at("g(1, 2")
+    @test result !== nothing
+    @test occursin("Argument `aaa` (2 of 4) in call to `g`", result)
+
+    # ... and the String literal selects the ::String method
+    result = hover_at("g(\"s\", 2")
+    @test result !== nothing
+    @test occursin("Argument `ddd` (2 of 4) in call to `g`", result)
+
+    # Constructor call resolved to the outer constructor, not the field list
+    result = hover_at("T(1")
+    @test result !== nothing
+    @test occursin("Argument `w` (1 of 4) in call to `T`", result)
+
+    # Unresolvable callee: old positional-only text is preserved
+    result = hover_at("h(1")
+    @test result !== nothing
+    @test occursin("Argument 1 of 5 in call to `h`", result)
+    @test !occursin("(1 of 5)", result)
+
+    # SymbolServer-backed method: name comes from the method store
+    result = hover_at("copyto!(arr1, 1")
+    @test result !== nothing
+    @test occursin(r"Argument `\w+` \(2 of 5\) in call to `copyto!`", result)
+
+    # No type-compatible method: keep the positional text instead of showing
+    # a name from an overload the call doesn't match
+    result = hover_at("q(qval, 2")
+    @test result !== nothing
+    @test occursin("Argument 2 of 4 in call to `q`", result)
+    @test !occursin(r"Argument `\w+`", result)
+
+    # Splat in the call: names before the splat resolve...
+    result = hover_at("sv(1, 2")
+    @test result !== nothing
+    @test occursin("Argument `sb` (2 of 4) in call to `sv`", result)
+
+    # ...but positions at/after the splat are unknowable
+    result = hover_at("svt..., 9")
+    @test result !== nothing
+    @test occursin(r"Argument 5 of \d+ in call to `sv`", result)
+    @test !occursin(r"Argument `\w+`", result)
+
+    # Keyword arguments after `;` don't shift the positional index
+    result = hover_at("kh(1, 2")
+    @test result !== nothing
+    @test occursin("Argument `beta` (2 of 4) in call to `kh`", result)
+
+    # Curly callee: parametric constructor call resolves through `P{Int}`
+    result = hover_at("P{Int}(1")
+    @test result !== nothing
+    @test occursin("Argument `w` (1 of 4) in call to `P`", result)
+
+    # Method-side vararg: fixed positions show their name...
+    result = hover_at("va(1, 2")
+    @test result !== nothing
+    @test occursin("Argument `y` (2 of 8) in call to `va`", result)
+
+    # ...and positions bound to the trailing vararg show `name...`,
+    # from the slot itself to the last argument
+    result = hover_at("va(1, 2, 3, 4, 5, 6")
+    @test result !== nothing
+    @test occursin("Argument `c...` (6 of 8) in call to `va`", result)
+
+    result = hover_at("6, 7, 8")
+    @test result !== nothing
+    @test occursin("Argument `c...` (8 of 8) in call to `va`", result)
+end
+
+@testitem "get_doc_from_word: basic matching" begin
+    using JuliaWorkspaces: JuliaWorkspace, get_doc_from_word
+
+    jw = JuliaWorkspace()
+
+    # Exact match for a well-known Base symbol
+    result = get_doc_from_word(jw, "println")
+    @test result != "No results found."
+    @test occursin("println", result)
+
+    # Fuzzy match — close misspelling
+    result = get_doc_from_word(jw, "printl")
+    @test result != "No results found."
+
+    # Completely nonsensical word should return no results
+    result = get_doc_from_word(jw, "zzznotarealsymbolxxx")
+    @test result == "No results found."
+end
+
+@testitem "Hover: standalone file (no project)" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # No Project.toml or Manifest.toml — just a bare Julia source file.
+    # This exercises the _stdlib_only_env() fallback path.
+    source = """
+    module Standalone
+
+    function myfunc(x)
+        return x + 1
+    end
+
+    myvar = 42
+
+    struct MyStruct
+        field1::Int
+    end
+
+    println("hello")
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///standalone/src/Standalone.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///standalone/src/Standalone.jl")
+
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # Hover on locally-defined function name "myfunc" (line 3, col 10)
+    result = get_hover_text(jw, uri, index_of(source, 3, 10))
+    @test result !== nothing
+
+    # Hover on locally-defined variable "myvar" (line 7, col 1)
+    result = get_hover_text(jw, uri, index_of(source, 7, 1))
+    @test result !== nothing
+
+    # Hover on stdlib function "println" (line 13, col 1)
+    result = get_hover_text(jw, uri, index_of(source, 13, 1))
+    @test result !== nothing
+
+    # Hover on integer literal should return nothing (line 7, col 9 = "42")
+    result = get_hover_text(jw, uri, index_of(source, 7, 9))
+    @test result === nothing
+end
+
+@testitem "Hover: package without manifest (pre-DJP)" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # Project.toml present but NO Manifest.toml — simulates the window
+    # between opening a project and DJP completing.
+    project_toml = """
+    name = "PreDJP"
+    uuid = "aabbccdd-1122-3344-5566-778899aabbcc"
+    version = "0.1.0"
+    """
+
+    source = """
+    module PreDJP
+
+    function greet(name)
+        println("Hello, \$name!")
+    end
+
+    counter = 0
+
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///predjp/Project.toml"), SourceText(project_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///predjp/src/PreDJP.jl"), SourceText(source, "julia")))
+
+    uri = URI("file:///predjp/src/PreDJP.jl")
+
+    function index_of(src, line, col)
+        lines = split(src, '\n')
+        idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # Hover on locally-defined function "greet" (line 3, col 10)
+    result = get_hover_text(jw, uri, index_of(source, 3, 10))
+    @test result !== nothing
+
+    # Hover on stdlib function "println" (line 4, col 5)
+    result = get_hover_text(jw, uri, index_of(source, 4, 5))
+    @test result !== nothing
+
+    # Hover on local variable "counter" (line 7, col 1)
+    result = get_hover_text(jw, uri, index_of(source, 7, 1))
+    @test result !== nothing
+end
+
+@testitem "Hover: docs from @doc macro (#1377)" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    source = """
+    @doc "Function doc via @doc" function docfun() end
+    @doc "Struct doc via @doc" struct DocType end
+    @doc "Variable doc via @doc" docvar = 1
+    @doc raw\"\"\"Raw doc via @doc\"\"\" function rawdocfun() end
+    docfun
+    DocType
+    docvar
+    rawdocfun
+    """
+
+    jw = JuliaWorkspace()
+    uri = URI("file:///docmacro/test.jl")
+    add_file!(jw, TextFile(uri, SourceText(source, "julia")))
+
+    # offset (1-based) of (1-based line, col); col 2 lands mid-identifier.
+    function index_of(src, line, col)
+        lines = split(src, '\n'); idx = 0
+        for l in 1:(line - 1)
+            idx += ncodeunits(lines[l]) + 1
+        end
+        return idx + col
+    end
+
+    # The explicit `@doc "..."` form (macroname `@doc`, not the implicit
+    # `:globalrefdoc`) must be recognised — including a raw-string payload and
+    # `@doc "..." target` referencing a binding via its refs.
+    @test occursin("Function doc via @doc", get_hover_text(jw, uri, index_of(source, 5, 2)))
+    @test occursin("Struct doc via @doc", get_hover_text(jw, uri, index_of(source, 6, 2)))
+    @test occursin("Variable doc via @doc", get_hover_text(jw, uri, index_of(source, 7, 2)))
+    @test occursin("Raw doc via @doc", get_hover_text(jw, uri, index_of(source, 8, 2)))
+end
+
+@testitem "Hover: struct constructor argument field (#1392)" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # Hovering an argument of a struct's default constructor names the field.
+    # This routes through _get_fcall_position → struct_nargs(val, env, …); the
+    # env threading is the applicable part of the JuliaFormatter-v2 PR. Needs
+    # >= 4 fields (get_fcall_position returns early for fewer).
+    source = """
+    struct Foo
+        a
+        b
+        c
+        d
+    end
+    Foo(1, 2, 3, 4)
+    """
+
+    jw = JuliaWorkspace()
+    uri = URI("file:///structarg/test.jl")
+    add_file!(jw, TextFile(uri, SourceText(source, "julia")))
+
+    # offset of the `2` argument (line 8: `Foo(1, 2, 3, 4)`).
+    rng = findfirst("Foo(1, 2", source)
+    result = get_hover_text(jw, uri, last(rng))
+    @test result !== nothing
+    @test occursin("Datatype field `b` of Foo", result)
+end
+
+@testitem "Hover: keyword parameter in definition signature" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text, get_expr1
+    using JuliaWorkspaces: derived_julia_legacy_syntax_tree
+    using JuliaWorkspaces.URIs2: URI
+    import CSTParser
+
+    # CSTParser folds the `;` separator into the preceding positional argument's
+    # `fullspan`, so the `parameters` node directly follows an IDENTIFIER with no
+    # separator token in between. A boundary heuristic in `get_expr1` used to grab
+    # that preceding identifier, so hovering the keyword parameter `y` resolved to
+    # the positional `x` instead.
+    source = "g(x;y)=x+y\n"
+
+    jw = JuliaWorkspace()
+    uri = URI("file:///kwparam/test.jl")
+    add_file!(jw, TextFile(uri, SourceText(source, "julia")))
+
+    # Hovering the keyword parameter `y` (index 5) must resolve to `y`, not `x`.
+    result = get_hover_text(jw, uri, 5)
+    @test result !== nothing
+    clean = replace(result, "\r" => "")
+    @test occursin("```julia\ny\n```", clean)
+    @test !occursin("```julia\nx\n```", clean)
+
+    # Direct unit check on the offset lookup: offset 4 (0-based) is the `y` of the
+    # parameters block, offset 2 is the positional `x`.
+    cst = CSTParser.parse(source)
+    @test CSTParser.str_value(get_expr1(cst, 4)) == "y"
+    @test CSTParser.str_value(get_expr1(cst, 2)) == "x"
+end
+
+@testsnippet HoverCrossWS begin
+    using JuliaWorkspaces
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, update_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    const PROJECT_TOML = """
+    name = "HoverX"
+    uuid = "a2345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+    const MANIFEST_TOML = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+
+    const ENTRY_URI = URI("file:///hoverx/src/HoverX.jl")
+    const A_URI = URI("file:///hoverx/src/a.jl")
+    const B_URI = URI("file:///hoverx/src/b.jl")
+
+    # A three-file package: the hovered file `b.jl` references names DECLARED
+    # in the sibling `a.jl` (resolved through the module tree in per-file
+    # mode, so their refs are plain-data `TreeRef`s, not merged Bindings).
+    function hoverx_workspace(a_src::String, b_src::String; entry_extra::String="")
+        entry = """
+        module HoverX
+        $(entry_extra)include("a.jl")
+        include("b.jl")
+        end
+        """
+        jw = JuliaWorkspace()
+        add_file!(jw, TextFile(URI("file:///hoverx/Project.toml"), SourceText(PROJECT_TOML, "toml")))
+        add_file!(jw, TextFile(URI("file:///hoverx/Manifest.toml"), SourceText(MANIFEST_TOML, "toml")))
+        add_file!(jw, TextFile(ENTRY_URI, SourceText(entry, "julia")))
+        add_file!(jw, TextFile(A_URI, SourceText(a_src, "julia")))
+        add_file!(jw, TextFile(B_URI, SourceText(b_src, "julia")))
+        return jw
+    end
+
+    hover_at(jw, src::String, needle::String; uri=B_URI) =
+        get_hover_text(jw, uri, findfirst(needle, src).stop)
+end
+
+@testitem "Hover: cross-file function shows docstring and signatures" setup=[HoverCrossWS] begin
+    a_src = """
+    \"\"\"
+    greet docs
+    \"\"\"
+    greet(name) = 1
+    greet(first, last) = 2
+    """
+    b_src = "caller(x) = greet(x)\n"
+    jw = hoverx_workspace(a_src, b_src)
+
+    # Byte parity with the old whole-closure rendering (captured by probe):
+    # the docstring, then one signature block per method, in splice order.
+    result = hover_at(jw, b_src, "caller(x) = gree")
+    @test result == "greet docs\n```julia\ngreet(name)\n```\n```julia\ngreet(first, last)\n```\n"
+end
+
+@testitem "Hover: cross-file struct shows docstring and fields" setup=[HoverCrossWS] begin
+    a_src = """
+    "CrossS docs"
+    struct CrossS
+        fielda
+        fieldb
+    end
+    """
+    b_src = "maker() = CrossS(1, 2)\n"
+    jw = hoverx_workspace(a_src, b_src)
+
+    result = hover_at(jw, b_src, "CrossS")
+    @test result !== nothing
+    @test occursin("CrossS docs", result)
+    @test occursin("fielda", result)
+    @test occursin("fieldb", result)
+end
+
+@testitem "Hover: cross-file const and assignment show typed definition and docstring" setup=[HoverCrossWS] begin
+    a_src = """
+    "CONSTX docs"
+    const CONSTX = 42
+
+    "v docs"
+    myglobal = [1, 2]
+    """
+    b_src = """
+    cuse() = CONSTX
+    guse() = myglobal
+    """
+    jw = hoverx_workspace(a_src, b_src)
+
+    # Byte parity with the old rendering (probe-captured): the typed
+    # definition block first, then the docstring.
+    @test hover_at(jw, b_src, "cuse() = CONSTX") ==
+        "\n```julia\nCONSTX::$(Int) = 42\n```\n\nCONSTX docs"
+    @test hover_at(jw, b_src, "guse() = myglobal") ==
+        "\n```julia\nmyglobal = [1, 2]\n```\n\nv docs"
+end
+
+@testitem "Hover: external symbol through a sibling file's using is unchanged" setup=[HoverCrossWS] begin
+    # `partition` is brought in by `using Base.Iterators` in the ENTRY file;
+    # in per-file mode the hovered file's ref is a `TreeRef` of kind
+    # `:external_symbol`, which must render the env store docs as before.
+    a_src = "unrelated() = 1\n"
+    b_src = "puse(v) = partition(v, 2)\n"
+    jw = hoverx_workspace(a_src, b_src; entry_extra="using Base.Iterators\n")
+
+    result = hover_at(jw, b_src, "puse(v) = partition")
+    @test result !== nothing
+    @test occursin("Iterate over a collection", result)
+    @test occursin("is a function with", result)
+end
+
+@testitem "Hover: qualified use of a sibling-file module member" setup=[HoverCrossWS] begin
+    a_src = """
+    module SubM
+    "subm fn docs"
+    subfn() = 1
+    end
+    """
+    b_src = """
+    using .SubM
+    moduse() = SubM.subfn()
+    """
+    jw = hoverx_workspace(a_src, b_src)
+
+    # The qualified member renders docstring + signature (old parity).
+    @test hover_at(jw, b_src, "SubM.subfn") == "subm fn docs\n```julia\nsubfn()\n```\n"
+
+    # Hovering the module NAME renders a compact module reference (the old
+    # pass dumped the module's entire body — deliberately NOT preserved; see
+    # the M4 task-5 change-list).
+    result = hover_at(jw, b_src, "moduse() = SubM")
+    @test result !== nothing
+    @test occursin("module SubM", result)
+    @test !occursin("subfn() = ", result)
+end
+
+@testitem "Hover: module-name hover is compact on both same-file and cross-file paths" setup=[HoverCrossWS] begin
+    # A module declared in the SIBLING file `a.jl` (resolved as a `TreeRef`) and
+    # a module declared in the hovered file `b.jl` itself (resolved as a local
+    # `Binding` whose `.val` is the module EXPR). Both name references must
+    # render the SAME compact `module <name>` — no whole-module-body dump
+    # (user-approved 2026-07-17).
+    a_src = """
+    module SharedMod
+    sharedfn() = 1
+    end
+    """
+    b_src = """
+    module LocalMod
+    localfn() = 1
+    end
+    using .SharedMod
+    crossref() = SharedMod
+    localref() = LocalMod
+    """
+    jw = hoverx_workspace(a_src, b_src)
+
+    expected(name) = "\n```julia\nmodule $name\n```\n"
+
+    cross = hover_at(jw, b_src, "crossref() = SharedMod")
+    localm = hover_at(jw, b_src, "localref() = LocalMod")
+
+    # Same compact format on both paths (byte-for-byte, differing only by name).
+    @test cross == expected("SharedMod")
+    @test localm == expected("LocalMod")
+
+    # The old whole-module-body dump is gone on the same-file path too.
+    @test !occursin("localfn", localm)
+    @test !occursin("sharedfn", cross)
+end
+
+@testitem "Hover: documented module renders its docstring above the compact block" setup=[HoverCrossWS] begin
+    # A DOCUMENTED module: the module's own docstring is preserved (rendered
+    # above the compact `module <name>` block) on BOTH the cross-file (`TreeRef`)
+    # and same-file (local `Binding`) paths — only the whole-module-body dump was
+    # dropped (user-approved 2026-07-17).
+    a_src = """
+    "shared module docs"
+    module SharedMod
+    sharedfn() = 1
+    end
+    """
+    b_src = """
+    "local module docs"
+    module LocalMod
+    localfn() = 1
+    end
+    using .SharedMod
+    crossref() = SharedMod
+    localref() = LocalMod
+    """
+    jw = hoverx_workspace(a_src, b_src)
+
+    # docstring, then the compact block (byte-for-byte, differing only by the
+    # docstring text and the module name).
+    expected(doc, name) = "$doc\n```julia\nmodule $name\n```\n"
+
+    cross = hover_at(jw, b_src, "crossref() = SharedMod")
+    localm = hover_at(jw, b_src, "localref() = LocalMod")
+
+    @test cross == expected("shared module docs", "SharedMod")
+    @test localm == expected("local module docs", "LocalMod")
+
+    # docstring present, body dump still gone.
+    @test occursin("local module docs", localm)
+    @test occursin("shared module docs", cross)
+    @test !occursin("localfn", localm)
+    @test !occursin("sharedfn", cross)
+end
+
+@testitem "Hover: cross-file operator definition resolves through visibility" setup=[HoverCrossWS] begin
+    # Operators are not resolved through the tree context during the per-file
+    # pass (identifier-gated), so hover's operator fallback must consult the
+    # module's visible names.
+    a_src = "⊕(a, b) = a + b\n"
+    b_src = "opuse() = 1 ⊕ 2\n"
+    jw = hoverx_workspace(a_src, b_src)
+
+    @test hover_at(jw, b_src, "1 ⊕") == "\n```julia\na ⊕ b\n```\n"
+end
+
+@testitem "Hover: cross-file call argument names" setup=[HoverCrossWS] begin
+    a_src = """
+    f5(alpha, beta, gamma, delta, epsilon) = 1
+
+    struct CrossT
+        fa
+        fb
+        fc
+        fd
+    end
+    """
+    b_src = """
+    argname() = f5(1, 2, 3, 4, 5)
+    maker() = CrossT(1, 2, 3, 4)
+    """
+    jw = hoverx_workspace(a_src, b_src)
+
+    # Parameter names come from the cross-file method definition (old parity).
+    result = hover_at(jw, b_src, "f5(1, 2")
+    @test result !== nothing
+    @test occursin("Argument `beta` (2 of 5) in call to `f5`", result)
+
+    # Constructor-call arguments name the struct's fields (old parity: the
+    # datatype-field rendering, reproduced cross-file from the materialized
+    # struct EXPR).
+    result = hover_at(jw, b_src, "CrossT(1, 2")
+    @test result !== nothing
+    @test occursin("Datatype field `fb` of CrossT", result)
+end
+
+@testitem "Hover: local variable rendering is unchanged" setup=[HoverCrossWS] begin
+    a_src = "unrelated() = 1\n"
+    b_src = """
+    function lvar()
+        localx = 3
+        return localx
+    end
+    """
+    jw = hoverx_workspace(a_src, b_src)
+
+    result = hover_at(jw, b_src, "return localx")
+    @test result !== nothing
+    @test occursin("localx", result)
+end
+
+@testitem "Hover: deved workspace-package function resolves cross-root" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    main_project = """
+    name = "MainP"
+    uuid = "b2345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+    manifest_toml = """
+    # This file is machine-generated - editing it directly is not advised
+
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+    project_hash = "abc123"
+
+    [deps]
+    """
+    b_project = """
+    name = "B"
+    uuid = "c2345678-1234-1234-1234-123456789abc"
+    version = "0.1.0"
+    """
+
+    entry = """
+    module MainP
+    using B
+    f() = myfunc(1)
+    g() = B.myfunc(1)
+    end
+    """
+    b_entry = """
+    module B
+    export myfunc
+    "myfunc docs"
+    myfunc(alpha) = 1
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///wsph/Main/Project.toml"), SourceText(main_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///wsph/Main/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///wsph/Main/src/MainP.jl"), SourceText(entry, "julia")))
+    add_file!(jw, TextFile(URI("file:///wsph/B/Project.toml"), SourceText(b_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///wsph/B/src/B.jl"), SourceText(b_entry, "julia")))
+
+    uri = URI("file:///wsph/Main/src/MainP.jl")
+
+    # Both the `using`-bring-in reference and the qualified one resolve
+    # through B's OWN root's tree (`_method_items_root` cross-root dispatch).
+    result = get_hover_text(jw, uri, findfirst("f() = myfunc", entry).stop)
+    @test result !== nothing
+    @test occursin("myfunc docs", result)
+    @test occursin("myfunc(alpha)", result)
+
+    result_q = get_hover_text(jw, uri, findfirst("B.myfunc", entry).stop)
+    @test result_q !== nothing
+    @test occursin("myfunc docs", result_q)
+    @test occursin("myfunc(alpha)", result_q)
+end
+
+@testitem "Hover: API-status footer for a name whose origin module is another root" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # `myfunc` is exported by the DEVED package B (a separate workspace root).
+    # The footer must query B's OWN root's export list, not MainP's — otherwise
+    # a cross-root name gets no exported/public footer at all.
+    main_project = "name = \"MainP\"\nuuid = \"b2345678-1234-1234-1234-123456789abc\"\nversion = \"0.1.0\"\n"
+    manifest_toml = "julia_version = \"1.11.0\"\nmanifest_format = \"2.0\"\nproject_hash = \"abc123\"\n\n[deps]\n"
+    b_project = "name = \"B\"\nuuid = \"c2345678-1234-1234-1234-123456789abc\"\nversion = \"0.1.0\"\n"
+    entry = "module MainP\nusing B\nf() = myfunc(1)\nend\n"
+    b_entry = "module B\nexport myfunc\nmyfunc(alpha) = 1\nend\n"
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///wsfoot/Main/Project.toml"), SourceText(main_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///wsfoot/Main/Manifest.toml"), SourceText(manifest_toml, "toml")))
+    add_file!(jw, TextFile(URI("file:///wsfoot/Main/src/MainP.jl"), SourceText(entry, "julia")))
+    add_file!(jw, TextFile(URI("file:///wsfoot/B/Project.toml"), SourceText(b_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///wsfoot/B/src/B.jl"), SourceText(b_entry, "julia")))
+
+    uri = URI("file:///wsfoot/Main/src/MainP.jl")
+    result = get_hover_text(jw, uri, findfirst("f() = myfunc", entry).stop)
+    @test result !== nothing
+    @test occursin("Exported by `B`", result)
+end
+
+@testitem "Hover: docstring edit in the defining file re-executes no analysis" setup=[HoverCrossWS] begin
+    import JuliaWorkspaces.Salsa.TraceLogging as TL
+
+    mutable struct CountReceiver <: TL.AbstractTraceReceiver
+        counts::Dict{String,Int}
+    end
+    CountReceiver() = CountReceiver(Dict{String,Int}())
+    TL.receive_span(r::CountReceiver, span::TL.TraceSpan) =
+        (r.counts[span.name] = get(r.counts, span.name, 0) + 1; nothing)
+
+    a_src = """
+    \"\"\"
+    greet docs
+    \"\"\"
+    greet(name) = 1
+    """
+    b_src = "caller(x) = greet(x)\n"
+    jw = hoverx_workspace(a_src, b_src)
+
+    # Untraced baseline fills the memo caches.
+    idx = findfirst("caller(x) = gree", b_src).stop
+    result = get_hover_text(jw, B_URI, idx)
+    @test occursin("greet docs", result)
+
+    # Edit ONLY the docstring in the DEFINING file. Docs live outside the
+    # inventory by design: the inventory value is equal, every dependent
+    # backdates, and NO per-file analysis re-executes — yet hover serves the
+    # fresh docstring (materialized request-time via `derived_item_positions`).
+    update_file!(jw, TextFile(A_URI, SourceText(replace(a_src, "greet docs" => "greet docs EDITED"), "julia")))
+
+    recv = CountReceiver()
+    result = TL.with_tracing(() -> get_hover_text(jw, B_URI, idx), recv)
+    @test occursin("greet docs EDITED", result)
+    @test get(recv.counts, "derived_file_analysis", 0) == 0
+end
+
+@testitem "Hover: API-status footer attributes exported/public/internal to the access module" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # Qualified access is attributed to the module it is accessed THROUGH (so a
+    # re-export reports that module, not where the name is defined).
+    src = """
+    module H
+    a = Base.sort
+    b = Base.var"@assume_effects"
+    c = Base.LibuvStream
+    d = Base.GC.enable_logging
+    end
+    """
+    uri = URI("file:///apistatus/src/H.jl")
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(uri, SourceText(src, "julia")))
+    hov(n) = get_hover_text(jw, uri, first(findfirst(n, src)))
+
+    @test occursin("Exported by `Base`", hov("sort"))
+    @test occursin("Internal to `Base`", hov("LibuvStream"))
+    if isdefined(Base, :ispublic)
+        # premise: @assume_effects is public-but-not-exported in Base on 1.11+
+        @test Base.ispublic(Base, Symbol("@assume_effects")) && !Base.isexported(Base, Symbol("@assume_effects"))
+        @test occursin("Public API of `Base` (not exported)", hov("@assume_effects"))
+        # submodule-qualified access: `Base.GC.enable_logging` is public in
+        # Base.GC on both 1.11 and 1.12 (hover the `enable_logging` identifier).
+        @test Base.ispublic(Base.GC, :enable_logging) && !Base.isexported(Base.GC, :enable_logging)
+        @test occursin("Public API of `GC` (not exported)", hov("enable_logging"))
+    end
+end
+
+@testitem "Hover: API-status footer for workspace-defined names (parity with imports)" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # Same-file workspace bindings carry the same exported/public status as
+    # imported members; an internal name or a local gets no footer.
+    src = """
+    module MyPkg
+    export foo
+    public bar
+    foo() = 1
+    bar() = 2
+    baz() = 3
+    function g()
+        local_x = foo() + bar() + baz()
+        return local_x
+    end
+    end
+    """
+    uri = URI("file:///hovws/src/MyPkg.jl")
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(uri, SourceText(src, "julia")))
+    hov(n) = get_hover_text(jw, uri, first(findlast(n, src)))
+    no_status(h) = h === nothing || !(occursin("Exported by", h) || occursin("Public API", h) || occursin("Internal to", h))
+
+    @test occursin("Exported by `MyPkg`", hov("foo()"))
+    @test no_status(hov("baz()"))       # internal — no footer for own code
+    @test no_status(hov("local_x"))     # local — no footer
+    if isdefined(Base, :ispublic)
+        @test occursin("Public API of `MyPkg` (not exported)", hov("bar()"))
+    end
+end
+
+@testitem "Hover: API-status footer for cross-file workspace names" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # A name defined in a sibling file resolves through the module tree; its
+    # status comes from the module's export list, same footer as same-file.
+    mainsrc = "module Foo\nexport bar\ninclude(\"impl.jl\")\nusebar() = bar()\nusebaz() = baz()\nend\n"
+    implsrc = "bar() = 1\nbaz() = 2\n"
+    jw = JuliaWorkspace()
+    mainuri = URI("file:///foo/src/Foo.jl")
+    add_file!(jw, TextFile(mainuri, SourceText(mainsrc, "julia")))
+    add_file!(jw, TextFile(URI("file:///foo/src/impl.jl"), SourceText(implsrc, "julia")))
+    # land on the trailing call name (`bar`/`baz`), not the def name
+    hov(n) = get_hover_text(jw, mainuri, first(findfirst(n, mainsrc)) + length(n) - 3)
+
+    @test occursin("Exported by `Foo`", hov("usebar() = bar"))    # cross-file, exported
+    h = hov("usebaz() = baz")                                     # cross-file, internal
+    @test h === nothing || !occursin("----", h)
+end
+
+@testitem "Hover: Base-submodule overloads of a Base function are aggregated" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # `length` has overloads defined in Base SUBMODULES (e.g. `Base.Iterators`,
+    # `Base.IteratorsMD`), each stored with `extends = Base.length`. The per-file
+    # analysis scope has an empty `.modules`, but `Base` is implicitly available
+    # in a regular module, so these overloads must still be aggregated rather than
+    # dropped (the bug: only the 60-odd methods defined directly in `Base` showed).
+    jw = JuliaWorkspace()
+    uri = URI("file:///submeth/Foo.jl")
+    src = "module Foo\nlength([])\nend\n"
+    add_file!(jw, TextFile(uri, SourceText(src, "julia")))
+
+    h = get_hover_text(jw, uri, first(findfirst("length", src)))
+    @test h !== nothing
+    @test occursin("is a function with", h)
+    @test occursin("in `Iterators`", h)
+end
+
+@testitem "iterate_over_ss_methods: Base-submodule overloads aggregate outside baremodules" begin
+    using JuliaWorkspaces
+    SL = JuliaWorkspaces.StaticLint
+    SSr = JuliaWorkspaces.SymbolServer
+    CSTParser = JuliaWorkspaces.CSTParser
+
+    env = JuliaWorkspaces._stdlib_only_env()
+    b = SSr.stdlibs[:Base][:length]
+    n_direct = length(b.methods)
+
+    mk(source) = SL.Scope(nothing, CSTParser.parse(source), Dict{String,SL.Binding}(), Dict{Symbol,Any}(), nothing)
+    nmethods(scope) = (c = Ref(0); SL.iterate_over_ss_methods(b, scope, env, m -> (c[] += 1; false)); c[])
+
+    # A regular module (empty `.modules`, as the per-file pass leaves it) still
+    # aggregates the Base-submodule overloads of `length`.
+    @test nmethods(mk("module Foo\nend")) > n_direct
+    # A baremodule does not implicitly `using Base`, so Base overloads are not aggregated.
+    @test nmethods(mk("baremodule Foo\nend")) == n_direct
+end
+
+@testitem "iterate_over_ss_methods: explicit in_scope set adds external overloads" begin
+    using JuliaWorkspaces
+    SL = JuliaWorkspaces.StaticLint
+    SSr = JuliaWorkspaces.SymbolServer
+    CSTParser = JuliaWorkspaces.CSTParser
+
+    # Build a synthetic env: stdlibs + a top-level module `FakeMod` that defines a
+    # `length` method extending `Base.length`.
+    base = JuliaWorkspaces._stdlib_only_env()
+    syms = copy(base.symbols)
+    fake_method = SSr.MethodStore(:length, :FakeMod, "fakemod.jl", Int32(1),
+        Pair{Any,Any}[:x => SSr.FakeTypeName(SSr.VarRef(SSr.VarRef(nothing, :FakeMod), :FakeThing), Any[])],
+        Symbol[], SSr.FakeTypeName(SSr.VarRef(SSr.VarRef(nothing, :Core), :Int), Any[]))
+    fake_len = SSr.FunctionStore(SSr.VarRef(SSr.VarRef(nothing, :FakeMod), :length),
+        SSr.MethodStore[fake_method], "", SSr.VarRef(SSr.VarRef(nothing, :Base), :length))
+    syms[:FakeMod] = SSr.ModuleStore(SSr.VarRef(nothing, :FakeMod),
+        Dict{Symbol,Any}(:length => fake_len), "", Symbol[:length], Symbol[:length], Symbol[])
+    env = SL.ExternalEnv(syms, JuliaWorkspaces._collect_extended_methods_shared(syms), collect(keys(syms)))
+
+    b = env.symbols[:Base][:length]
+    modscope = SL.Scope(nothing, CSTParser.parse("module Foo\nend"), Dict{String,SL.Binding}(), Dict{Symbol,Any}(), nothing)
+    mods(scope, in_scope) = begin
+        seen = Set{Symbol}()
+        SL.iterate_over_ss_methods(b, scope, env, m -> (push!(seen, m.mod); false); in_scope=in_scope)
+        seen
+    end
+
+    # With FakeMod in scope, its overload is aggregated; without it, it is not.
+    @test :FakeMod in mods(modscope, Set([:FakeMod]))
+    @test !(:FakeMod in mods(modscope, Set{Symbol}()))
+    # Base submodule overloads (top :Base) are still included in a regular module
+    # regardless of the external set (Base is implicit).
+    # In a baremodule Base is NOT implicit, so Base-submodule overloads drop out.
+    barescope = SL.Scope(nothing, CSTParser.parse("baremodule Foo\nend"), Dict{String,SL.Binding}(), Dict{Symbol,Any}(), nothing)
+    @test !(:Iterators in mods(barescope, Set([:FakeMod])))
+end
+
+@testitem "Hover: method list uses the visibility layer for in-scope modules" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text, URIs2
+    uri = URIs2.uri"file:///vis/Foo.jl"
+    jw = JuliaWorkspace()
+    # `using Base.Iterators` is redundant for Base subs (implicit), but this
+    # asserts the hover path is driven by _in_scope_syms_at without regressing:
+    # the Iterators overloads must still be listed.
+    src = "module Foo\nusing Base.Iterators\nlength([])\nend\n"
+    add_file!(jw, TextFile(uri, SourceText(src, "julia")))
+    h = get_hover_text(jw, uri, first(findfirst("length([])", src)))
+    @test h !== nothing
+    @test occursin("is a function with", h)
+    @test occursin("in `Iterators`", h)
+end
+
+@testitem "Hover: a reassigned local reports the type covering its assignments" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText, get_hover_text
+    using JuliaWorkspaces.URIs2: URI
+
+    # User-visible consequence of settling a rebound local's type: hover reports
+    # what covers every assignment, not whichever one the traversal reached last.
+    source = """
+    function f()
+        x = 1
+        x = 2.0
+        x
+    end
+    function g()
+        y = 1
+        y = nothing
+        y
+    end
+    """
+    uri = URI("file:///hoverrebind/test.jl")
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(uri, SourceText(source, "julia")))
+    hover(marker) = get_hover_text(jw, uri, findlast(marker, source)[end])
+
+    # Int and Float64 are both Reals
+    @test occursin("Real", hover("\n    x\n"))
+    # nothing shares only Any with Int
+    @test occursin("Any", hover("\n    y\n"))
+end
