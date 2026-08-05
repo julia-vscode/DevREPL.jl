@@ -28,7 +28,16 @@ end
 function is_defaultctors(@nospecialize(f))
     @assert !isa(f, Core.SSAValue) && !isa(f, JuliaInterpreter.SSAValue)
     if isa(f, GlobalRef)
-        return f.mod === Core && f.name === :_defaultctors
+        return (f.mod === Core || f.mod === Base) && f.name === :_defaultctors
+    else
+        if isa(f, QuoteNode)
+            f = f.value
+        end
+        if isdefined(Core, :_defaultctors) && f === Core._defaultctors
+            return true
+        elseif isdefined(Base, :_defaultctors) && f === Base._defaultctors
+            return true
+        end
     end
     return false
 end
@@ -416,17 +425,41 @@ function _methods_by_execution!(
                     # avoid redefining types unless we have to
                     pc = next_or_nothing!(frame)
                 else
+                    # If the RHS is a call, unwrap it and dispatch to the call handler
+                    callstmt = LoweredCodeUtils.getrhs(stmt)
+                    if isa(callstmt, Expr) && callstmt.head === :call
+                        @goto call_dispatch
+                    end
                     pc = step_expr!(interp, frame, stmt, true)
                 end
             elseif head === :call
-                f = lookup(frame, stmt.args[1])
-                if __bpart__ && f === Core._typebody!
-                    analyze_typebody!(exinfo, interp, frame, stmt)
-                    pc = step_expr!(interp, frame, stmt, true)
-                elseif @static(isdefined(Core, :_defaultctors) && true) && f === Core._defaultctors && length(stmt.args) == 3
+                callstmt = stmt
+                @label call_dispatch
+                f = lookup(frame, callstmt.args[1])
+                if @static(isdefined(Core, :_typebody!) ? true : false) && f === Core._typebody!
+                    if __bpart__[]
+                        analyze_typebody!(exinfo, interp, frame, callstmt)
+                    end
+                    if mode === :sigs && length(callstmt.args) >= 4 && reuse_existing_type!(interp, frame, callstmt)
+                        # The type is already defined (e.g., by package loading).
+                        # In :sigs mode we just want to extract signatures, so don't
+                        # execute `_typebody!` — that would rebind the type and clear
+                        # methods that aren't redefined here (e.g., outer constructors
+                        # whose `:method` statements are skipped because `define=false`).
+                        pc = next_or_nothing!(frame)
+                    else
+                        pc = step_expr!(interp, frame, stmt, true)
+                    end
+                elseif mode === :sigs && @static(isdefined(Core, :declare_const) ? true : false) && f === Core.declare_const &&
+                       length(callstmt.args) >= 3 && skip_declare_const(interp, frame, callstmt)
+                    # The corresponding `_typebody!` was skipped above; skip the matching
+                    # `declare_const` to avoid creating a new binding partition for an
+                    # already-defined type.
+                    pc = next_or_nothing!(frame)
+                elseif is_defaultctors(f) && length(callstmt.args) == 3
                     # Create the constructors for a type (i.e., a method definition)
-                    T = lookup(frame, stmt.args[2])
-                    lnn = lookup(frame, stmt.args[3])
+                    T = lookup(frame, callstmt.args[2])
+                    lnn = lookup(frame, callstmt.args[3])
                     if T isa Type && lnn isa LineNumberNode
                         empty!(signatures)
                         uT = Base.unwrap_unionall(T)::DataType
@@ -450,8 +483,8 @@ function _methods_by_execution!(
                     end
                 elseif f === Core.eval
                     # an @eval or eval block: this may contain method definitions, so intercept it.
-                    evalmod = lookup(interp, frame, stmt.args[2])::Module
-                    evalex = lookup(interp, frame, stmt.args[3])
+                    evalmod = lookup(interp, frame, callstmt.args[2])::Module
+                    evalex = lookup(interp, frame, callstmt.args[3])
                     local value = nothing
                     for (newmod, newex) in ExprSplitter(evalmod, evalex)
                         if is_doc_expr(newex)
@@ -467,11 +500,11 @@ function _methods_by_execution!(
                 elseif skip_include && (f === modinclude || f === Core.include || f === Base.include)
                     # include calls need to be managed carefully from several standpoints, including
                     # path management and parsing new expressions
-                    handle_include!(exinfo, interp, frame, stmt)
+                    handle_include!(exinfo, interp, frame, callstmt)
                     assign_this!(frame, nothing)  # FIXME: the file might return something different from `nothing`
                     pc = next_or_nothing!(frame)
                 elseif f === Base.Docs.doc! # && mode !== :eval
-                    fargs = JuliaInterpreter.collect_args(interp, frame, stmt)
+                    fargs = JuliaInterpreter.collect_args(interp, frame, callstmt)
                     popfirst!(fargs)
                     length(fargs) == 3 && push!(fargs, Union{})  # add the default sig
                     dmod::Module, b::Base.Docs.Binding, str::Base.Docs.DocStr, sig = fargs
@@ -562,4 +595,44 @@ function analyze_typebody!(exinfo::ExInfo, interp::Interpreter, frame::Frame, st
     datatype = Base.unwrap_unionall(typ)::DataType
     push!(exinfo.typeinfos, TypeInfo(datatype.name))
     return exinfo
+end
+
+# Look up the existing type that this `_typebody!` call would (re)define. If found,
+# assign it as the result of the SSA statement and return `true`; otherwise return
+# `false` so the caller falls back to executing the call normally.
+#
+# Only call this from `mode=:sigs`, which assumes the in-memory bindings already
+# match the source (the same assumption that lets `:sigs` skip `:method` statements
+# via `define=false`). No structural equivalence check is performed: on Julia 1.12+
+# `_equiv_typedef` is exactly what we're trying to avoid tripping, so a comparison
+# here would defeat the purpose. Genuine struct edits arrive through `revise()` in
+# `:eval`/`:evalmeth` mode, which does not take this path.
+#
+# `_typebody!(arg2, new_partial, fieldtypes_svec [, ...])` where `new_partial` is a
+# fresh `DataType` constructed by `_structtype`; its `.name.module/.name.name` give
+# the destination binding.
+function reuse_existing_type!(interp::Interpreter, frame::Frame, stmt::Expr)
+    new_partial = lookup(interp, frame, stmt.args[3])
+    new_partial isa DataType || return false
+    tn = new_partial.name
+    mod = tn.module
+    name = tn.name
+    @invokelatest(isdefined(mod, name)) || return false
+    existing = @invokelatest getfield(mod, name)
+    existing isa Type || return false
+    assign_this!(frame, existing)
+    return true
+end
+
+# Return `true` if the destination of `Core.declare_const(mod, :name, value)` is
+# already defined; if so, the caller will skip the call. This pairs with
+# `reuse_existing_type!` to avoid generating a new binding partition for a struct
+# whose definition we just skipped.
+function skip_declare_const(interp::Interpreter, frame::Frame, stmt::Expr)
+    mod_arg = lookup(interp, frame, stmt.args[2])
+    mod_arg isa Module || return false
+    name_arg = stmt.args[3]
+    name = name_arg isa QuoteNode ? name_arg.value : name_arg
+    name isa Symbol || return false
+    return @invokelatest isdefined(mod_arg, name)
 end

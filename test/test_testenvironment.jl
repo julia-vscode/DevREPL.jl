@@ -1,23 +1,23 @@
-@testitem "TestEnvironment equality" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv equality" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(
+    env1 = ProcessEnv(
         "file:///project",
         "file:///package",
         "MyPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Run",
         Dict{String,Union{String,Nothing}}()
     )
-    env2 = TestEnvironment(
+    env2 = ProcessEnv(
         "file:///project",
         "file:///package",
         "MyPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Run",
         Dict{String,Union{String,Nothing}}()
     )
@@ -26,36 +26,36 @@
     @test isequal(env1, env2)
 end
 
-@testitem "TestEnvironment inequality" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv inequality" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(
+    env1 = ProcessEnv(
         "file:///project",
         "file:///package",
         "MyPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Run",
         Dict{String,Union{String,Nothing}}()
     )
-    env_diff_mode = TestEnvironment(
+    env_diff_mode = ProcessEnv(
         "file:///project",
         "file:///package",
         "MyPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Coverage",
         Dict{String,Union{String,Nothing}}()
     )
-    env_diff_pkg = TestEnvironment(
+    env_diff_pkg = ProcessEnv(
         "file:///project",
         "file:///other",
         "OtherPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Run",
         Dict{String,Union{String,Nothing}}()
     )
@@ -65,42 +65,42 @@ end
     @test !isequal(env1, env_diff_mode)
 end
 
-@testitem "TestEnvironment hashing" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv hashing" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run", Dict{String,Union{String,Nothing}}())
-    env2 = TestEnvironment(nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run", Dict{String,Union{String,Nothing}}())
-    env3 = TestEnvironment(nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Coverage", Dict{String,Union{String,Nothing}}())
+    env1 = ProcessEnv(nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run", Dict{String,Union{String,Nothing}}())
+    env2 = ProcessEnv(nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run", Dict{String,Union{String,Nothing}}())
+    env3 = ProcessEnv(nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Coverage", Dict{String,Union{String,Nothing}}())
 
     @test hash(env1) == hash(env2)
     @test hash(env1) != hash(env3)
 end
 
-@testitem "TestEnvironment as Dict key" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv as Dict key" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run", Dict{String,Union{String,Nothing}}())
-    env2 = TestEnvironment(nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run", Dict{String,Union{String,Nothing}}())
+    env1 = ProcessEnv(nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run", Dict{String,Union{String,Nothing}}())
+    env2 = ProcessEnv(nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run", Dict{String,Union{String,Nothing}}())
 
-    d = Dict{TestEnvironment,Int}()
+    d = Dict{ProcessEnv,Int}()
     d[env1] = 42
     @test d[env2] == 42
     @test length(d) == 1
 end
 
-@testitem "TestEnvironment with non-empty env dict" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv with non-empty env dict" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(
-        nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run",
+    env1 = ProcessEnv(
+        nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run",
         Dict{String,Union{String,Nothing}}("MY_VAR" => "hello", "OTHER" => nothing)
     )
-    env2 = TestEnvironment(
-        nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run",
+    env2 = ProcessEnv(
+        nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run",
         Dict{String,Union{String,Nothing}}("MY_VAR" => "hello", "OTHER" => nothing)
     )
-    env3 = TestEnvironment(
-        nothing, "file:///pkg", "Pkg", "julia", String[], missing, "Run",
+    env3 = ProcessEnv(
+        nothing, "file:///pkg", "Pkg", "julia", String[], nothing, "Run",
         Dict{String,Union{String,Nothing}}("MY_VAR" => "different")
     )
 
@@ -113,23 +113,23 @@ end
     @test hash(env1) != hash(env3)
 end
 
-@testitem "TestEnvironment with different juliaArgs" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv with different juliaArgs" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(
+    env1 = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia",
         ["--optimize=2"],
-        missing, "Run", Dict{String,Union{String,Nothing}}()
+        nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
-    env2 = TestEnvironment(
+    env2 = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia",
         ["--optimize=0"],
-        missing, "Run", Dict{String,Union{String,Nothing}}()
+        nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
-    env3 = TestEnvironment(
+    env3 = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia",
         ["--optimize=2"],
-        missing, "Run", Dict{String,Union{String,Nothing}}()
+        nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
 
     @test env1 != env2
@@ -141,43 +141,42 @@ end
     @test hash(env1) == hash(env3)
 end
 
-@testitem "TestEnvironment with different juliaNumThreads" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv with different juliaNumThreads" begin
+    using TestItemControllers: ProcessEnv
 
-    env_missing = TestEnvironment(
+    env_nothing = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia", String[],
-        missing, "Run", Dict{String,Union{String,Nothing}}()
+        nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
-    env_auto = TestEnvironment(
+    env_auto = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia", String[],
         "auto", "Run", Dict{String,Union{String,Nothing}}()
     )
-    env_four = TestEnvironment(
+    env_four = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia", String[],
         "4", "Run", Dict{String,Union{String,Nothing}}()
     )
 
-    @test env_missing != env_auto
+    @test env_nothing != env_auto
     @test env_auto != env_four
-    @test !isequal(env_missing, env_auto)
-    # isequal should handle missing correctly
-    @test isequal(env_missing, env_missing)
+    @test !isequal(env_nothing, env_auto)
+    @test isequal(env_nothing, env_nothing)
 end
 
-@testitem "TestEnvironment with different project_uri" begin
-    using TestItemControllers: TestEnvironment
+@testitem "ProcessEnv with different project_uri" begin
+    using TestItemControllers: ProcessEnv
 
-    env1 = TestEnvironment(
+    env1 = ProcessEnv(
         "file:///project1", "file:///pkg", "Pkg", "julia",
-        String[], missing, "Run", Dict{String,Union{String,Nothing}}()
+        String[], nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
-    env2 = TestEnvironment(
+    env2 = ProcessEnv(
         "file:///project2", "file:///pkg", "Pkg", "julia",
-        String[], missing, "Run", Dict{String,Union{String,Nothing}}()
+        String[], nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
-    env_nothing = TestEnvironment(
+    env_nothing = ProcessEnv(
         nothing, "file:///pkg", "Pkg", "julia",
-        String[], missing, "Run", Dict{String,Union{String,Nothing}}()
+        String[], nothing, "Run", Dict{String,Union{String,Nothing}}()
     )
 
     @test env1 != env2

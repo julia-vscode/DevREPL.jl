@@ -4,7 +4,7 @@
 
     @test length(discovered.items) >= 1
 
-    result = TestHelpers.run_testrun(discovered.items, discovered.setups)
+    result = TestHelpers.run_testrun(discovered)
 
     # All items should have errored (not passed, not hung)
     errored_events = filter(e -> e.event == :errored, result.events)
@@ -34,7 +34,7 @@ end
     @test length(discovered.items) >= 1
 
     # Run with multiple processes — precompile process failure should prevent all from running
-    result = TestHelpers.run_testrun(discovered.items, discovered.setups; max_procs=3)
+    result = TestHelpers.run_testrun(discovered; max_procs=3)
 
     errored_events = filter(e -> e.event == :errored, result.events)
     passed_events = filter(e -> e.event == :passed, result.events)

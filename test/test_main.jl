@@ -2,12 +2,12 @@
     using TestItemControllers: ControllerCallbacks
 
     callbacks = ControllerCallbacks(
-        on_testitem_started = (run_id, item_id) -> nothing,
-        on_testitem_passed = (run_id, item_id, duration) -> nothing,
-        on_testitem_failed = (run_id, item_id, messages, duration) -> nothing,
-        on_testitem_errored = (run_id, item_id, messages, duration) -> nothing,
-        on_testitem_skipped = (run_id, item_id) -> nothing,
-        on_append_output = (run_id, item_id, output) -> nothing,
+        on_testitem_started = (run_id, item_id, test_env_id) -> nothing,
+        on_testitem_passed = (run_id, item_id, test_env_id, duration) -> nothing,
+        on_testitem_failed = (run_id, item_id, test_env_id, messages, duration) -> nothing,
+        on_testitem_errored = (run_id, item_id, test_env_id, messages, duration) -> nothing,
+        on_testitem_skipped = (run_id, item_id, test_env_id) -> nothing,
+        on_append_output = (run_id, item_id, test_env_id, output) -> nothing,
         on_attach_debugger = (run_id, pipe_name) -> nothing,
     )
 

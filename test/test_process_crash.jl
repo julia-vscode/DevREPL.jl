@@ -1,5 +1,5 @@
 @testitem "Controlled crash via exit()" setup=[TestHelpers] begin
-    using TestItemControllers: TestItemController, execute_testrun, shutdown, ControllerCallbacks
+    using TestItemControllers: TestItemController, TestRunItem, execute_testrun, shutdown, ControllerCallbacks
     import UUIDs
     @info "[test] Controlled crash via exit(): starting"
 
@@ -20,24 +20,24 @@
     process_events_lock = ReentrantLock()
 
     callbacks = ControllerCallbacks(
-        on_testitem_started = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_started = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:started, testitem_id=item_id))
         end,
-        on_testitem_passed = (run_id, item_id, duration) -> lock(events_lock) do
+        on_testitem_passed = (run_id, item_id, test_env_id, duration) -> lock(events_lock) do
             push!(events, (event=:passed, testitem_id=item_id))
         end,
-        on_testitem_failed = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_failed = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:failed, testitem_id=item_id, messages=messages))
         end,
-        on_testitem_errored = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_errored = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:errored, testitem_id=item_id, messages=messages))
         end,
-        on_testitem_skipped = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_skipped = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:skipped, testitem_id=item_id))
         end,
-        on_append_output = (run_id, item_id, output) -> nothing,
+        on_append_output = (run_id, item_id, test_env_id, output) -> nothing,
         on_attach_debugger = (run_id, pipe_name) -> nothing,
-        on_process_created = (id, pkg_name, pkg_uri, proj_uri, coverage, env) -> lock(process_events_lock) do
+        on_process_created = (id, test_env_id) -> lock(process_events_lock) do
             push!(process_events, (event=:process_created, id=id))
         end,
         on_process_terminated = id -> lock(process_events_lock) do
@@ -48,8 +48,9 @@
     )
 
     controller = TestItemController(callbacks; log_level=:Debug)
-    profile = TestHelpers.make_test_profile()
+    test_env = TestHelpers.make_test_environment(; TestHelpers._env_kwargs(discovered)...)
     testrun_id = string(UUIDs.uuid4())
+    work_units = [TestRunItem(item.id, test_env.id, nothing, :Debug) for item in all_items]
 
     controller_task = @async try
         run(controller)
@@ -59,7 +60,7 @@
 
     @info "[test] Controlled crash via exit(): executing testrun"
     testrun_task = @async try
-        execute_testrun(controller, testrun_id, [profile], all_items, discovered.setups, nothing)
+        execute_testrun(controller, testrun_id, [test_env], all_items, work_units, discovered.setups, 1, nothing)
     catch err
         @error "Test run error" exception=(err, catch_backtrace())
     end
@@ -104,7 +105,7 @@
 end
 
 @testitem "Hard crash via ccall abort" setup=[TestHelpers] begin
-    using TestItemControllers: TestItemController, execute_testrun, shutdown, ControllerCallbacks
+    using TestItemControllers: TestItemController, TestRunItem, execute_testrun, shutdown, ControllerCallbacks
     import UUIDs
     @info "[test] Hard crash via ccall abort: starting"
 
@@ -125,24 +126,24 @@ end
     process_events_lock = ReentrantLock()
 
     callbacks = ControllerCallbacks(
-        on_testitem_started = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_started = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:started, testitem_id=item_id))
         end,
-        on_testitem_passed = (run_id, item_id, duration) -> lock(events_lock) do
+        on_testitem_passed = (run_id, item_id, test_env_id, duration) -> lock(events_lock) do
             push!(events, (event=:passed, testitem_id=item_id))
         end,
-        on_testitem_failed = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_failed = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:failed, testitem_id=item_id, messages=messages))
         end,
-        on_testitem_errored = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_errored = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:errored, testitem_id=item_id, messages=messages))
         end,
-        on_testitem_skipped = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_skipped = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:skipped, testitem_id=item_id))
         end,
-        on_append_output = (run_id, item_id, output) -> nothing,
+        on_append_output = (run_id, item_id, test_env_id, output) -> nothing,
         on_attach_debugger = (run_id, pipe_name) -> nothing,
-        on_process_created = (id, pkg_name, pkg_uri, proj_uri, coverage, env) -> lock(process_events_lock) do
+        on_process_created = (id, test_env_id) -> lock(process_events_lock) do
             push!(process_events, (event=:process_created, id=id))
         end,
         on_process_terminated = id -> lock(process_events_lock) do
@@ -153,8 +154,9 @@ end
     )
 
     controller = TestItemController(callbacks; log_level=:Debug)
-    profile = TestHelpers.make_test_profile()
+    test_env = TestHelpers.make_test_environment(; TestHelpers._env_kwargs(discovered)...)
     testrun_id = string(UUIDs.uuid4())
+    work_units = [TestRunItem(item.id, test_env.id, nothing, :Debug) for item in all_items]
 
     controller_task = @async try
         run(controller)
@@ -164,7 +166,7 @@ end
 
     @info "[test] Hard crash via ccall abort: executing testrun"
     testrun_task = @async try
-        execute_testrun(controller, testrun_id, [profile], all_items, discovered.setups, nothing)
+        execute_testrun(controller, testrun_id, [test_env], all_items, work_units, discovered.setups, 1, nothing)
     catch err
         @error "Test run error" exception=(err, catch_backtrace())
     end
@@ -216,7 +218,7 @@ end
 end
 
 @testitem "Single crash item is immediately errored" setup=[TestHelpers] begin
-    using TestItemControllers: TestItemController, execute_testrun, shutdown, ControllerCallbacks
+    using TestItemControllers: TestItemController, TestRunItem, execute_testrun, shutdown, ControllerCallbacks
     import UUIDs
     @info "[test] Single crash item is immediately errored: starting"
 
@@ -233,24 +235,24 @@ end
     process_events_lock = ReentrantLock()
 
     callbacks = ControllerCallbacks(
-        on_testitem_started = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_started = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:started, testitem_id=item_id))
         end,
-        on_testitem_passed = (run_id, item_id, duration) -> lock(events_lock) do
+        on_testitem_passed = (run_id, item_id, test_env_id, duration) -> lock(events_lock) do
             push!(events, (event=:passed, testitem_id=item_id))
         end,
-        on_testitem_failed = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_failed = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:failed, testitem_id=item_id, messages=messages))
         end,
-        on_testitem_errored = (run_id, item_id, messages, duration) -> lock(events_lock) do
+        on_testitem_errored = (run_id, item_id, test_env_id, messages, duration) -> lock(events_lock) do
             push!(events, (event=:errored, testitem_id=item_id, messages=messages))
         end,
-        on_testitem_skipped = (run_id, item_id) -> lock(events_lock) do
+        on_testitem_skipped = (run_id, item_id, test_env_id) -> lock(events_lock) do
             push!(events, (event=:skipped, testitem_id=item_id))
         end,
-        on_append_output = (run_id, item_id, output) -> nothing,
+        on_append_output = (run_id, item_id, test_env_id, output) -> nothing,
         on_attach_debugger = (run_id, pipe_name) -> nothing,
-        on_process_created = (id, pkg_name, pkg_uri, proj_uri, coverage, env) -> lock(process_events_lock) do
+        on_process_created = (id, test_env_id) -> lock(process_events_lock) do
             push!(process_events, (event=:process_created, id=id))
         end,
         on_process_terminated = id -> lock(process_events_lock) do
@@ -261,8 +263,9 @@ end
     )
 
     controller = TestItemController(callbacks; log_level=:Debug)
-    profile = TestHelpers.make_test_profile()
+    test_env = TestHelpers.make_test_environment(; TestHelpers._env_kwargs(discovered)...)
     testrun_id = string(UUIDs.uuid4())
+    work_units = [TestRunItem(item.id, test_env.id, nothing, :Debug) for item in crash_items]
 
     controller_task = @async try
         run(controller)
@@ -272,7 +275,7 @@ end
 
     @info "[test] Single crash item: executing testrun"
     testrun_task = @async try
-        execute_testrun(controller, testrun_id, [profile], crash_items, discovered.setups, nothing)
+        execute_testrun(controller, testrun_id, [test_env], crash_items, work_units, discovered.setups, 1, nothing)
     catch err
         @error "Test run error" exception=(err, catch_backtrace())
     end

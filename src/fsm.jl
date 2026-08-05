@@ -98,10 +98,10 @@ function testprocess_fsm(id::String)
         end
     end
     # Specific transitions (merged with Dead)
-    union!(transitions[ProcessCreated],             Set([ProcessIdle, ProcessReviseOrStart]))
+    union!(transitions[ProcessCreated],             Set([ProcessIdle, ProcessReviseOrStart, ProcessStarting]))
     union!(transitions[ProcessIdle],                Set([ProcessReviseOrStart]))
     union!(transitions[ProcessReviseOrStart],       Set([ProcessRevising, ProcessStarting]))
-    union!(transitions[ProcessRevising],            Set([ProcessStarting, ProcessActivatingEnv, ProcessConfiguringTestRun]))
+    union!(transitions[ProcessRevising],            Set([ProcessActivatingEnv, ProcessConfiguringTestRun]))
     union!(transitions[ProcessStarting],            Set([ProcessWaitingForPrecompile, ProcessActivatingEnv, ProcessIdle]))
     union!(transitions[ProcessWaitingForPrecompile],Set([ProcessActivatingEnv]))
     union!(transitions[ProcessActivatingEnv],       Set([ProcessConfiguringTestRun]))
@@ -109,11 +109,11 @@ function testprocess_fsm(id::String)
     union!(transitions[ProcessReadyToRun],          Set([ProcessRunning]))
     union!(transitions[ProcessRunning],             Set([ProcessIdle]))
 
-    # Allow restart (→ ProcessStarting) from any active state for error recovery
-    for phase in instances(TestProcessPhase)
-        if phase != ProcessDead
-            push!(transitions[phase], ProcessStarting)
-        end
+    # Allow return to idle (→ ProcessIdle) from intermediate setup states
+    # so that cancellation can cleanly return processes to the pool.
+    for phase in (ProcessReviseOrStart, ProcessRevising, ProcessWaitingForPrecompile,
+                  ProcessActivatingEnv, ProcessConfiguringTestRun, ProcessReadyToRun)
+        push!(transitions[phase], ProcessIdle)
     end
 
     return FSM(ProcessCreated, transitions, id)

@@ -7,7 +7,7 @@ using Test
 
 @test isempty(detect_ambiguities(Revise))
 
-using Pkg, Unicode, Distributed, InteractiveUtils, REPL, UUIDs
+using Pkg, Unicode, Distributed, InteractiveUtils, REPL, UUIDs, Dates
 import LibGit2
 using Revise.OrderedCollections: OrderedSet
 using Test: collect_test_logs
@@ -17,6 +17,10 @@ using Base.CoreLogging: Debug,Info
 # assume that dependency packages are already precompiled, so we make an
 # explicit `precompile()` call here to ensure this.
 Pkg.precompile()
+
+if isdefined(Test, :detect_closure_boxes)
+    @test isempty(Test.detect_closure_boxes(Revise))
+end
 
 # In addition to using this for the "More arg-modifying macros" test below,
 # this package is used on CI to test what happens when you have multiple
@@ -747,6 +751,41 @@ end
         rm_precompile("Issue758")
 
         pop!(LOAD_PATH)
+    end
+
+    # https://github.com/timholy/Revise.jl/issues/1033
+    do_test("Source from cache") && @testset "Source from cache" begin
+        testdir = newtestdir()
+        dn = joinpath(testdir, "CacheLookup1033", "src")
+        mkpath(dn)
+        write(joinpath(dn, "CacheLookup1033.jl"), """
+            module CacheLookup1033
+            include("sub.jl")
+            end
+            """)
+        write(joinpath(dn, "sub.jl"), "f1033() = 1")
+        sleep(mtimedelay)
+        @eval using CacheLookup1033
+        sleep(mtimedelay)
+        pkgdata = Revise.pkgdatas[Base.PkgId(CacheLookup1033)]
+        # Baseline: the source of a precompiled package is read back from its `.ji` cache.
+        for file in Revise.srcfiles(pkgdata)
+            @test occursin("1033", Revise.read_from_cache(pkgdata, file))
+        end
+        # The cache is indexed by the path recorded at precompile time. Reading it must
+        # not depend on reconstructing that path from `basedir`, which can take a
+        # different form than the cache's (e.g. across symlinks). Simulate the
+        # divergence by pointing `basedir` elsewhere; the source should still be found.
+        saved = pkgdata.info.basedir
+        pkgdata.info.basedir = joinpath(saved, "does", "not", "match")
+        try
+            for file in Revise.srcfiles(pkgdata)
+                @test occursin("1033", Revise.read_from_cache(pkgdata, file))
+            end
+        finally
+            pkgdata.info.basedir = saved
+        end
+        rm_precompile("CacheLookup1033")
     end
 
     # issue #131
@@ -1750,6 +1789,68 @@ end
         rm_precompile("Timing")
     end
 
+    # Regression test for issue #1025: PR #1003 (TOCTOU fix) broke the #341 fix.
+    # An editor save typically generates a burst of directory events: creating a temp file,
+    # renaming it over the tracked file, etc. With #1003, every spurious event advanced
+    # wl.timestamp so the tracked file's ctime could fall behind it and be missed.
+    #
+    # The fix was to track per-file ctimes instead of a directory timestamp.
+    # A file is detected when its ctime changes, not when it exceeds a watermark.
+    # Spurious events touch no tracked files, so no file_ctimes entry changes and
+    # nothing is falsely reported as changed.
+    do_test("Spurious events don't prevent detection (issue #1025)") &&
+    @testset "Spurious events don't prevent detection (issue #1025)" begin
+        testdir = mktempdir()
+        push!(to_remove, testdir)
+        tracked_file = joinpath(testdir, "tracked1025.jl")
+
+        write(tracked_file, "tracked1025_f() = 1")
+        sleep(0.1)  # let ctime settle before creating WatchList
+
+        # Set up a WatchList as init_watching would (baseline ctime recorded at push time)
+        pkgid = Base.PkgId(UUIDs.uuid4(), "tracked1025_test")
+        @lock Revise.watched_files_lock begin
+            wl = Revise.WatchList()
+            push!(wl, basename(tracked_file) => pkgid)
+            wl.file_ctimes[basename(tracked_file)] = stat(tracked_file).ctime
+            Revise.watched_files[testdir] = wl
+        end
+
+        try
+            # --- Phase 1: spurious event; no tracked file changed ---
+            # Start the watcher *before* any modification (naturalistic ordering).
+            t1 = @async Revise.watch_files_via_dir(testdir)
+            sleep(0.05)  # give t1 time to block on wait_changed
+            write(joinpath(testdir, "spurious1025a.tmp"), "")
+            wait(t1)
+            rm(joinpath(testdir, "spurious1025a.tmp"), force=true)
+
+            # Invariant check (deterministic on all platforms):
+            # a spurious event must not change any tracked file's recorded ctime.
+            @test Revise.watched_files[testdir].file_ctimes[basename(tracked_file)] == stat(tracked_file).ctime
+
+            # --- Phase 2: edit the tracked file ---
+            write(tracked_file, "tracked1025_f() = 2")
+
+            # --- Phase 3: detection event; tracked file must be found ---
+            detected = Ref{Vector{String}}(String[])
+            t2 = @async begin
+                latestfiles, _ = Revise.watch_files_via_dir(testdir)
+                detected[] = [first(p) for p in latestfiles]
+            end
+            sleep(0.05)
+            write(joinpath(testdir, "spurious1025b.tmp"), "")
+            wait(t2)
+            rm(joinpath(testdir, "spurious1025b.tmp"), force=true)
+
+            @test basename(tracked_file) ∈ detected[]
+        finally
+            @lock Revise.watched_files_lock begin
+                delete!(Revise.watched_files, testdir)
+            end
+        end
+    end
+
     do_test("DO NOT PARSE") && @testset "DO NOT PARSE" begin
         testdir = newtestdir()
         dn = joinpath(testdir, "DoNotParse", "src")
@@ -2463,7 +2564,39 @@ end
         pop!(LOAD_PATH)
     end
 
-    Revise.__bpart__ && do_test("Type info tracking") && @testset "Type info tracking" begin
+    do_test("revise_structs preference") && if Base.VERSION >= v"1.12.0-DEV.2047"
+        @testset "revise_structs preference" begin
+            # The preference is read in __init__, so we have to test it via subprocesses.
+            test_proj_dir = dirname(Base.active_project())
+            prefs_file = joinpath(test_proj_dir, "JuliaLocalPreferences.toml")
+            backup = isfile(prefs_file) ? read(prefs_file, String) : nothing
+            julia = Base.julia_cmd()
+            check_bpart = "using Revise; print(Revise.__bpart__[])"
+            try
+                # Without the preference set, __bpart__ should be false
+                rm(prefs_file; force=true)
+                @test read(`$julia --project=$test_proj_dir -e $check_bpart`, String) == "false"
+                # With revise_structs = true, __bpart__ should be true
+                write(prefs_file, "[Revise]\nrevise_structs = true\n")
+                @test read(`$julia --project=$test_proj_dir -e $check_bpart`, String) == "true"
+            finally
+                if backup === nothing
+                    rm(prefs_file; force=true)
+                else
+                    write(prefs_file, backup)
+                end
+            end
+        end
+    end
+
+    # Struct revision tests require __bpart__[] = true. Enable it based on the Julia version
+    # alone: the LocalPreferences setting (which defaults to false for end users) should not
+    # suppress these tests on CI.
+    if Base.VERSION >= v"1.12.0-DEV.2047"
+        Revise.__bpart__[] = true
+    end
+
+    Revise.__bpart__[] && do_test("Type info tracking") && @testset "Type info tracking" begin
         let exinfo = lower_and_track(:(abstract type ABC end))
             typeinfo = only(exinfo.typeinfos)
             @test typeinfo.typname == @invokelatest(getglobal(TypeInfoTracking, :ABC)).name
@@ -2525,9 +2658,9 @@ end
         end
     end
 
-    Revise.__bpart__ && do_test("visit") && @testset "visit" include("test_visit.jl")
+    Revise.__bpart__[] && do_test("visit") && @testset "visit" include("test_visit.jl")
 
-    if Revise.__bpart__ && do_test("struct revision (simple)")   # can we revise types and constants?
+    if Revise.__bpart__[] && do_test("struct revision (simple)")   # can we revise types and constants?
         @testset "struct revision (simple)" begin
             testdir = newtestdir()
             try
@@ -2562,7 +2695,7 @@ end
         end
     end
 
-    if Revise.__bpart__ && do_test("struct revision (retry)")
+    if Revise.__bpart__[] && do_test("struct revision (retry)")
         @testset "struct revision (retry)" begin
             testdir = newtestdir()
             try
@@ -2613,7 +2746,7 @@ end
         end
     end
 
-    if Revise.__bpart__ && do_test("struct revision (dependency)")   # can we revise types and constants?
+    if Revise.__bpart__[] && do_test("struct revision (dependency)")   # can we revise types and constants?
         @testset "struct revision (dependency)" begin
             testdir = newtestdir()
             try
@@ -2821,21 +2954,37 @@ end
     end
 
     do_test("Pkg exclusion") && @testset "Pkg exclusion" begin
-        Revise.dont_watch(:Example)
-        Revise.silence(:Example)
-        @eval import Example
-        id = Base.PkgId(Example)
-        @test !haskey(Revise.pkgdatas, id)
-        # Ensure that dont_watch/allow_watch works
-        Revise.dont_watch(:GSL)
-        @test :GSL in Revise.dont_watch_pkgs
-        Revise.allow_watch(:GSL)
-        @test !(:GSL in Revise.dont_watch_pkgs)
-        # Ensure that silencing works
-        Revise.silence(:GSL)
-        @test "GSL" in Revise.silence_pkgs
-        Revise.unsilence(:GSL)
-        @test !("GSL" in Revise.silence_pkgs)
+        # `dont_watch`/`silence` mutate global state and persist to LocalPreferences.toml;
+        # snapshot both so the testset leaves nothing behind.
+        prefs_file = joinpath(dirname(Base.active_project()), "LocalPreferences.toml")
+        prefs_backup = isfile(prefs_file) ? read(prefs_file, String) : nothing
+        dont_watch_backup = copy(Revise.dont_watch_pkgs)
+        silence_backup = copy(Revise.silence_pkgs)
+        try
+            Revise.dont_watch(:Example)
+            Revise.silence(:Example)
+            @eval import Example
+            id = Base.PkgId(Example)
+            @test !haskey(Revise.pkgdatas, id)
+            # Ensure that dont_watch/allow_watch works
+            Revise.dont_watch(:GSL)
+            @test :GSL in Revise.dont_watch_pkgs
+            Revise.allow_watch(:GSL)
+            @test !(:GSL in Revise.dont_watch_pkgs)
+            # Ensure that silencing works
+            Revise.silence(:GSL)
+            @test "GSL" in Revise.silence_pkgs
+            Revise.unsilence(:GSL)
+            @test !("GSL" in Revise.silence_pkgs)
+        finally
+            empty!(Revise.dont_watch_pkgs); union!(Revise.dont_watch_pkgs, dont_watch_backup)
+            empty!(Revise.silence_pkgs); union!(Revise.silence_pkgs, silence_backup)
+            if prefs_backup === nothing
+                rm(prefs_file; force=true)
+            else
+                write(prefs_file, prefs_backup)
+            end
+        end
         pop!(LOAD_PATH)
     end
 
@@ -3335,6 +3484,12 @@ end
             # Determine whether a git repo is available. Travis & Appveyor do not have this.
             repo, path = Revise.git_repo(Revise.juliadir)
             if repo != nothing && isfile(joinpath(path, "VERSION")) && isdir(joinpath(path, "base"))
+                # Capture some Core.Compiler types/methods that have outer constructors
+                # alongside inner constructors so we can verify that tracking does not
+                # clobber them (https://github.com/JuliaLang/julia/issues/61308).
+                @static if VERSION >= v"1.12.0-DEV"
+                    pre_inf_methods = length(methods(Core.Compiler.InferenceResult))
+                end
                 # Tracking Core.Compiler
                 Revise.track(Core.Compiler)
                 id = Revise.pkgidid_for_mod(Core.Compiler)
@@ -3342,6 +3497,18 @@ end
                 @test any(k->endswith(k, "optimize.jl"), Revise.srcfiles(pkgdata))
                 m = first(methods(Core.Compiler.typeinf_code))
                 @test definition(m) isa Expr
+                @static if VERSION >= v"1.12.0-DEV"
+                    # tracking should not have redefined types and dropped methods
+                    @test length(methods(Core.Compiler.InferenceResult)) == pre_inf_methods
+                    @test hasmethod(Core.Compiler.InferenceResult,
+                                    Tuple{Core.MethodInstance, Core.Compiler.AbstractLattice})
+                    # An end-to-end check: InteractiveUtils.code_warntype invokes
+                    # Core.Compiler.InferenceResult(::MethodInstance, ::AbstractLattice).
+                    io = IOBuffer()
+                    InteractiveUtils.code_warntype(IOContext(io, :color=>false),
+                                                   sin, Tuple{Float64})
+                    @test !isempty(String(take!(io)))
+                end
             else
                 @test_throws Revise.GitRepoException Revise.track(Core.Compiler)
                 @warn "skipping Core.Compiler tests due to lack of git repo"
@@ -3360,6 +3527,14 @@ end
     do_test("Methods at REPL") && @testset "Methods at REPL" begin
         if isdefined(Base, :active_repl) && !isnothing(Base.active_repl)
             hp = Base.active_repl.interface.modes[1].hist
+            # The element type of `hp.history` changed from `String` to
+            # `REPL.History.HistEntry` in Julia 1.14; wrap accordingly.
+            push_hist! = if isdefined(REPL, :History) && isdefined(REPL.History, :HistEntry)
+                (h, s) -> push!(h.history, REPL.History.HistEntry(
+                    :julia, Dates.now(), s, UInt32(length(h.history) + 1)))
+            else
+                (h, s) -> push!(h.history, s)
+            end
             fstr = "__fREPL__(x::Int16) = 0"
             histidx = length(hp.history) + 1 - hp.start_idx
             ex = Base.parse_input_line(fstr; filename="REPL[$histidx]")
@@ -3367,7 +3542,7 @@ end
             if ex.head === :toplevel
                 ex = ex.args[end]
             end
-            push!(hp.history, fstr)
+            push_hist!(hp, fstr)
             m = first(methods(f))
             @test !isempty(signatures_at(String(m.file), m.line))
             @test isequal(Revise.RelocatableExpr(definition(m)), Revise.RelocatableExpr(ex))
@@ -3381,7 +3556,7 @@ end
             if ex.head === :toplevel
                 ex = ex.args[end]
             end
-            push!(hp.history, fstr)
+            push_hist!(hp, fstr)
             m = first(methods(f))
             @test isequal(Revise.RelocatableExpr(definition(m)), Revise.RelocatableExpr(ex))
             @test definition(String, m)[1] == fstr
@@ -3998,7 +4173,38 @@ do_test("New files & Requires.jl") && @testset "New files & Requires.jl" begin
     pop!(LOAD_PATH)
 end
 
+do_test("revision_event autoreset") && @testset "revision_event autoreset (issue #837)" begin
+    # `revision_event` must be an autoreset `Base.Event`, so that `wait`
+    # clears the bit. Without autoreset, a `notify` fired between the time
+    # `entr`'s loop returns from `wait` and the time it would call
+    # `reset(revision_event)` is silently dropped, and the corresponding
+    # file change is not serviced until another notify happens.
+    ev = Revise.revision_event
+    @test ev isa Base.Event
+    # Drain any stale state left by earlier testsets.
+    notify(ev); wait(ev)
+    # After `wait`, the bit must be cleared: a second wait with no
+    # intervening `notify` must block. Without autoreset it would return
+    # immediately because the bit set by the previous `notify` would still
+    # be latched.
+    t = @async wait(ev)
+    @test timedwait(() -> istaskdone(t), 0.2; pollint=0.02) === :timed_out
+    notify(ev)
+    wait(t)
+end
+
 do_test("entr") && @testset "entr" begin
+    # `entr` debounces file changes: a change schedules the callback to run
+    # `pause` seconds later, and any further change before then pushes that
+    # deadline out, so a burst of changes less than `pause` apart triggers the
+    # callback exactly once. Poll for the expected state with `timedwait`
+    # rather than fixed `sleep`s, which flake on slow CI runners (#1039-#1042).
+    waitfor(pred) = timedwait(pred, event_timeout; pollint=0.02)
+
+    # A generous `pause` keeps a burst coalesced despite variable
+    # filesystem-event detection latency; a tight value flaked on Windows (#1040).
+    pause = 2.0
+
     srcfile1 = joinpath(tempdir(), randtmp()*".jl"); push!(to_remove, srcfile1)
     srcfile2 = joinpath(tempdir(), randtmp()*".jl"); push!(to_remove, srcfile2)
     revise(throw=true)   # force compilation
@@ -4011,28 +4217,40 @@ do_test("entr") && @testset "entr" begin
             @test Main.__entr__ == 0
 
             @async begin
-                entr([srcfile1, srcfile2]; pause=0.5) do
+                entr([srcfile1, srcfile2]; pause) do
                     include(srcfile1)
                 end
             end
-            sleep(1)
+            # `postpone=false` runs the callback synchronously, before `entr`
+            # arms its watch.
+            waitfor(() -> Main.__entr__ >= 1)
             @test Main.__entr__ == 1  # callback should have been run (postpone=false)
 
-            # File modification
-            write(srcfile1, "Core.eval(Main, :(__entr__ = 2))")
-            sleep(1)
+            # Drive a single modification through the watch. The watch may not
+            # be armed the instant `entr` starts (#1040, #1041), so retry the
+            # write — but space the retries more than `pause` apart so each is
+            # its own burst and the debounce is allowed to fire between them.
+            probed = timedwait(event_timeout; pollint=pause+1) do
+                Main.__entr__ >= 2 || (write(srcfile1, "Core.eval(Main, :(__entr__ = 2))"); false)
+            end
+            @test probed === :ok
+            sleep(2*pause)            # let the debounce settle
             @test Main.__entr__ == 2  # callback should have been called
 
-            # Two events in quick succession (w.r.t. the `pause` argument)
+            # A burst of changes less than `pause` apart must coalesce into a
+            # single callback. Switch `srcfile1` to an increment so a surplus
+            # callback would be visible, hammer both files, then stop and let
+            # the debounce fire.
             write(srcfile1, "Core.eval(Main, :(__entr__ += 1))")
-            sleep(0.1)
-            touch(srcfile2)
-            sleep(1)
-            @test Main.__entr__ == 3  # callback should have been called only once
-
+            for _ in 1:8
+                touch(srcfile2)
+                sleep(pause/4)
+            end
+            waitfor(() -> Main.__entr__ >= 3)
+            sleep(2*pause)            # a surplus callback would fire within ~pause
+            @test Main.__entr__ == 3  # the whole burst triggered the callback once
 
             write(srcfile1, "error(\"stop\")")
-            sleep(mtimedelay)
         end
         @test false
     catch err
@@ -4053,69 +4271,81 @@ do_test("entr") && @testset "entr" begin
     @test isempty(Revise.user_callbacks_by_file[srcfile1])
 
 
-    # Watch directories (#470)
-    try
-        @sync let
-            srcdir = joinpath(tempdir(), randtmp())
-            mkdir(srcdir)
+    # Watch directories (#470). Skipped under polling: poll mode watches a
+    # directory through its own `stat`, which does not change when a file
+    # inside it is modified in place, so the checks below cannot be detected.
+    if !Revise.polling_files[]
+        try
+            @sync let
+                srcdir = joinpath(tempdir(), randtmp())
+                mkdir(srcdir)
 
-            trigger = joinpath(srcdir, "trigger.txt")
+                trigger = joinpath(srcdir, "trigger.txt")
 
-            counter = Ref(0)
-            stop = Ref(false)
+                counter = Ref(0)
+                stop = Ref(false)
 
-            @async begin
-                entr([srcdir]; pause=0.5) do
-                    counter[] += 1
-                    stop[] && error("stop watching directory")
+                @async begin
+                    entr([srcdir]; pause) do
+                        counter[] += 1
+                        stop[] && error("stop watching directory")
+                    end
+                end
+                waitfor(() -> counter[] >= 1)
+                @test counter[] == 1               # postpone=false
+                @test length(readdir(srcdir)) == 0 # directory should still be empty
+
+                # Drive a detected change to confirm the watch is live, retrying
+                # more than `pause` apart so the debounce can fire between attempts.
+                probed = timedwait(event_timeout; pollint=pause+1) do
+                    counter[] >= 2 || (touch(trigger); false)
+                end
+                @test probed === :ok
+                sleep(2*pause)                     # let the debounce settle
+                counter[] = 0                      # watch is live now; count from a clean slate
+
+                # File modification
+                touch(trigger)
+                waitfor(() -> counter[] >= 1)
+                @test counter[] == 1
+
+                # File deletion -> the directory should be empty again
+                rm(trigger)
+                waitfor(() -> counter[] >= 2)
+                @test length(readdir(srcdir)) == 0
+                @test counter[] == 2
+
+                # A burst of changes less than `pause` apart must coalesce into a
+                # single callback.
+                for _ in 1:8
+                    touch(trigger)
+                    rm(trigger)
+                    sleep(pause/4)
+                end
+                waitfor(() -> counter[] >= 3)
+                sleep(2*pause)       # a surplus callback would fire within ~pause
+                @test counter[] == 3 # the whole burst triggered the callback once
+
+                # Stop
+                stop[] = true
+                touch(trigger)
+            end
+
+            # `entr` should have errored by now
+            @test false
+        catch err
+            while err isa CompositeException
+                err = err.exceptions[1]
+                if err isa TaskFailedException
+                    err = err.task.exception
+                end
+                if err isa CapturedException
+                    err = err.ex
                 end
             end
-            sleep(1)
-            @test length(readdir(srcdir)) == 0 # directory should still be empty
-            @test counter[] == 1               # postpone=false
-
-            # File creation
-            touch(trigger)
-            sleep(1)
-            @test counter[] == 2
-
-            # File modification
-            touch(trigger)
-            sleep(1)
-            @test counter[] == 3
-
-            # File deletion -> the directory should be empty again
-            rm(trigger)
-            sleep(1)
-            @test length(readdir(srcdir)) == 0
-            @test counter[] == 4
-
-            # Two events in quick succession (w.r.t. the `pause` argument)
-            touch(trigger)       # creation
-            sleep(0.1)
-            touch(trigger)       # modification
-            sleep(1)
-            @test counter[] == 5 # Callback should have been called only once
-
-            # Stop
-            stop[] = true
-            touch(trigger)
+            @test isa(err, ErrorException)
+            @test err.msg == "stop watching directory"
         end
-
-        # `entr` should have errored by now
-        @test false
-    catch err
-        while err isa CompositeException
-            err = err.exceptions[1]
-            if err isa TaskFailedException
-                err = err.task.exception
-            end
-            if err isa CapturedException
-                err = err.ex
-            end
-        end
-        @test isa(err, ErrorException)
-        @test err.msg == "stop watching directory"
     end
 end
 
@@ -4224,10 +4454,10 @@ do_test("callbacks") && @testset "callbacks" begin
             contents[] = read(path, String)
         end
 
-        sleep(mtimedelay)
+        sleep(2*mtimedelay)
 
         append(path, "abc")
-        sleep(mtimedelay)
+        sleep(2*mtimedelay)
         revise()
         @test contents[] == "abc"
 
@@ -4445,7 +4675,8 @@ include("backedges.jl")
 do_test("Base signatures") && @testset "Base signatures" begin
     println("beginning signatures tests")
     # Using the extensive repository of code in Base as a testbed
-    @test success(pipeline(`$(Base.julia_cmd()) sigtest.jl`, stderr=stderr))
+    sigfile = normpath(@__DIR__, "sigtest.jl")
+    @test success(pipeline(`$(Base.julia_cmd()) $sigfile`, stderr=stderr))
 end
 
 # Run this test in a separate julia process, since it messes with projects, and we don't want to have to

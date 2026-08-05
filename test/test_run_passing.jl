@@ -6,7 +6,7 @@
     passing_items = filter(i -> i.label in ("add works", "greet works"), discovered.items)
     @test length(passing_items) >= 1
 
-    result = TestHelpers.run_testrun(passing_items, discovered.setups)
+    result = TestHelpers.run_testrun(passing_items, discovered.setups, discovered)
 
     started_events = filter(e -> e.event == :started, result.events)
     passed_events = filter(e -> e.event == :passed, result.events)

@@ -13,14 +13,14 @@ Optional callbacks (default to `nothing`):
 - Process lifecycle: created, terminated, status_changed, output
 """
 struct ControllerCallbacks{F1<:Function,F2<:Function,F3<:Function,F4<:Function,F5<:Function,F6<:Function,F7<:Function,F8<:Union{Nothing,Function},F9<:Union{Nothing,Function},F10<:Union{Nothing,Function},F11<:Union{Nothing,Function}}
-    on_testitem_started::F1              # (testrun_id, testitem_id) -> nothing
-    on_testitem_passed::F2               # (testrun_id, testitem_id, duration) -> nothing
-    on_testitem_failed::F3               # (testrun_id, testitem_id, messages, duration) -> nothing
-    on_testitem_errored::F4              # (testrun_id, testitem_id, messages, duration) -> nothing
-    on_testitem_skipped::F5              # (testrun_id, testitem_id) -> nothing
-    on_append_output::F6                 # (testrun_id, testitem_id, output) -> nothing
+    on_testitem_started::F1              # (testrun_id, testitem_id, test_env_id) -> nothing
+    on_testitem_passed::F2               # (testrun_id, testitem_id, test_env_id, duration) -> nothing
+    on_testitem_failed::F3               # (testrun_id, testitem_id, test_env_id, messages, duration) -> nothing
+    on_testitem_errored::F4              # (testrun_id, testitem_id, test_env_id, messages, duration) -> nothing
+    on_testitem_skipped::F5              # (testrun_id, testitem_id, test_env_id) -> nothing
+    on_append_output::F6                 # (testrun_id, testitem_id, test_env_id, output) -> nothing
     on_attach_debugger::F7               # (testrun_id, debug_pipe_name) -> nothing
-    on_process_created::F8               # (id, package_name, package_uri, project_uri, coverage, env) -> nothing
+    on_process_created::F8               # (id, test_env_id) -> nothing
     on_process_terminated::F9            # (id) -> nothing
     on_process_status_changed::F10       # (id, status) -> nothing
     on_process_output::F11               # (id, output) -> nothing

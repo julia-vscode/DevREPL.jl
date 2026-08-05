@@ -2,3 +2,4 @@
 *.cov
 Manifest.toml
 *.log
+docs/build

@@ -14,16 +14,17 @@
         coverage_root = filepath2uri(joinpath(pkg_path, "src"))
 
         result = TestHelpers.run_testrun(
-            passing_items, discovered.setups;
+            passing_items, discovered.setups, discovered;
             mode="Coverage",
-            coverage_root_uris=[coverage_root]
+            coverage_root_uris=[coverage_root],
+            timeout=600
         )
 
         passed_events = filter(e -> e.event == :passed, result.events)
         @test length(passed_events) == 1
 
         # Coverage data should be returned
-        @test result.coverage !== missing
+        @test result.coverage !== nothing
         @test result.coverage isa Vector
         @test length(result.coverage) >= 1
 
@@ -62,15 +63,16 @@ end
         coverage_root = filepath2uri(joinpath(pkg_path, "src"))
 
         result = TestHelpers.run_testrun(
-            items, discovered.setups;
+            items, discovered.setups, discovered;
             mode="Coverage",
-            coverage_root_uris=[coverage_root]
+            coverage_root_uris=[coverage_root],
+            timeout=600
         )
 
         passed_events = filter(e -> e.event == :passed, result.events)
         @test length(passed_events) == 2
 
-        @test result.coverage !== missing
+        @test result.coverage !== nothing
         @test length(result.coverage) >= 1
 
         src_file = joinpath(pkg_path, "src", "BasicPackage.jl")
@@ -107,9 +109,10 @@ end
         coverage_root = filepath2uri(joinpath(pkg_path, "src"))
 
         result = TestHelpers.run_testrun(
-            failing_items, discovered.setups;
+            failing_items, discovered.setups, discovered;
             mode="Coverage",
-            coverage_root_uris=[coverage_root]
+            coverage_root_uris=[coverage_root],
+            timeout=600
         )
 
         # The test item should have failed (not errored/crashed)
@@ -139,9 +142,10 @@ end
         fake_root = filepath2uri(joinpath(pkg_path, "src", "nonexistent"))
 
         result = TestHelpers.run_testrun(
-            passing_items, discovered.setups;
+            passing_items, discovered.setups, discovered;
             mode="Coverage",
-            coverage_root_uris=[fake_root]
+            coverage_root_uris=[fake_root],
+            timeout=600
         )
 
         # Test should still pass
@@ -149,6 +153,6 @@ end
         @test length(passed_events) == 1
 
         # But coverage should be missing since no files matched the root
-        @test result.coverage === missing
+        @test result.coverage === nothing
     end
 end

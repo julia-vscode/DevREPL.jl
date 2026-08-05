@@ -1,13 +1,13 @@
 @testitem "TestProcessState construction defaults" begin
-    using TestItemControllers: TestProcessState, TestEnvironment, state, ProcessCreated, CancellationTokens
+    using TestItemControllers: TestProcessState, ProcessEnv, state, ProcessCreated, CancellationTokens
 
-    env = TestEnvironment(
+    env = ProcessEnv(
         "file:///project",
         "file:///package",
         "MyPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Run",
         Dict{String,Union{String,Nothing}}()
     )
@@ -24,7 +24,8 @@
     @test ps.current_testitem_started_at === nothing
     @test ps.timeout_cs === nothing
     @test ps.timeout_reg === nothing
-    @test ps.julia_proc_cs === nothing
+    @test ps.termination_reg === nothing
+    @test isempty(ps.process_tasks)
     @test ps.is_precompile_process == false
     @test ps.precompile_done == false
     @test ps.test_env_content_hash === nothing
@@ -40,15 +41,15 @@
 end
 
 @testitem "TestProcessState precompile options" begin
-    using TestItemControllers: TestProcessState, TestEnvironment, state, ProcessCreated
+    using TestItemControllers: TestProcessState, ProcessEnv, state, ProcessCreated
 
-    env = TestEnvironment(
+    env = ProcessEnv(
         nothing,
         "file:///package",
         "MyPkg",
         "julia",
         String[],
-        missing,
+        nothing,
         "Run",
         Dict{String,Union{String,Nothing}}()
     )
@@ -67,32 +68,38 @@ end
 end
 
 @testitem "TestRunState construction" begin
-    using TestItemControllers: TestRunState, TestProfile, TestItemDetail, TestSetupDetail,
+    using TestItemControllers: TestRunState, TestEnvironment, TestRunItem, TestItemDetail, TestSetupDetail,
         state, TestRunCreated, CancellationTokens
 
-    profile = TestProfile(
-        "prof-1", "Default", "julia", String[], missing,
-        Dict{String,Union{String,Nothing}}(), 1, "Run", nothing, :Info
+    test_env = TestEnvironment(
+        "env-1", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Run",
+        "Pkg", "file:///pkg", "file:///proj", nothing
     )
 
     items = [
-        TestItemDetail("item-1", "file:///test.jl", "test1", "Pkg", "file:///pkg",
-            "file:///proj", nothing, true, String[], 1, 1, "@test true", 1, 1, nothing),
-        TestItemDetail("item-2", "file:///test.jl", "test2", "Pkg", "file:///pkg",
-            "file:///proj", nothing, true, String[], 5, 1, "@test false", 5, 1, nothing),
+        TestItemDetail("item-1", "file:///test.jl", "test1",
+            "Pkg", "file:///pkg", true, String[], 1, 1, "@test true", 1, 1),
+        TestItemDetail("item-2", "file:///test.jl", "test2",
+            "Pkg", "file:///pkg", true, String[], 5, 1, "@test false", 5, 1),
+    ]
+
+    work_units = [
+        TestRunItem("item-1", "env-1", nothing, :Info),
+        TestRunItem("item-2", "env-1", nothing, :Info),
     ]
 
     setups = TestSetupDetail[]
 
-    rs = TestRunState("run-1", [profile], items, setups)
+    rs = TestRunState("run-1", [test_env], items, work_units, setups, 1)
 
     @test rs.id == "run-1"
     @test state(rs.fsm) == TestRunCreated
-    @test length(rs.profiles) == 1
-    @test length(rs.remaining_items) == 2
-    @test haskey(rs.remaining_items, "item-1")
-    @test haskey(rs.remaining_items, "item-2")
-    @test rs.remaining_items["item-1"].label == "test1"
+    @test length(rs.test_environments) == 1
+    @test length(rs.remaining_work) == 2
+    @test haskey(rs.remaining_work, ("item-1", "env-1"))
+    @test haskey(rs.remaining_work, ("item-2", "env-1"))
+    @test rs.test_items["item-1"].label == "test1"
     @test isempty(rs.test_setups)
     @test rs.procs === nothing
     @test isempty(rs.testitem_ids_by_proc)
@@ -105,23 +112,26 @@ end
 end
 
 @testitem "TestRunState with cancellation token" begin
-    using TestItemControllers: TestRunState, TestProfile, TestItemDetail, TestSetupDetail,
+    using TestItemControllers: TestRunState, TestEnvironment, TestRunItem, TestItemDetail, TestSetupDetail,
         CancellationTokens
 
-    profile = TestProfile(
-        "prof-1", "Default", "julia", String[], missing,
-        Dict{String,Union{String,Nothing}}(), 1, "Run", nothing, :Info
+    test_env = TestEnvironment(
+        "env-1", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Run",
+        "Pkg", "file:///pkg", "file:///proj", nothing
     )
 
     items = [
-        TestItemDetail("item-1", "file:///test.jl", "test1", "Pkg", "file:///pkg",
-            "file:///proj", nothing, true, String[], 1, 1, "@test true", 1, 1, nothing),
+        TestItemDetail("item-1", "file:///test.jl", "test1",
+            "Pkg", "file:///pkg", true, String[], 1, 1, "@test true", 1, 1),
     ]
+
+    work_units = [TestRunItem("item-1", "env-1", nothing, :Info)]
 
     parent_cs = CancellationTokens.CancellationTokenSource()
     parent_token = CancellationTokens.get_token(parent_cs)
 
-    rs = TestRunState("run-linked", [profile], items, TestSetupDetail[]; token=parent_token)
+    rs = TestRunState("run-linked", [test_env], items, work_units, TestSetupDetail[], 1; token=parent_token)
 
     # Cancelling the parent should propagate to the run's cancellation source
     @test !CancellationTokens.is_cancellation_requested(CancellationTokens.get_token(rs.cancellation_source))
@@ -130,15 +140,16 @@ end
 end
 
 @testitem "TestRunState without cancellation token" begin
-    using TestItemControllers: TestRunState, TestProfile, TestItemDetail, TestSetupDetail,
+    using TestItemControllers: TestRunState, TestEnvironment, TestRunItem, TestItemDetail, TestSetupDetail,
         CancellationTokens
 
-    profile = TestProfile(
-        "prof-1", "Default", "julia", String[], missing,
-        Dict{String,Union{String,Nothing}}(), 1, "Run", nothing, :Info
+    test_env = TestEnvironment(
+        "env-1", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Run",
+        "", "", nothing, nothing
     )
 
-    rs = TestRunState("run-no-token", [profile], TestItemDetail[], TestSetupDetail[])
+    rs = TestRunState("run-no-token", [test_env], TestItemDetail[], TestRunItem[], TestSetupDetail[], 1)
 
     # Should have its own independent cancellation source
     @test !CancellationTokens.is_cancellation_requested(CancellationTokens.get_token(rs.cancellation_source))

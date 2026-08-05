@@ -6,7 +6,7 @@
     passing_items = filter(i -> i.label in ("add works", "greet works"), discovered.items)
     @test length(passing_items) >= 2
 
-    result = TestHelpers.run_testrun(passing_items, discovered.setups; max_procs=2)
+    result = TestHelpers.run_testrun(passing_items, discovered.setups, discovered; max_procs=2)
 
     # All items should reach terminal state
     started = filter(e -> e.event == :started, result.events)

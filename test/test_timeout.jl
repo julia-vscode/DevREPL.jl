@@ -4,33 +4,25 @@
     pkg_path = joinpath(TestHelpers.TESTDATA_DIR, "BasicPackage")
     discovered = TestHelpers.discover_test_items(pkg_path)
 
-    # Get the slow test item and set a short timeout on it
+    # Get the slow test item
     slow_items = filter(i -> i.label == "slow test", discovered.items)
     @test length(slow_items) == 1
-
     slow = slow_items[1]
-    timed_item = TestItemDetail(
-        slow.id, slow.uri, slow.label,
-        slow.package_name, slow.package_uri, slow.project_uri,
-        slow.env_content_hash, slow.option_default_imports,
-        slow.test_setups, slow.line, slow.column, slow.code,
-        slow.code_line, slow.code_column,
-        5.0  # 5 second timeout
-    )
 
     # Also include a passing item to verify it still completes
     passing_items = filter(i -> i.label == "add works", discovered.items)
     @test length(passing_items) == 1
 
-    all_items = [timed_item; passing_items]
+    all_items = [slow; passing_items]
 
-    result = TestHelpers.run_testrun(all_items, discovered.setups; timeout=120)
+    # Set a 5-second timeout on the slow item via work unit timeouts
+    result = TestHelpers.run_testrun(all_items, discovered.setups, discovered; timeout=120, item_timeouts=Dict(slow.id => 5.0))
 
     # The timed-out item should be errored
     errored = filter(e -> e.event == :errored, result.events)
     @test length(errored) >= 1
 
-    timed_errored = filter(e -> e.testitem_id == timed_item.id, errored)
+    timed_errored = filter(e -> e.testitem_id == slow.id, errored)
     @test length(timed_errored) == 1
 
     # Error message should mention timeout

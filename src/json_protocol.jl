@@ -4,26 +4,32 @@ import ..JSONRPC
 
 using ..JSONRPC: @dict_readable, RequestType, NotificationType, Outbound
 
-@dict_readable struct TestProfile <: JSONRPC.Outbound
+@dict_readable struct TestEnvironment <: JSONRPC.Outbound
     id::String
-    label::String
     juliaCmd::String
     juliaArgs::Vector{String}
     juliaNumThreads::Union{Missing,String}
     juliaEnv::Dict{String,Union{String,Nothing}}
-    maxProcessCount::Int
     mode::String
-    coverageRootUris::Union{Missing,Vector{String}}
+    packageName::String
+    packageUri::String
+    projectUri::Union{Missing,String}
+    envContentHash::Union{Missing,String}
+end
+
+@dict_readable struct TestRunItem <: JSONRPC.Outbound
+    testitemId::String
+    testEnvId::String
+    timeout::Union{Missing,Float64}
+    logLevel::String
 end
 
 @dict_readable struct TestItemDetail <: JSONRPC.Outbound
     id::String
     uri::String
     label::String
-    packageName::Union{Missing,String}
-    packageUri::Union{Missing,String}
-    projectUri::Union{Missing,String}
-    envContentHash::Union{Missing,String}
+    packageName::String
+    packageUri::String
     useDefaultUsings::Bool
     testSetups::Vector{String}
     line::Int
@@ -31,7 +37,6 @@ end
     code::String
     codeLine::Int
     codeColumn::Int
-    timeout::Union{Missing,Float64}
 end
 
 @dict_readable struct TestSetupDetail <: JSONRPC.Outbound
@@ -46,9 +51,12 @@ end
 
 @dict_readable struct CreateTestRunParams <: JSONRPC.Outbound
     testRunId::String
-    testProfiles::Vector{TestProfile}
+    testEnvironments::Vector{TestEnvironment}
     testItems::Vector{TestItemDetail}
+    workUnits::Vector{TestRunItem}
     testSetups::Vector{TestSetupDetail}
+    maxProcessCount::Int
+    coverageRootUris::Union{Missing,Vector{String}}
 end
 
 struct FileCoverage <: JSONRPC.Outbound
@@ -71,6 +79,13 @@ end
 
 const terminate_test_process_request_type = RequestType("terminateTestProcess", TerminateTestProcessParams, Nothing)
 
+@dict_readable struct TestMessageStackFrame <: JSONRPC.Outbound
+    label::String
+    uri::Union{Missing,String}
+    line::Union{Missing,Int}
+    column::Union{Missing,Int}
+end
+
 @dict_readable struct TestMessage <: JSONRPC.Outbound
     message::String
     expectedOutput::Union{Missing,String}
@@ -78,6 +93,7 @@ const terminate_test_process_request_type = RequestType("terminateTestProcess", 
     uri::Union{Missing,String}
     line::Union{Missing,Int}
     column::Union{Missing,Int}
+    stackTrace::Union{Missing,Vector{TestMessageStackFrame}}
 end
 
 @dict_readable struct TestItemStartedParams <: Outbound
