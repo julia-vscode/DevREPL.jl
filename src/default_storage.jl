@@ -80,8 +80,13 @@ mutable struct DefaultStorage <: AbstractSalsaStorage
     # modify any inputs while derived functions are active, on the current Task or any Task.
     derived_functions_active::Atomic{Int}
 
+    # Tracks lazy input keys currently being computed. When a lazy input callback is
+    # in-progress, a Threads.Condition is stored here so that other threads requesting the
+    # same key can wait instead of running the callback a second time.
+    in_progress_lazy_inputs::Dict{InputKey, Threads.Condition}
+
     function DefaultStorage()
-        new(Base.ReentrantLock(), 0, InputMapType(), DerivedFunctionMapType(), Atomic{Int}(0))
+        new(Base.ReentrantLock(), 0, InputMapType(), DerivedFunctionMapType(), Atomic{Int}(0), Dict{InputKey, Threads.Condition}())
     end
 end
 
@@ -142,6 +147,9 @@ function Salsa._previous_output_internal(
     return previous_output
 end
 
+function _derived_func_name(::DerivedKey{F}) where {F}
+    return isdefined(F, :instance) ? nameof(F.instance) : nameof(F)
+end
 
 function Salsa._memoized_lookup_internal(
     runtime::Salsa._TracingRuntimeWithStorage{DefaultStorage},
@@ -240,7 +248,7 @@ function Salsa._memoized_lookup_internal(
                 #   allocation and a copy by _swapping_ the `trace`'s `ordered_dependencies`
                 #   with `existing_value.dependencies`, so that the deps are written
                 #   in-place directly into their final destination! :)
-                trace = Salsa.get_trace(runtime.immediate_dependencies_id)
+                trace = Salsa.trace(runtime)
                 # Temporarily swap the dependency vectors while running user_func so the
                 # deps are recorded in-place. Note that we must swap them back at the end.
                 existing_value.dependencies, trace.ordered_deps =
@@ -250,7 +258,7 @@ function Salsa._memoized_lookup_internal(
                 # previous invocation of the derived function will hang around
                 empty!(trace.ordered_deps)
                 try
-                    v = user_func(runtime, key.args...)
+                    v = Salsa.TraceLogging.@trace string(_derived_func_name(key)) NamedTuple{Salsa._derived_arg_names(key)}(key.args) user_func(runtime, key.args...)
                 finally
                     # Swap back the dependency vectors so the vector isn't modified by
                     # future traces.
@@ -258,7 +266,7 @@ function Salsa._memoized_lookup_internal(
                         trace.ordered_deps, existing_value.dependencies
                 end
             else
-                v = user_func(runtime, key.args...)
+                v = Salsa.TraceLogging.@trace string(_derived_func_name(key)) NamedTuple{Salsa._derived_arg_names(key)}(key.args) user_func(runtime, key.args...)
             end
             # NOTE: We use `isequal` for the Early Exit Optimization, since values are
             # required to be purely immutable (but not necessarily julia `immutable
@@ -324,8 +332,9 @@ end
 
 # A `value` is still valid if none of its dependencies have changed.
 function still_valid(runtime, value)
+    storage = Salsa.storage(runtime)
     for depkey in value.dependencies
-        dep_changed_at = key_changed_at(runtime, depkey)
+        dep_changed_at = _key_changed_at(runtime, storage, depkey)
         if dep_changed_at > value.verified_at
             return false
         end
@@ -333,8 +342,61 @@ function still_valid(runtime, value)
     return true
 end
 
-function key_changed_at(runtime, key::DependencyKey)
-    return _changed_at(memoized_lookup(runtime, key))
+# Public entry point; unused internally (callers thread `storage` via `_key_changed_at`).
+key_changed_at(runtime, key::DependencyKey) = _key_changed_at(runtime, Salsa.storage(runtime), key)
+
+# Manual union split: with `key` narrowed by `isa`, each call below resolves
+# to exactly one (@nospecialize'd) method, so the isbits runtime is passed
+# unboxed — a dynamic dispatch here would box it (and the returned Int) once
+# per dependency edge, tens of MB of garbage per whole-graph verification.
+Base.@inline function _key_changed_at(runtime, storage::DefaultStorage, key::DependencyKey)::Revision
+    if key isa InputKey
+        return _input_changed_at(runtime, storage, key)
+    else
+        return _derived_changed_at(runtime, storage, key)
+    end
+end
+
+# Verification fast path: pure verification needs no trace bookkeeping (deps
+# aren't recorded during still_valid anyway) and no `derived_functions_active`
+# accounting (the caller sits inside `_memoized_lookup_internal`, which already
+# holds it >= 1, so `current_revision` is stable here — the same invariant the
+# slow path relies on). One lock + one probe per node; anything that needs
+# recomputation (or a lazy-input fill) falls back to the full traced
+# `memoized_lookup`. `key` is deliberately unspecialized: one compiled
+# instance regardless of the key's function/argument types.
+function _input_changed_at(runtime, storage::DefaultStorage, @nospecialize(key::InputKey))::Revision
+    v = @lock storage.lock get(storage.inputs_map, key, nothing)
+    v === nothing && return _changed_at(memoized_lookup(runtime, key))
+    return v.changed_at
+end
+
+# Typed probe behind a function barrier: inside, the key's args tuple is
+# extracted unboxed and the dict lookup is fully typed. The (single) dynamic
+# dispatch here allocates nothing — both arguments are already heap values.
+# NOTE: `DerivedValue{Any}` here (and the assert below) relies on `RT = Any`
+# in `_memoized_lookup_internal`; strongly typing the value would break these.
+_probe_derived(map::Dict{TT,DerivedValue{Any}}, key::DerivedKey{F,TT}) where {F,TT} =
+    get(map, key.args, nothing)
+
+function _derived_changed_at(runtime, storage::DefaultStorage, @nospecialize(key::DerivedKey))::Revision
+    local v
+    @lock storage.lock begin
+        map = get(storage.derived_function_maps, typeof(key), nothing)
+        v = map === nothing ? nothing : _probe_derived(map, key)
+    end
+    v === nothing && return _changed_at(memoized_lookup(runtime, key))
+    v = v::DerivedValue{Any}
+    v.verified_at == storage.current_revision && return v.changed_at
+    for dep in v.dependencies
+        if _key_changed_at(runtime, storage, dep) > v.verified_at
+            return _changed_at(memoized_lookup(runtime, key))
+        end
+    end
+    # All deps unchanged since this value was last verified: mark it verified
+    # at the current revision. Same unlocked write the slow path does.
+    v.verified_at = storage.current_revision
+    return v.changed_at
 end
 
 # =============================================================================
@@ -358,8 +420,62 @@ function Salsa._memoized_lookup_internal(
 )
     storage = Salsa.storage(runtime)
     cache = get_map_for_key(storage, key)
-    @lock storage.lock begin
-        return cache[key]
+
+    lock(storage.lock)
+    try
+        # Check cache — may loop back here after waiting on another thread's computation.
+        while true
+            val = get(cache, key, nothing)
+            if val !== nothing
+                return val
+            end
+
+            # Cache miss. Check if another thread is already computing this lazy input.
+            cond = get(storage.in_progress_lazy_inputs, key, nothing)
+            if cond !== nothing
+                # Another thread is computing this key. Wait for it to finish, then
+                # loop back to re-check the cache.
+                wait(cond)  # atomically releases lock, sleeps, re-acquires lock
+                continue
+            end
+
+            # Nobody is computing this key yet. Check for a lazy callback.
+            f = Salsa.get_lazy_input_function(runtime, key)
+            if f === nothing
+                throw(KeyError(key))
+            end
+
+            # Register a sentinel so other threads know we're computing this key.
+            sentinel = Threads.Condition(storage.lock)
+            storage.in_progress_lazy_inputs[key] = sentinel
+            unlock(storage.lock)
+
+            # Compute the lazy value outside the lock.
+            local new_val
+            try
+                new_unwrapped_val = f(Salsa.context(runtime), key.args...)
+                new_val = InputValue(new_unwrapped_val, storage.current_revision)
+            catch
+                # Clean up the sentinel so waiting threads can retry or see the error.
+                lock(storage.lock)
+                notify(sentinel)
+                delete!(storage.in_progress_lazy_inputs, key)
+                rethrow()
+            end
+
+            # Re-acquire the lock to store the result and clean up.
+            lock(storage.lock)
+            # We intentionally do NOT bump current_revision here. A lazy input
+            # materializing for the first time is not a "change" — it is the initial
+            # value at the current revision. Bumping would force all derived functions
+            # to re-verify unnecessarily.
+            cache[key] = new_val
+            notify(sentinel)
+            delete!(storage.in_progress_lazy_inputs, key)
+            return new_val
+        end
+    finally
+        unlock(storage.lock)
     end
 end
 
