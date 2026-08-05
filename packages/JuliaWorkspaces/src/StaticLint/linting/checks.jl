@@ -1,0 +1,1738 @@
+@enum(
+    LintCodes,
+
+    MissingRef,
+    IncorrectCallArgs,
+    IncorrectIterSpec,
+    NothingEquality,
+    NothingNotEq,
+    ConstIfCondition,
+    EqInIfConditional,
+    PointlessOR,
+    PointlessAND,
+    UnusedBinding,
+    InvalidTypeDeclaration,
+    UnusedTypeParameter,
+    IncludeLoop,
+    MissingFile,
+    InvalidModuleName,
+    TypePiracy,
+    UnusedFunctionArgument,
+    CannotDeclareConst,
+    InvalidRedefofConst,
+    NotEqDef,
+    KwDefaultMismatch,
+    InappropriateUseOfLiteral,
+    ShouldBeInALoop,
+    TypeDeclOnGlobalVariable,
+    UnsupportedConstLocalVariable,
+    UnassignedKeywordArgument,
+    CannotDefineFuncAlreadyHasValue,
+    DuplicateFuncArgName,
+    IncludePathContainsNULL,
+    IndexFromLength,
+    FileTooBig,
+    FileNotAvailable,
+    RelativeImportTooManyDots,
+    DuplicateInclude,
+    FunctionHasNoMethods,
+    UnresolvedImport,
+)
+
+const LintCodeDescriptions = Dict{LintCodes,String}(
+    IncorrectCallArgs => "Possible method call error.",
+    IncorrectIterSpec => "A loop iterator has been used that will likely error.",
+    NothingEquality => "Compare against `nothing` using `isnothing` or `===`",
+    NothingNotEq => "Compare against `nothing` using `!isnothing` or `!==`",
+    ConstIfCondition => "A boolean literal has been used as the conditional of an if statement - it will either always or never run.",
+    EqInIfConditional => "Unbracketed assignment in if conditional statements is not allowed, did you mean to use ==?",
+    PointlessOR => "The first argument of a `||` call is a boolean literal.",
+    PointlessAND => "The first argument of a `&&` call is a boolean literal.",
+    UnusedBinding => "Variable has been assigned but not used.",
+    InvalidTypeDeclaration => "A non-DataType has been used in a type declaration statement.",
+    UnusedTypeParameter => "A DataType parameter has been specified but not used.",
+    IncludeLoop => "Circular include detected.",
+    DuplicateInclude => "This file has already been included.",
+    MissingFile => "The included file can not be found.",
+    InvalidModuleName => "Module name matches that of its parent.",
+    TypePiracy => "An imported function has been extended without using module defined typed arguments.",
+    UnusedFunctionArgument => "An argument is included in a function signature but not used within its body.",
+    CannotDeclareConst => "Cannot declare constant; it already has a value.",
+    InvalidRedefofConst => "Invalid redefinition of constant.",
+    NotEqDef => "`!=` is defined as `const != = !(==)` and should not be overloaded. Overload `==` instead.",
+    KwDefaultMismatch => "The default value provided does not match the specified argument type.",
+    InappropriateUseOfLiteral => "You really shouldn't be using a literal value here.",
+    ShouldBeInALoop => "`break` or `continue` used outside loop.",
+    TypeDeclOnGlobalVariable => "Type declarations on global variables are not yet supported.",
+    UnsupportedConstLocalVariable => "Unsupported `const` declaration on local variable.",
+    UnassignedKeywordArgument => "Keyword argument not assigned.",
+    CannotDefineFuncAlreadyHasValue => "Cannot define function ; it already has a value.",
+    DuplicateFuncArgName => "Function argument name not unique.",
+    IncludePathContainsNULL => "Cannot include file, path contains NULL characters.",
+    IndexFromLength => "Indexing with indices obtained from `length`, `size` etc is discouraged. Use `eachindex` or `axes` instead.",
+    FileTooBig => "File too big, not following include.",
+    FileNotAvailable => "File not available.",
+    RelativeImportTooManyDots => "Relative import has more leading dots than available module nesting.",
+    FunctionHasNoMethods => "Called function has no methods.",
+    UnresolvedImport => "Failed to resolve import.",
+)
+
+haserror(m::Meta) = m.error !== nothing
+haserror(x::EXPR, meta_dict) = hasmeta(x, meta_dict) && haserror(getmeta(x, meta_dict))
+errorof(x::EXPR, meta_dict) = hasmeta(x, meta_dict) ? getmeta(x, meta_dict).error : nothing
+function seterror!(x::EXPR, e, meta_dict)
+    ensuremeta(x, meta_dict)
+    getmeta(x, meta_dict).error = e
+end
+
+const default_options = (true, true, true, true, true, true, true, true, true, true, true, true, true, true)
+
+struct LintOptions
+    call::Bool
+    iter::Bool
+    nothingcomp::Bool
+    constif::Bool
+    lazy::Bool
+    datadecl::Bool
+    typeparam::Bool
+    modname::Bool
+    pirates::Bool
+    useoffuncargs::Bool
+    kwdefault::Bool
+    literal::Bool
+    breakcontinue::Bool
+    constdecl::Bool
+end
+LintOptions() = LintOptions(default_options...)
+LintOptions(::Colon) = LintOptions(fill(true, length(default_options))...)
+
+LintOptions(options::Vararg{Union{Bool,Nothing},length(default_options)}) =
+    LintOptions(something.(options, default_options)...)
+
+# `tree_visible` (per-file traversal mode only, `nothing` in the
+# whole-closure pass): a `(name::String, x::EXPR) -> Bool` predicate over
+# the tree-context visible names AT THE CALL SITE `x` (the site matters:
+# a call inside a module declared in the analyzed file resolves against
+# that module's visibility, not the file's own splice path). When the
+# callee of a call is ALSO visible through the tree context, the file
+# provably sees only a partial method set (other files of the module may
+# add methods, forward declarations get their methods elsewhere), so the
+# method-set lints (`FunctionHasNoMethods`/`IncorrectCallArgs`) must
+# decline — the lost true-positive direction (a genuinely method-less
+# module-level function) is sanctioned conservatism of the per-file
+# architecture.
+function check_all(x::EXPR, opts::LintOptions, env::ExternalEnv, meta_dict, tree_visible=nothing, tree_extended=nothing, tree_arities=nothing, tree_in_scope=nothing)
+    # Linting is disabled inside `@test_throws`: its body is expected to error and
+    # may contain invalid code
+    is_test_throws_macrocall(x, env, meta_dict) && return
+
+    # Do checks
+    opts.call && check_call(x, env, meta_dict, tree_visible, tree_extended, tree_arities, tree_in_scope)
+    opts.iter && check_loop_iter(x, env, meta_dict)
+    opts.nothingcomp && check_nothing_equality(x, env, meta_dict)
+    opts.constif && check_if_conds(x, meta_dict)
+    opts.lazy && check_lazy(x, meta_dict)
+    opts.datadecl && check_datatype_decl(x, env, meta_dict)
+    opts.typeparam && check_typeparams(x, meta_dict)
+    opts.modname && check_modulename(x, meta_dict)
+    opts.pirates && check_for_pirates(x, meta_dict)
+    opts.useoffuncargs && check_farg_unused(x, meta_dict)
+    opts.kwdefault && check_kw_default(x, env, meta_dict)
+    opts.literal && check_use_of_literal(x, meta_dict)
+    opts.breakcontinue && check_break_continue(x, meta_dict)
+    opts.constdecl && check_const(x, meta_dict)
+
+    if x.args !== nothing
+        for i in 1:length(x.args)
+            check_all(x.args[i], opts, env, meta_dict, tree_visible, tree_extended, tree_arities, tree_in_scope)
+        end
+    end
+end
+
+
+function _typeof(x, state)
+    if x isa EXPR
+        if headof(x) in (:abstract, :primitive, :struct)
+            return CoreTypes.DataType
+        elseif CSTParser.defines_module(x)
+            return CoreTypes.Module
+        elseif CSTParser.defines_function(x)
+            return CoreTypes.Function
+        end
+    elseif x isa SymbolServer.DataTypeStore
+        return CoreTypes.DataType
+    elseif x isa SymbolServer.FunctionStore
+        return resolves_to_datatype(x, state.env) ? CoreTypes.DataType : CoreTypes.Function
+    elseif x isa TreeRef
+        # per-file traversal mode: map the tree item kind
+        if x.kind === :function || x.kind === :macro
+            return CoreTypes.Function
+        elseif x.kind === :struct || x.kind === :mutable_struct || x.kind === :abstract || x.kind === :primitive
+            return CoreTypes.DataType
+        elseif x.kind === :module
+            return CoreTypes.Module
+        end
+    end
+end
+
+# Call
+function struct_nargs(x::EXPR, env=nothing, meta_dict=nothing)
+    # struct defs wrapped in macros are likely to have some arbirtary additional
+    # constructors, so lets allow anything — except behind a doc wrapper, which
+    # adds no constructors (see `func_nargs`).
+    parentof(x) isa EXPR && CSTParser.ismacrocall(parentof(x)) &&
+        !is_doc_macrocall(parentof(x)) && return 0, typemax(Int), Symbol[], true
+    minargs, maxargs, kws, kwsplat = 0, 0, Symbol[], false
+    args = x.args[3]
+    length(args.args) == 0 && return 0, typemax(Int), kws, kwsplat
+    # Inner constructors are alternative methods, so the struct's arity is their
+    # union — keying on the first one alone false-flags calls to the others. A
+    # single range can't express a gap (arities 1 and 3 admit 2), which errs
+    # towards accepting a call, never towards a false positive.
+    inner_constructors = findall(a -> CSTParser.defines_function(a), args.args)
+    if !isempty(inner_constructors)
+        minargs, maxargs = typemax(Int), 0
+        for i in inner_constructors
+            imin, imax, ikws, ikwsplat = func_nargs(args.args[i], env, meta_dict)
+            minargs = min(minargs, imin)
+            maxargs = max(maxargs, imax)
+            union!(kws, ikws)
+            kwsplat |= ikwsplat
+        end
+        return minargs, maxargs, kws, kwsplat
+    else
+        # Only real fields count towards the default constructor. A field's
+        # docstring is a bare string child of the body block, not a field — the
+        # inventory's own field-name loop skips it the same way, and counting it
+        # made a documented field reject the correct call.
+        nfields = count(a -> !CSTParser.isstringliteral(a), args.args)
+        # A body carrying no fields at all answers like an empty one.
+        nfields == 0 && return 0, typemax(Int), kws, kwsplat
+        minargs = maxargs = nfields
+    end
+    return minargs, maxargs, kws, kwsplat
+end
+
+const SIGNATURE_PRESERVING_MACROS = Symbol[
+    Symbol("@inline"),
+    Symbol("@noinline"),
+    Symbol("@propagate_inbounds"),
+    Symbol("@generated"),
+    Symbol("@assume_effects"),
+    Symbol("@constprop"),
+    Symbol("@pure"),
+    Symbol("@nospecializeinfer"),
+]
+
+function func_nargs(x::EXPR, env=nothing, meta_dict=nothing)
+    # early return for macro-wrapped functions, unless we know the macro does
+    # not modify the signature (requires env + meta_dict to resolve the macro).
+    # A doc wrapper is exempt: it is a macrocall, but it cannot rewrite the
+    # signature it wraps, so a docstring must not stop the arity being checked.
+    if env !== nothing && meta_dict !== nothing && parentof(x) isa EXPR &&
+            CSTParser.ismacrocall(parentof(x)) && !is_doc_macrocall(parentof(x))
+        macroname = parentof(x).args[1]
+        any(n -> _points_to_Base_macro(macroname, n, env, meta_dict), SIGNATURE_PRESERVING_MACROS) ||
+            return 0, typemax(Int), Symbol[], true
+    end
+
+    minargs, maxargs, kws, kwsplat = 0, 0, Symbol[], false
+    sig = CSTParser.rem_wheres_decls(CSTParser.get_sig(x))
+
+    if sig.args !== nothing
+        for i = 2:length(sig.args)
+            arg = unwrap_nospecialize(sig.args[i])
+            if isparameters(arg)
+                for j = 1:length(arg.args)
+                    arg1 = arg.args[j]
+                    if iskwarg(arg1)
+                        push!(kws, Symbol(CSTParser.str_value(CSTParser.get_arg_name(arg1.args[1]))))
+                    elseif isidentifier(arg1) || isdeclaration(arg1)
+                        push!(kws, Symbol(CSTParser.str_value(CSTParser.get_arg_name(arg1))))
+                    elseif issplat(arg1)
+                        kwsplat = true
+                    end
+                end
+            elseif iskwarg(arg)
+                if issplat(arg.args[1])
+                    maxargs = typemax(Int)
+                else
+                    maxargs !== typemax(Int) && (maxargs += 1)
+                end
+            elseif issplat(arg) || is_explicit_vararg_decl(arg)
+                bn = bounded_vararg_N(arg)
+                if bn !== nothing
+                    minargs += bn
+                    maxargs !== typemax(Int) && (maxargs += bn)
+                else
+                    maxargs = typemax(Int)
+                end
+            else
+                minargs += 1
+                maxargs !== typemax(Int) && (maxargs += 1)
+            end
+        end
+    end
+
+    return minargs, maxargs, kws, kwsplat
+end
+
+function func_nargs(m::SymbolServer.MethodStore)
+    minargs, maxargs, kws, kwsplat = 0, 0, Symbol[], false
+
+    for arg in m.sig
+        t = last(arg)
+        if CoreTypes.isva(t)
+            va = unwrap_fakeunionall(t)
+            # Bounded `Vararg{T,N}` contributes exactly N args. Unbounded forms
+            # (`Vararg{T}` / `Vararg{T,N} where N`) allow any count.
+            if va isa SymbolServer.FakeTypeofVararg && isdefined(va, :N) && va.N isa Integer
+                minargs += va.N
+                maxargs !== typemax(Int) && (maxargs += va.N)
+            else
+                maxargs = typemax(Int)
+            end
+        else
+            minargs += 1
+            maxargs !== typemax(Int) && (maxargs += 1)
+        end
+    end
+    for kw in m.kws
+        if endswith(String(kw), "...")
+            kwsplat = true
+        else
+            push!(kws, kw)
+        end
+    end
+    return minargs, maxargs, kws, kwsplat
+end
+
+function call_nargs(x::EXPR)
+    minargs, maxargs, kws = 0, 0, Symbol[]
+    if length(x.args) > 0
+        for i = 2:length(x.args)
+            arg = x.args[i]
+            if isparameters(arg)
+                for j = 1:length(arg.args)
+                    arg1 = arg.args[j]
+                    if iskwarg(arg1)
+                        push!(kws, Symbol(CSTParser.str_value(CSTParser.get_arg_name(arg1.args[1]))))
+                    end
+                end
+            elseif iskwarg(arg)
+                push!(kws, Symbol(CSTParser.str_value(CSTParser.get_arg_name(arg.args[1]))))
+            elseif issplat(arg)
+                maxargs = typemax(Int)
+            else
+                minargs += 1
+                maxargs !== typemax(Int) && (maxargs += 1)
+            end
+        end
+    else
+        @info string("call_nargs: ", to_codeobject(x))
+    end
+
+    return minargs, maxargs, kws
+end
+
+# compare_f_call(m_counts, call_counts) = true # fallback method
+
+function compare_f_call(
+        (ref_minargs, ref_maxargs, ref_kws, kwsplat),
+        (act_minargs, act_maxargs, act_kws),
+    )
+    # check matching on positional arguments
+    if act_maxargs == typemax(Int)
+        act_minargs <= act_maxargs < ref_minargs && return false
+    else
+        !(ref_minargs <= act_minargs <= act_maxargs <= ref_maxargs) && return false
+    end
+
+    # check matching on keyword arguments
+    kwsplat && return true # splatted kw in method so accept any kw in call
+
+    # no splatted kw in method sig
+    length(act_kws) > length(ref_kws) && return false # call has more kws than method accepts
+    !all(kw in ref_kws for kw in act_kws) && return false # call supplies a kw that isn't defined in the method
+
+    return true
+end
+
+compare_f_call(ref::MethodArity, act) =
+    compare_f_call((ref.minargs, ref.maxargs, ref.kws, ref.kwsplat), act)
+
+function is_something_with_methods(x::Binding)
+    (CoreTypes.isfunction(x.type) && x.val isa EXPR) ||
+    (CoreTypes.isdatatype(x.type) && x.val isa EXPR && CSTParser.defines_struct(x.val)) ||
+    (x.val isa SymbolServer.FunctionStore || x.val isa SymbolServer.DataTypeStore)
+end
+is_something_with_methods(x::T) where T <: Union{SymbolServer.FunctionStore,SymbolServer.DataTypeStore} = true
+is_something_with_methods(x) = false
+
+# A function-LOCAL callee binding — a closure or parameter defined inside a
+# function/macro body — as opposed to a module/file top-level definition. A local
+# fully shadows any same-named global, so its method set is exactly its own; the
+# cross-file `tree_arities` gate (which reasons about module-level names whose
+# methods may span sibling files) must not apply, or a call to the local
+# false-flags against the global's arity.
+_is_local_callee_binding(b, meta_dict) = false
+function _is_local_callee_binding(b::Binding, meta_dict)
+    b.val isa EXPR || return false
+    p = parentof(b.val)
+    p isa EXPR || return false
+    return maybe_get_parent_fexpr(p, x -> CSTParser.defines_function(x) || CSTParser.defines_macro(x)) !== nothing
+end
+
+function check_call(x, env::ExternalEnv, meta_dict, tree_visible=nothing, tree_extended=nothing, tree_arities=nothing, tree_in_scope=nothing)
+    if iscall(x)
+        parentof(x) isa EXPR && headof(parentof(x)) === :do && return # TODO: add number of args specified in do block.
+        length(x.args) == 0 && return
+        # A definition's own signature is call-shaped but not a call — this
+        # includes macro-wrapped defs (`@inline foo(u, bar = u) = …`), whose
+        # signatures check_call still visits.
+        _is_def_sig(x) && return
+        # find the function we're dealing with
+        func_ref = refof_call_func(x, meta_dict)
+        func_ref === nothing && return
+
+        # Per-file mode partial-method-set gate (see `check_all`'s docs):
+        # a Binding-backed callee whose name is also tree-visible has an
+        # unknowable-from-this-file method set — decline. Store-backed
+        # callees (env) keep their full method sets and stay checked.
+        # A tree-visible workspace callee — a local `Binding` whose name is also
+        # tree-visible (methods may span sibling files), OR a `TreeRef` to a
+        # function/macro/struct defined only in sibling files.
+        if tree_visible !== nothing &&
+           ((func_ref isa Binding && !_is_local_callee_binding(func_ref, meta_dict)) ||
+            (func_ref isa TreeRef && func_ref.kind in (:function, :macro, :struct, :mutable_struct)))
+            name = CSTParser.get_name(x)
+            if name isa EXPR && isidentifier(name)
+                n = valofid(name)
+                if n !== nothing && tree_visible(n, x)
+                    # The local `func_ref` sees only THIS file's methods of a
+                    # tree-visible name, but the tree knows all of them. Check the
+                    # argument count against the full cross-file arity set
+                    # (`tree_arities`); a positional TYPE check of a cross-file
+                    # callee is deferred (needs sibling analyses). Splatted calls
+                    # have an unknowable arity — skip.
+                    if tree_arities !== nothing && !call_has_splat(x)
+                        arities = tree_arities(n, x)
+                        # An unqualified import of a store function/type
+                        # (`import Base: show`) binds a `Binding` whose `.val` is
+                        # the store: its method set is the workspace overloads
+                        # (`tree_arities`, cross-file) PLUS the store's own
+                        # methods, which `tree_arities` omits. Accept a match
+                        # against EITHER set — else this file's partial view
+                        # false-flags a valid store-arity call.
+                        store = func_ref isa Binding &&
+                            (func_ref.val isa SymbolServer.FunctionStore || func_ref.val isa SymbolServer.DataTypeStore) ?
+                            func_ref.val : nothing
+                        if !isempty(arities) || store !== nothing
+                            cc = call_nargs(x)
+                            if any(a -> compare_f_call(a, cc), arities)
+                                # matches a workspace overload's arity
+                            elseif store !== nothing
+                                # Match against the store's own methods; decline
+                                # (no flag) if we can't resolve a scope for them.
+                                tls = retrieve_toplevel_scope(x, meta_dict)
+                                if tls isa Scope && !iterate_over_ss_methods(store, tls, env, m -> compare_f_call(func_nargs(m), cc); in_scope = tree_in_scope === nothing ? nothing : tree_in_scope(x))
+                                    seterror!(x, IncorrectCallArgs, meta_dict)
+                                end
+                            else
+                                seterror!(x, IncorrectCallArgs, meta_dict)
+                            end
+                        end
+                    end
+                    return
+                end
+            end
+        end
+
+        # Per-file mode partial-method-set gate for a STORE-backed callee that a
+        # workspace file extends (`Base.relpath(::AbstractString, ::PkgData)` in a
+        # sibling): the overload lives in that file's `scope.overloaded` and is not
+        # in the env store's method set, so this file sees only a partial set —
+        # decline rather than false-positive. `tree_extended` (per-file mode only)
+        # confirms `func_ref` is the function actually extended.
+        if tree_extended !== nothing && (func_ref isa SymbolServer.FunctionStore || func_ref isa SymbolServer.DataTypeStore)
+            tree_extended(func_ref, x) && return
+        end
+
+        if is_something_with_methods(func_ref) && !(func_ref isa Binding && func_ref.val isa EXPR && func_ref.val.head === :macro)
+            # intentionally empty
+            if func_ref isa Binding && func_ref.val isa EXPR && isassignment(func_ref.val) && isidentifier(func_ref.val.args[1]) && isidentifier(func_ref.val.args[2])
+                # if func_ref is a shadow binding (for these purposes, an assignment that just changes the name of a mehtod), redirect to the rhs of the assignment.
+                func_ref = refof(func_ref.val.args[2], meta_dict)
+            end
+        else
+            return
+        end
+        call_counts = call_nargs(x)
+        tls = retrieve_toplevel_scope(x, meta_dict)
+        tls === nothing && return @warn "Couldn't get top-level scope." # General check, this means something has gone wrong.
+        func_ref === nothing && return
+        if func_has_no_methods(func_ref, meta_dict)
+            seterror!(x, FunctionHasNoMethods, meta_dict)
+        elseif !sig_match_any(func_ref, x, call_counts, tls, env, meta_dict, tree_in_scope)
+            seterror!(x, IncorrectCallArgs, meta_dict)
+        end
+    end
+end
+
+# True when call-shaped `x` is the signature of a definition, possibly behind
+# `::T`/`where` wrappers. Position matters: only `args[1]` of the wrapping
+# `=`/`function`/`macro` is a signature (the RHS of an assignment is a real
+# call). A macro's signature is call-shaped and can share a binding with a
+# same-named function, so it must be recognised here rather than checked as a
+# call against that function's methods.
+function _is_def_sig(x::EXPR)
+    p = parentof(x)
+    p isa EXPR || return false
+    p.args !== nothing && !isempty(p.args) && p.args[1] == x || return false
+    if headof(p) === :function || CSTParser.is_eq(headof(p))
+        return CSTParser.defines_function(p)
+    elseif headof(p) === :macro
+        return CSTParser.defines_macro(p)
+    elseif isdeclaration(p) || iswhere(p)
+        return _is_def_sig(p)
+    end
+    return false
+end
+
+# True when every visible definition of `func_ref` is a bare forward
+# declaration (`function f end`) — i.e. the function has no methods, so any
+# call to it can only throw a `MethodError`.
+_is_real_method(m::EXPR) =
+    (CSTParser.defines_function(m) || CSTParser.defines_macro(m)) &&
+    (s = CSTParser.rem_wheres_decls(CSTParser.get_sig(m))) !== nothing && s.args !== nothing
+
+function func_has_no_methods(func_ref, meta_dict)
+    func_ref isa Binding || return false
+    func_ref.val isa EXPR && CSTParser.defines_function(func_ref.val) || return false
+    _is_real_method(func_ref.val) && return false
+    for r in func_ref.refs
+        method = get_method(r)
+        method === nothing && continue
+        method isa EXPR || return false  # external (stdlib/package) backing has methods
+        _is_real_method(method) && return false
+    end
+    return true
+end
+
+function sig_match_any(func_ref::Union{SymbolServer.FunctionStore,SymbolServer.DataTypeStore}, x, call_counts, tls::Scope, env::ExternalEnv, meta_dict, tree_in_scope=nothing)
+    in_scope = tree_in_scope === nothing ? nothing : tree_in_scope(x)
+    # we can't statically determine how many arguments a splat will take up
+    if call_has_splat(x)
+        return iterate_over_ss_methods(func_ref, tls, env, m -> compare_f_call(func_nargs(m), call_counts); in_scope)
+    end
+    args, kws = call_arg_types(x, false, meta_dict, getsymbols(env))
+    iterate_over_ss_methods(func_ref, tls, env, m -> match_method(args, kws, m, getsymbols(env), meta_dict); in_scope)
+end
+
+function call_has_splat(x::EXPR)
+    x.args === nothing && return false
+    for a in x.args
+        CSTParser.issplat(a) && return true
+    end
+    return false
+end
+
+function sig_match_any(func_ref::Binding, x, call_counts, tls::Scope, env::ExternalEnv, meta_dict, tree_in_scope=nothing)
+    if func_ref.val isa SymbolServer.FunctionStore || func_ref.val isa SymbolServer.DataTypeStore
+        match = sig_match_any(func_ref.val, x, call_counts, tls, env, meta_dict, tree_in_scope)
+        match && return true
+    end
+
+    has_at_least_one_method = func_ref.val isa EXPR && defines_function(func_ref.val)
+
+    # Check binding.val directly as a method definition.
+    # When a file is include()d multiple times (e.g. shared.jl included by
+    # each @testitem), the function-name EXPR node carries a ref to only ONE
+    # Binding (the last include's).  Later bindings' refs lists may lack the
+    # function-name node, so get_method() below won't find it.  Checking val
+    # directly ensures the first method definition is always considered.
+    #
+    # Restrict this to plain defs: a macrocall-wrapped val (e.g. an `@eval`-
+    # interpreted binding, whose val keeps the macrocall as parent) would hit
+    # the macro-permissive early return in sig_match_any(::EXPR) and wrongly
+    # tolerate any arity. Such defs fall through to the refs/get_method path
+    # below, matching upstream behaviour.
+    if has_at_least_one_method && !(parentof(func_ref.val) isa EXPR && CSTParser.ismacrocall(parentof(func_ref.val)))
+        sig_match_any(func_ref.val, x, call_counts, tls, env, meta_dict, tree_in_scope) && return true
+    end
+
+    for r in func_ref.refs
+        method = get_method(r)
+        method === nothing && continue
+        has_at_least_one_method = true
+        sig_match_any(method, x, call_counts, tls, env, meta_dict, tree_in_scope) && return true
+    end
+    return !has_at_least_one_method
+end
+
+function sig_match_any(func::EXPR, x, call_counts, tls::Scope, env::ExternalEnv, meta_dict, tree_in_scope=nothing)
+    if CSTParser.defines_function(func) || CSTParser.defines_struct(func)
+        # Macro-wrapped definitions can rewrite arity/constructors at expansion
+        # time (`@kwdef` structs, `@kernel` functions, …). For unknown macros we
+        # can't see that statically — fall back to arity-only matching, which
+        # func_nargs/struct_nargs render permissive ((0, typemax, …)) for
+        # non-signature-preserving macros.
+        if parentof(func) isa EXPR && CSTParser.ismacrocall(parentof(func))
+            m_counts = CSTParser.defines_struct(func) ? struct_nargs(func, env, meta_dict) : func_nargs(func, env, meta_dict)
+            return compare_f_call(m_counts, call_counts)
+        end
+        # Splat in the call → unknown actual arity, fall back to arity-only.
+        if call_has_splat(x)
+            m_counts = CSTParser.defines_struct(func) ? struct_nargs(func, env, meta_dict) : func_nargs(func, env, meta_dict)
+            compare_f_call(m_counts, call_counts) && return true
+        else
+            args, kws = call_arg_types(x, false, meta_dict, getsymbols(env))
+            match_method(args, kws, func, getsymbols(env), meta_dict) && return true
+        end
+        return false
+    end
+    return true # We shouldn't get here
+end
+
+# ── Detailed "possible method call error" messages ─────────────────────────
+# `check_call` flags a call with the bare `IncorrectCallArgs` code; these build a
+# human-readable reason at render time (see `describe_call_mismatch`), reusing the
+# same arg-count / arg-type machinery `sig_match_any` uses so the reason can never
+# disagree with the flag.
+
+# Short, readable name of a type value (as produced by `call_arg_types` /
+# `_resolve_type_expr` / a MethodStore sig slot). Strips the noisy `Core.` prefix.
+function _format_type(@nospecialize(t))
+    s = t === nothing ? "Any" :
+        t isa SymbolServer.DataTypeStore ? string(t.name) :
+        t isa Binding ? (t.name isa EXPR ? valofid(t.name) : string(t.name)) :
+        string(t)
+    s === nothing && (s = "Any")
+    startswith(s, "Core.") ? s[6:end] : s
+end
+
+# The callee name of a call, as written (`f`, `Base.foo`), or `nothing`.
+function _call_name_str(call::EXPR)
+    n = CSTParser.get_name(call)
+    n isa EXPR || return nothing
+    return string(to_codeobject(n))
+end
+
+# Candidate methods of a call's callee — store `MethodStore`s and/or workspace
+# method `EXPR`s — mirroring `sig_match_any`'s enumeration but without the match
+# filter. Returns `nothing` for a callee shape we can't enumerate confidently.
+function _candidate_methods(call::EXPR, env::ExternalEnv, meta_dict, tree_in_scope=nothing)
+    func_ref = refof_call_func(call, meta_dict)
+    func_ref === nothing && return nothing
+    fuel = 20
+    while func_ref isa Binding && func_ref.val isa Binding && fuel > 0
+        func_ref = func_ref.val
+        fuel -= 1
+    end
+    if func_ref isa Binding && (func_ref.val isa SymbolServer.FunctionStore || func_ref.val isa SymbolServer.DataTypeStore)
+        func_ref = func_ref.val
+    end
+    cands = Any[]
+    if func_ref isa SymbolServer.FunctionStore || func_ref isa SymbolServer.DataTypeStore
+        tls = retrieve_toplevel_scope(call, meta_dict)
+        if tls isa Scope
+            iterate_over_ss_methods(func_ref, tls, env, m -> (push!(cands, m); false); in_scope = tree_in_scope === nothing ? nothing : tree_in_scope(call))
+        else
+            append!(cands, func_ref.methods)
+        end
+    elseif func_ref isa Binding && (CoreTypes.isfunction(func_ref.type) || CoreTypes.isdatatype(func_ref.type))
+        if func_ref.val isa EXPR && defines_function(func_ref.val) &&
+           !(parentof(func_ref.val) isa EXPR && CSTParser.ismacrocall(parentof(func_ref.val)))
+            push!(cands, func_ref.val)
+        end
+        for ref in func_ref.refs
+            m = get_method(ref)
+            m === nothing && continue
+            if m isa SymbolServer.FunctionStore
+                append!(cands, m.methods)
+            elseif m isa EXPR
+                push!(cands, m)
+            end
+        end
+    else
+        return nothing
+    end
+    return cands
+end
+
+_cand_nargs(m::SymbolServer.MethodStore, env, meta_dict) = MethodArity(func_nargs(m)...)
+_cand_nargs(m::EXPR, env, meta_dict) =
+    MethodArity((CSTParser.defines_struct(m) ? struct_nargs(m, env, meta_dict) : func_nargs(m, env, meta_dict))...)
+
+# Expected type of positional slot `i` (1-based) of candidate `m` at a call of
+# `nargs` positional arguments, or `nothing` when it can't be pinned down
+# (untyped arg, splat/vararg element, out of range) — matching `match_method`'s
+# leniency so a mismatch is only ever asserted where the matcher rejected it.
+function _expected_arg_type(m::SymbolServer.MethodStore, i::Int, nargs::Int, store, meta_dict)
+    sig = m.sig
+    n = length(sig)
+    n == 0 && return nothing
+    if last(sig)[2] isa SymbolServer.FakeTypeofVararg
+        va = last(sig)[2]
+        i <= n - 1 && return sig[i][2]
+        return isdefined(va, :T) ? va.T : nothing
+    end
+    i <= n ? sig[i][2] : nothing
+end
+function _expected_arg_type(m::EXPR, i::Int, nargs::Int, store, meta_dict)
+    sig = CSTParser.rem_wheres_decls(CSTParser.get_sig(m))
+    (sig isa EXPR && sig.args !== nothing) || return nothing
+    decls = EXPR[]
+    for j in 2:length(sig.args)
+        a = unwrap_nospecialize(sig.args[j])
+        isparameters(a) && continue
+        push!(decls, a)
+    end
+    i <= length(decls) || return nothing
+    a = decls[i]
+    (issplat(a) || is_explicit_vararg_decl(a)) && return nothing
+    (isdeclaration(a) && length(a.args) >= 2) || return nothing
+    return _resolve_type_expr(a.args[2], store, meta_dict)
+end
+
+# Render the arity constraint of a set of `func_nargs`-style tuples for a message.
+function _arity_desc(counts)
+    mins = sort!(unique(c.minargs for c in counts))
+    unbounded = any(c.maxargs == typemax(Int) for c in counts)
+    if unbounded
+        return string("at least ", minimum(mins))
+    elseif length(mins) == 1 && all(c.maxargs == mins[1] for c in counts)
+        return string(mins[1])
+    else
+        lo = minimum(c.minargs for c in counts)
+        hi = maximum(c.maxargs for c in counts)
+        return lo == hi ? string(lo) : string(lo, " to ", hi)
+    end
+end
+
+"""
+    describe_call_mismatch(call::EXPR, env, meta_dict) -> Union{Nothing,String}
+
+A specific message for a call `check_call` flagged with `IncorrectCallArgs`:
+`No method matching \\\`f(::T1, ::T2)\\\`.` plus the closest reason — an argument
+count mismatch, an unsupported keyword, or a positional type mismatch (naming the
+argument, the inferred type, and the expected type). Returns `nothing` when no
+specific reason is derivable (splatted call, unusual callee shape), so the caller
+keeps the generic wording.
+"""
+function describe_call_mismatch(call::EXPR, env::ExternalEnv, meta_dict; cand_arities=nothing, tree_in_scope=nothing)
+    call_has_splat(call) && return nothing
+    # `cand_arities` (cross-file arity set, from `derived_method_arities`) drives
+    # the arg-count / keyword reason for a callee whose method set spans files —
+    # the local candidate EXPRs are then incomplete, so skip the type branch. With
+    # no `cand_arities`, enumerate the local candidates (store methods / local
+    # method EXPRs) and do the full arity + keyword + positional-type analysis.
+    cands = cand_arities === nothing ? _candidate_methods(call, env, meta_dict, tree_in_scope) : nothing
+    cand_arities === nothing && (cands === nothing || isempty(cands)) && return nothing
+    name = _call_name_str(call)
+    name === nothing && return nothing
+    store = getsymbols(env)
+
+    act_min, act_max, act_kws = call_nargs(call)
+    nargs = act_min # no splat ⇒ min == max
+    inferred, _ = call_arg_types(call, false, meta_dict, store)
+
+    header = string("No method matching `", name, "(",
+        join((string("::", _format_type(t)) for t in inferred), ", "),
+        isempty(act_kws) ? "" : string("; ", join(act_kws, ", ")), ")`.")
+
+    counts = cand_arities === nothing ? [_cand_nargs(c, env, meta_dict) for c in cands] : cand_arities
+    isempty(counts) && return nothing
+
+    arity_ok = [i for i in eachindex(counts) if counts[i].minargs <= nargs <= counts[i].maxargs]
+    if isempty(arity_ok)
+        return string(header, " Expected ", _arity_desc(counts), " argument",
+            _arity_desc(counts) == "1" ? "" : "s", ", got ", nargs, ".")
+    end
+
+    # keyword: a passed keyword no arity-matching candidate accepts
+    if !isempty(act_kws)
+        accepts(i, kw) = counts[i].kwsplat || kw in counts[i].kws
+        for kw in act_kws
+            any(i -> accepts(i, kw), arity_ok) || return string(header, " Unsupported keyword `", kw, "`.")
+        end
+    end
+
+    # positional type: only with real candidate EXPRs/MethodStores in hand
+    # (the cross-file arity path has no per-method types — that is Part B).
+    cands === nothing && return header
+
+    # candidates of matching arity (and, if the call has keywords, keyword-ok)
+    kw_ok = [i for i in arity_ok if counts[i].kwsplat || all(kw in counts[i].kws for kw in act_kws)]
+    consider = isempty(kw_ok) ? arity_ok : kw_ok
+    # Collapse duplicate views of the SAME method — a workspace binding yields its
+    # definition EXPR through both `.val` and a `.refs` entry. With more than one
+    # DISTINCT candidate of matching arity, no single "expected `T`" is meaningful
+    # (the argument may suit another overload's slot), so emit header only rather
+    # than naming an arbitrary one; the header already lists the actual arg types.
+    distinct = Any[]
+    for i in consider
+        any(c -> c === cands[i], distinct) || push!(distinct, cands[i])
+    end
+    length(distinct) == 1 || return header
+
+    cand = distinct[1]
+    slot = 0
+    for s in 1:nargs
+        exp = _expected_arg_type(cand, s, nargs, store, meta_dict)
+        exp === nothing && continue
+        got = s <= length(inferred) ? inferred[s] : nothing
+        if _has_type_intersection(got, exp, store, meta_dict) === false
+            slot = s
+            break
+        end
+    end
+    if slot > 0
+        exp = _expected_arg_type(cand, slot, nargs, store, meta_dict)
+        got = slot <= length(inferred) ? inferred[slot] : nothing
+        return string(header, " At argument ", slot, ": expected `",
+            _format_type(exp), "`, got `", _format_type(got), "`.")
+    end
+    return header
+end
+
+function get_method(name::EXPR)
+    f = maybe_get_parent_fexpr(name, x -> CSTParser.defines_function(x) || CSTParser.defines_struct(x) || CSTParser.defines_macro(x))
+    if f !== nothing && CSTParser.get_name(f) == name
+        return f
+    end
+end
+function get_method(x::Union{SymbolServer.FunctionStore,SymbolServer.DataTypeStore})
+    x
+end
+get_method(x) = nothing
+
+# The documentation macro in any of its spellings: the implicit `:globalrefdoc`
+# of `"…" f(x) = 1`, an explicit `@doc`, or a qualified `Mod.@doc`. The single
+# source of truth for the shape — the parent module's doc handling calls this too,
+# so the two cannot drift.
+is_doc_macro_name(x) = false
+function is_doc_macro_name(x::EXPR)
+    headof(x) === :globalrefdoc && return true
+    CSTParser.is_getfield_w_quotenode(x) &&
+        return is_doc_macro_name(CSTParser.unquotenode(CSTParser.rhs_getfield(x)))
+    return isidentifier(x) && valofid(x) == "@doc"
+end
+
+# A doc wrapper. Unlike other macros it cannot rewrite what it wraps, so arity
+# checking must see through it.
+function is_doc_macrocall(x::EXPR)
+    CSTParser.ismacrocall(x) || return false
+    (x.args === nothing || isempty(x.args)) && return false
+    return is_doc_macro_name(x.args[1])
+end
+
+isdocumented(x::EXPR) = parentof(x) isa EXPR && is_doc_macrocall(parentof(x))
+
+function check_loop_iter(x::EXPR, env::ExternalEnv, meta_dict)
+    if headof(x) === :for
+        if length(x.args) > 1
+            body = x.args[2]
+            if headof(x.args[1]) === :block && x.args[1].args !== nothing
+                for arg in x.args[1].args
+                    check_incorrect_iter_spec(arg, body, env, meta_dict)
+                end
+            else
+                check_incorrect_iter_spec(x.args[1], body, env, meta_dict)
+            end
+        end
+    elseif headof(x) === :generator
+        body = x.args[1]
+        for i = 2:length(x.args)
+            check_incorrect_iter_spec(x.args[i], body, env, meta_dict)
+        end
+    end
+end
+
+function check_incorrect_iter_spec(x, body, env, meta_dict)
+    if x.args !== nothing && CSTParser.is_range(x)
+        rng = rhs_of_iterator(x)
+
+        if headof(rng) === :FLOAT || headof(rng) === :INTEGER || (iscall(rng) && refof(rng.args[1], meta_dict) === getsymbols(env)[:Base][:length])
+            seterror!(x, IncorrectIterSpec, meta_dict)
+        elseif iscall(rng) && valof(rng.args[1]) == ":" &&
+            length(rng.args) === 3 &&
+            headof(rng.args[2]) === :INTEGER &&
+            iscall(rng.args[3]) &&
+            length(rng.args[3].args) > 1 && (
+                refof(rng.args[3].args[1], meta_dict) === getsymbols(env)[:Base][:length] ||
+                refof(rng.args[3].args[1], meta_dict) === getsymbols(env)[:Base][:size]
+            )
+            if length(x.args) >= 1
+                lhs = x.args[1]
+                arr = rng.args[3].args[2]
+                b = refof(arr, meta_dict)
+
+                # 1:length(arr) indexing is ok for Vector and Array specifically
+                if b isa Binding && (CoreTypes.isarray(b.type) || CoreTypes.isvector(b.type))
+                    return
+                end
+                if !all_underscore(valof(lhs))
+                    if check_is_used_in_getindex(body, lhs, arr, meta_dict)
+                        seterror!(x, IndexFromLength, meta_dict)
+                    end
+                end
+            end
+        elseif hasref(rng, meta_dict) && refof(rng, meta_dict) isa Binding && refof(rng, meta_dict).type !== nothing
+            type = get_eventual_datatype(refof(rng, meta_dict).type, env)
+            try
+                if type !== nothing && _issubtype(type, getsymbols(env)[:Core][:Number], env.symbols, meta_dict) === true
+                    seterror!(x, IncorrectIterSpec, meta_dict)
+                end
+            catch err
+                # TODO Should this be an error for crash reporting, I think?
+                @warn "iter type checker crashed with" ex=(err, catch_backtrace())
+            end
+        end
+    end
+end
+
+function check_is_used_in_getindex(expr, lhs, arr, meta_dict)
+    if headof(expr) === :ref && expr.args !== nothing && length(expr.args) > 1
+        this_arr = expr.args[1]
+        if hasref(this_arr, meta_dict) && hasref(arr, meta_dict) && refof(this_arr, meta_dict) == refof(arr, meta_dict)
+            for index_arg in expr.args[2:end]
+                if hasref(index_arg, meta_dict) && hasref(lhs, meta_dict) && refof(index_arg, meta_dict) == refof(lhs, meta_dict)
+                    seterror!(expr, IndexFromLength, meta_dict)
+                    return true
+                end
+            end
+        end
+    end
+    if expr.args !== nothing
+        for arg in expr.args
+            check_is_used_in_getindex(arg, lhs, arr, meta_dict) && return true
+        end
+    end
+    return false
+end
+
+# `nothing` is Core-owned but re-exported by Base. Depending on how the crawl
+# represents the re-export, a use can resolve to either the Core or the Base
+# store entry — two distinct `GenericStore` instances that don't compare equal —
+# so matching only against `Core[:nothing]` misses uses that resolve through
+# Base. Accept either.
+function _refers_to_nothing(@nospecialize(r), env::ExternalEnv)
+    r === nothing && return false
+    syms = getsymbols(env)
+    r == syms[:Core][:nothing] && return true
+    return haskey(syms[:Base], :nothing) && r == syms[:Base][:nothing]
+end
+
+function check_nothing_equality(x::EXPR, env::ExternalEnv, meta_dict)
+    if isbinarycall(x) && length(x.args) == 3
+        _is_nothing(a) = valof(a) == "nothing" && _refers_to_nothing(refof(a, meta_dict), env)
+        if valof(x.args[1]) == "==" && (_is_nothing(x.args[2]) || _is_nothing(x.args[3]))
+            seterror!(x.args[1], NothingEquality, meta_dict)
+        elseif valof(x.args[1]) == "!=" && (_is_nothing(x.args[2]) || _is_nothing(x.args[3]))
+            seterror!(x.args[1], NothingNotEq, meta_dict)
+        end
+    end
+end
+
+function _get_top_binding(x::EXPR, name::String)
+    if scopeof(x, meta_dict) isa Scope
+        return _get_top_binding(scopeof(x, meta_dict), name)
+    elseif parentof(x) isa EXPR
+        return _get_top_binding(parentof(x), name)
+    else
+        return nothing
+    end
+end
+
+function _get_top_binding(s::Scope, name::String)
+    if scopehasbinding(s, name)
+        return s.names[name]
+    elseif parentof(s) isa Scope
+        return _get_top_binding(parentof(s), name)
+    else
+        return nothing
+    end
+end
+
+function _get_global_scope(s::Scope)
+    if !CSTParser.defines_module(s.expr) && parentof(s) isa Scope && parentof(s) != s
+        return _get_global_scope(parentof(s))
+    else
+        return s
+    end
+end
+
+function check_if_conds(x::EXPR, meta_dict)
+    if headof(x) === :if
+        cond = x.args[1]
+        if headof(cond) === :TRUE || headof(cond) === :FALSE
+            seterror!(cond, ConstIfCondition, meta_dict)
+        elseif isassignment(cond)
+            seterror!(cond, EqInIfConditional, meta_dict)
+        end
+    end
+end
+
+function check_lazy(x::EXPR, meta_dict)
+    if isbinarysyntax(x)
+        if valof(headof(x)) == "||"
+            if headof(x.args[1]) === :TRUE || headof(x.args[1]) === :FALSE
+                seterror!(x, PointlessOR, meta_dict)
+            end
+        elseif valof(headof(x)) == "&&"
+            if headof(x.args[1]) === :TRUE || headof(x.args[1]) === :FALSE || headof(x.args[2]) === :TRUE || headof(x.args[2]) === :FALSE
+                seterror!(x, PointlessAND, meta_dict)
+            end
+        end
+    end
+end
+
+is_never_datatype(b, env::ExternalEnv) = false
+is_never_datatype(b::SymbolServer.DataTypeStore, env::ExternalEnv) = false
+function is_never_datatype(b::SymbolServer.FunctionStore, env::ExternalEnv)
+    !(SymbolServer._lookup(b.extends, getsymbols(env)) isa SymbolServer.DataTypeStore)
+end
+function is_never_datatype(b::Binding, env::ExternalEnv)
+    if b.val isa Binding
+        return is_never_datatype(b.val, env)
+    elseif b.val isa SymbolServer.FunctionStore
+        return is_never_datatype(b.val, env)
+    elseif CoreTypes.isdatatype(b.type)
+        return false
+    elseif b.type !== nothing
+        if !any(x -> x isa SymbolServer.DataTypeStore, get_eventual_datatype(ref, env) for ref in b.refs)
+            return true
+        end
+    end
+    return false
+end
+
+function check_datatype_decl(x::EXPR, env::ExternalEnv, meta_dict)
+    # Only call in function signatures?
+    if isdeclaration(x) && parentof(x) isa EXPR && iscall(parentof(x))
+        if (dt = refof_maybe_getfield(last(x.args), meta_dict)) !== nothing
+            if is_never_datatype(dt, env)
+                seterror!(x, InvalidTypeDeclaration, meta_dict)
+            end
+        elseif CSTParser.isliteral(last(x.args))
+            seterror!(x, InvalidTypeDeclaration, meta_dict)
+        end
+    end
+end
+
+function check_modulename(x::EXPR, meta_dict)
+    if CSTParser.defines_module(x) && # x is a module
+        scopeof(x, meta_dict) isa Scope && parentof(scopeof(x, meta_dict)) isa Scope && # it has a scope and a parent scope
+        CSTParser.defines_module(parentof(scopeof(x, meta_dict)).expr) # the parent scope is a module
+        # valofid also covers var"..." names, where valof is nothing (and
+        # would spuriously compare equal for two distinct var"..." names)
+        name = _module_name_or_nothing(CSTParser.get_name(x))
+        parent_name = _module_name_or_nothing(CSTParser.get_name(parentof(scopeof(x, meta_dict)).expr))
+        if name !== nothing && name == parent_name # their names match
+            seterror!(CSTParser.get_name(x), InvalidModuleName, meta_dict)
+        end
+    end
+end
+
+# Check whether function arguments are unused
+function check_farg_unused(x::EXPR, meta_dict)
+    if CSTParser.defines_function(x)
+        sig = CSTParser.rem_wheres_decls(CSTParser.get_sig(x))
+        if iscall(sig)
+            arg_names = Set{String}()
+            for i = 2:length(sig.args)
+                arg = sig.args[i]
+                if arg.head === :parameters
+                    for arg2 in arg.args
+                        !check_farg_unused_(arg2, arg_names, meta_dict) && continue
+                    end
+                else
+                    !check_farg_unused_(arg, arg_names, meta_dict) && continue
+                end
+            end
+        end
+    end
+end
+
+function check_farg_unused_(arg, arg_names, meta_dict)
+    if !hasbinding(arg, meta_dict)
+        if iskwarg(arg)
+            arg = arg.args[1]
+        end
+        if is_nospecialize_call(arg)
+            arg = unwrap_nospecialize(arg)
+        end
+    end
+    if !hasbinding(arg, meta_dict)
+        return false
+    end
+    b = bindingof(arg, meta_dict)
+
+    # We don't care about these
+    valof(b.name) isa String && all_underscore(valof(b.name)) && return false
+
+    if b === nothing ||
+        # no refs:
+       isempty(b.refs) ||
+        # only self ref:
+       (length(b.refs) == 1 && first(b.refs) == b.name) ||
+        # first usage is itself a binding (i.e. a reassignment, not a read):
+       (length(b.refs) > 1 && b.refs[2] isa EXPR && hasbinding(b.refs[2], meta_dict))
+        seterror!(arg, UnusedFunctionArgument, meta_dict)
+    end
+
+    argname = b.name isa EXPR && isidentifier(b.name) ? valofid(b.name) : valof(b.name)
+    if argname === nothing
+    elseif argname in arg_names
+        seterror!(arg, DuplicateFuncArgName, meta_dict)
+    else
+        push!(arg_names, argname)
+    end
+    true
+end
+
+function unwrap_nospecialize(x)
+    is_nospecialize_call(x) || return x
+    length(x.args) >= 3 || return x
+    x.args[3]
+end
+
+function is_nospecialize_call(x)
+    CSTParser.ismacrocall(x) &&
+    CSTParser.ismacroname(x.args[1]) &&
+    is_nospecialize(x.args[1])
+end
+
+"""
+    is_test_throws_macrocall(x::EXPR, env, meta_dict)
+
+True if `x` is a call to `Test.@test_throws`, resolved through the environment
+(so `using Test`, qualified `Test.@test_throws`, and renamed imports are handled,
+while an unrelated user-defined `@test_throws` is not matched). Its body
+deliberately contains code that is expected to error - often intentionally
+invalid - so linting is disabled there (issue #3682).
+"""
+function is_test_throws_macrocall(x::EXPR, env, meta_dict)
+    CSTParser.ismacrocall(x) || return false
+    (x.args !== nothing && length(x.args) > 0) || return false
+    return _points_to_arbitrary_macro(x.args[1], :Test, Symbol("@test_throws"), env, meta_dict)
+end
+
+"""
+    in_macrocall_arg(x::EXPR)
+
+True if walking up from `x` we reach a macrocall (with `x` in its argument list,
+not the macroname) without first crossing a scope-introducing expression
+(function/let/struct/...).
+
+If a user-written scope sits between the identifier and the macrocall, we assume
+the macro respects normal Julia scoping.
+"""
+function in_macrocall_arg(x::EXPR)
+    cur = x
+    while parentof(cur) isa EXPR
+        p = parentof(cur)
+        if CSTParser.ismacrocall(p)
+            return !(length(p.args) > 0 && p.args[1] === cur)
+        end
+        h = headof(p)
+        if h === :function || h === :macro || h === :for || h === :while ||
+           h === :let || h === :generator || h === :try || h === :do ||
+           h === :module || h === :abstract || h === :primitive || h === :struct
+            return false
+        end
+        cur = p
+    end
+    return false
+end
+
+# Is `x` inside a scope whose missing-ref checks are disabled by an
+# unresolved wildcard `using`? Stops at module boundaries, mirroring
+# `resolve_ref`: a nested `module` does not inherit its parent's usings.
+function in_unresolved_wildcard_import_scope(x::EXPR, meta_dict)
+    sc = retrieve_scope(x, meta_dict)
+    while sc isa Scope
+        sc.unresolved_wildcard_import && return true
+        CSTParser.defines_module(sc.expr) && return false
+        sc = parentof(sc)
+    end
+    return false
+end
+
+"""
+collect_hints(x::EXPR, env, missingrefs = :all, isquoted = false, errs = Tuple{Int,EXPR}[], pos = 0)
+
+Collect hints and errors from an expression. `missingrefs` = (:none, :id, :all) determines whether unresolved
+identifiers are marked, the :all option will mark identifiers used in getfield calls."
+"""
+function collect_hints(x::EXPR, env, workspace_packages, meta_dict, missingrefs=:all, isquoted=false, errs=Tuple{Int,EXPR}[], pos=0)
+    # Linting is disabled inside `@test_throws` (see `check_all`), so skip its body
+    # here too - otherwise deliberately undefined references would still be flagged.
+    is_test_throws_macrocall(x, env, meta_dict) && return errs
+
+    # relies on quoted(x) and unquoted(x) being mutually exclusive
+    isquoted = isquoted ? !unquoted(x) : quoted(x)
+
+    if headof(x) === :errortoken
+        # collect parse errors
+        push!(errs, (pos, x))
+    elseif !isquoted
+        if haserror(x, meta_dict) && errorof(x, meta_dict) isa StaticLint.LintCodes
+            # collect lint hints
+            push!(errs, (pos, x))
+        elseif missingrefs != :none && isidentifier(x) && !hasref(x, meta_dict) &&
+            !(valof(x) == "var" && parentof(x) isa EXPR && isnonstdid(parentof(x))) &&
+            !((valof(x) == "stdcall" || valof(x) == "cdecl" || valof(x) == "fastcall" || valof(x) == "thiscall" || valof(x) == "llvmcall") && is_in_fexpr(x, x -> iscall(x) && isidentifier(x.args[1]) && valof(x.args[1]) == "ccall")) &&
+            !in_macrocall_arg(x) &&
+            # inside using/import statements the UnresolvedImport marking
+            # pass is the sole reporter
+            !is_in_fexpr(x, y -> headof(y) === :using || headof(y) === :import) &&
+            !in_unresolved_wildcard_import_scope(x, meta_dict)
+            push!(errs, (pos, x))
+        end
+    elseif isquoted && missingrefs == :all && should_mark_missing_getfield_ref(x, env, workspace_packages, meta_dict)
+        push!(errs, (pos, x))
+    end
+
+    for i in 1:length(x)
+        collect_hints(x[i], env, workspace_packages, meta_dict, missingrefs, isquoted, errs, pos)
+        pos += x[i].fullspan
+    end
+
+    errs
+end
+
+function refof_maybe_getfield(x::EXPR, meta_dict)
+    if isidentifier(x)
+        return refof(x, meta_dict)
+    elseif is_getfield_w_quotenode(x)
+        return refof(x.args[2].args[1], meta_dict)
+    end
+end
+
+"""
+    resolve_remaining_getfields!(x::EXPR, env, workspace_packages, meta_dict, isquoted=false)
+
+Perform late getfield reference resolution over `x`. By-use type inference runs
+after the initial reference-resolution pass, so the type of the left-hand side of
+a `getproperty` (e.g. `a` in `a.b`) may only become known afterwards. This pass
+revisits the field-name identifiers of `getproperty` calls and attempts to
+resolve them now that types are available.
+
+This mutates `meta_dict` (via `setref!`/`resolve_getfield`) and must therefore be
+run while the meta is still being built (e.g. alongside `check_all`), not from the
+read-only diagnostics gathering in `collect_hints`.
+"""
+function resolve_remaining_getfields!(x::EXPR, env, workspace_packages, meta_dict, isquoted=false)
+    # relies on quoted(x) and unquoted(x) being mutually exclusive
+    isquoted = isquoted ? !unquoted(x) : quoted(x)
+    if isquoted
+        try_resolve_getfield_ref!(x, env, workspace_packages, meta_dict)
+    end
+    if x.args !== nothing
+        for a in x.args
+            resolve_remaining_getfields!(a, env, workspace_packages, meta_dict, isquoted)
+        end
+    end
+    return x
+end
+
+# Attempt to resolve a getfield-rhs identifier `x` (the field name in `a.b`).
+# Mutates `meta_dict`/bindings via `resolve_getfield` and `setref!`.
+function try_resolve_getfield_ref!(x, env, workspace_packages, meta_dict)
+    if isidentifier(x) && !hasref(x, meta_dict) && # x has no ref
+    parentof(x) isa EXPR && headof(parentof(x)) === :quotenode && parentof(parentof(x)) isa EXPR && is_getfield(parentof(parentof(x)))  # x is the rhs of a getproperty
+        lhsref = refof_maybe_getfield(parentof(parentof(x)).args[1], meta_dict)
+        if lhsref isa Binding
+            # by-use type inference runs after we've resolved references so we may not have known lhsref's type first time round, lets try and find `x` again
+            resolve_getfield(x, lhsref, ResolveOnly(retrieve_scope(x, meta_dict), env, workspace_packages, meta_dict)) # FIXME: Setting `server` to nothing might be sketchy?
+            hasref(x, meta_dict) && return # We've resolved
+            if lhsref.val isa Binding
+                lhsref = lhsref.val
+            end
+            lhsref = get_root_method(lhsref)
+            if lhsref isa Binding && lhsref.type isa Binding && lhsref.type.val isa EXPR && CSTParser.defines_struct(lhsref.type.val) && !has_getproperty_method(lhsref.type)
+                # We may have infered the lhs type after the semantic pass that was resolving references. Copied from `resolve_getfield(x::EXPR, parent_type::EXPR, state::TraverseState)::Bool`.
+                if scopehasbinding(scopeof(lhsref.type.val, meta_dict), valofid(x))
+                    setref!(x, scopeof(lhsref.type.val, meta_dict).names[valofid(x)], meta_dict)
+                end
+            end
+        end
+    end
+    return
+end
+
+# Pure (read-only) decision: should `x` (the field name in `a.b`) be reported as a
+# missing reference? Any late resolution that could change the answer must already
+# have been performed by `resolve_remaining_getfields!` before this runs.
+function should_mark_missing_getfield_ref(x, env, workspace_packages, meta_dict)
+    if isidentifier(x) && !hasref(x, meta_dict) && # x has no ref
+    parentof(x) isa EXPR && headof(parentof(x)) === :quotenode && parentof(parentof(x)) isa EXPR && is_getfield(parentof(parentof(x)))  # x is the rhs of a getproperty
+        lhsref = refof_maybe_getfield(parentof(parentof(x)).args[1], meta_dict)
+        if lhsref isa SymbolServer.ModuleStore || (lhsref isa Binding && lhsref.val isa SymbolServer.ModuleStore)
+            # a module, we should know this.
+            return true
+        elseif lhsref isa Binding
+            if lhsref.val isa Binding
+                lhsref = lhsref.val
+            end
+            lhsref = get_root_method(lhsref)
+            if !(lhsref isa Binding)
+                # Not clear what is happening here.
+                return false
+            elseif lhsref.type isa SymbolServer.DataTypeStore && !(isempty(lhsref.type.fieldnames) || isunionfaketype(lhsref.type.name) || has_getproperty_method(lhsref.type, env))
+                return true
+            elseif lhsref.type isa Binding && lhsref.type.val isa EXPR && CSTParser.defines_struct(lhsref.type.val) && !has_getproperty_method(lhsref.type)
+                # We may have infered the lhs type after the semantic pass that was resolving references.
+                return !scopehasbinding(scopeof(lhsref.type.val, meta_dict), valofid(x))
+            end
+        end
+    end
+    return false
+end
+
+unwrap_fakeunionall(x) = x isa SymbolServer.FakeUnionAll ? unwrap_fakeunionall(x.body) : x
+function has_getproperty_method(b::SymbolServer.DataTypeStore, env)
+    getprop_vr = SymbolServer.VarRef(SymbolServer.VarRef(nothing, :Base), :getproperty)
+    if haskey(getsymbolextendeds(env), getprop_vr)
+        for ext in getsymbolextendeds(env)[getprop_vr]
+            for m in SymbolServer._lookup(ext, getsymbols(env))[:getproperty].methods
+                t = unwrap_fakeunionall(m.sig[1][2])
+                !(t isa SymbolServer.FakeUnion) && t.name == b.name.name && return true
+            end
+        end
+    else
+        for m in getsymbols(env)[:Base][:getproperty].methods
+            t = unwrap_fakeunionall(m.sig[1][2])
+            !(t isa SymbolServer.FakeUnion) && t.name == b.name.name && return true
+        end
+    end
+    return false
+end
+
+function has_getproperty_method(b::Binding)
+    if b.val isa Binding || b.val isa SymbolServer.DataTypeStore
+        return has_getproperty_method(b.val)
+    elseif b isa Binding && CoreTypes.isdatatype(b.type)
+        for ref in b.refs
+            if ref isa EXPR && is_type_of_call_to_getproperty(ref)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function is_type_of_call_to_getproperty(x::EXPR)
+    function is_call_to_getproperty(x::EXPR)
+        if iscall(x)
+            func_name = x.args[1]
+            return (isidentifier(func_name) && valof(func_name) == "getproperty") || # getproperty()
+            (is_getfield_w_quotenode(func_name) && isidentifier(func_name.args[2].args[1]) && valof(func_name.args[2].args[1]) == "getproperty") # Base.getproperty()
+        end
+        return false
+    end
+
+    return parentof(x) isa EXPR && parentof(parentof(x)) isa EXPR &&
+        ((isdeclaration(parentof(x)) && x === parentof(x).args[2] && is_call_to_getproperty(parentof(parentof(x)))) ||
+        (iscurly(parentof(x)) && x === parentof(x).args[1] && isdeclaration(parentof(parentof(x))) &&  parentof(parentof(parentof(x))) isa EXPR && is_call_to_getproperty(parentof(parentof(parentof(x))))))
+end
+
+isunionfaketype(t::SymbolServer.FakeTypeName) = t.name.name === :Union && t.name.parent isa SymbolServer.VarRef && t.name.parent.name === :Core
+
+function check_typeparams(x::EXPR, meta_dict)
+    if iswhere(x)
+        for i in 2:length(x.args)
+            a = x.args[i]
+            if hasbinding(a, meta_dict) && (bindingof(a, meta_dict).refs === nothing || length(bindingof(a, meta_dict).refs) < 2)
+                seterror!(a, UnusedTypeParameter, meta_dict)
+            end
+        end
+    end
+end
+
+function check_for_pirates(x::EXPR, meta_dict)
+    if CSTParser.defines_function(x)
+        sig = CSTParser.rem_wheres_decls(CSTParser.get_sig(x))
+        fname = CSTParser.get_name(sig)
+        if fname_is_noteq(fname)
+            seterror!(x, NotEqDef, meta_dict)
+        elseif iscall(sig) && hasbinding(x, meta_dict) && overwrites_imported_function(refof(fname, meta_dict))
+            for i = 2:length(sig.args)
+                if hasbinding(sig.args[i], meta_dict) && bindingof(sig.args[i], meta_dict).type isa Binding
+                    return
+                elseif refers_to_nonimported_type(sig.args[i], meta_dict)
+                    return
+                end
+            end
+            seterror!(x, TypePiracy, meta_dict)
+        end
+    end
+end
+
+function fname_is_noteq(x)
+    if x isa EXPR
+        if isoperator(x) && valof(x) == "!="
+            return true
+        elseif is_getfield_w_quotenode(x)
+            return fname_is_noteq(x.args[2].args[1])
+        end
+    end
+    return false
+end
+
+function refers_to_nonimported_type(arg::EXPR, meta_dict)
+    arg = CSTParser.rem_wheres(arg)
+    if hasref(arg, meta_dict) && refof(arg, meta_dict) isa Binding
+        return true
+    elseif isunarysyntax(arg) && (valof(headof(arg)) == "::" || valof(headof(arg)) == "<:")
+        return refers_to_nonimported_type(arg.args[1], meta_dict)
+    elseif isdeclaration(arg)
+        return refers_to_nonimported_type(arg.args[2], meta_dict)
+    elseif iscurly(arg)
+        for i = 1:length(arg.args)
+            if refers_to_nonimported_type(arg.args[i], meta_dict)
+                return true
+            end
+        end
+        return false
+    end
+    return false
+end
+
+overwrites_imported_function(b) = false
+function overwrites_imported_function(b::Binding)
+    if ((b.val isa SymbolServer.FunctionStore || b.val isa SymbolServer.DataTypeStore) &&
+        (is_in_fexpr(b.name, x -> headof(x) === :import)) || (b.refs isa Vector && length(b.refs) > 0 && (first(b.refs) isa SymbolServer.FunctionStore || first(b.refs) isa SymbolServer.DataTypeStore)))
+        return true
+    end
+    return false
+end
+
+# Now called from add_binding
+# Should return true/false indicating whether the binding should actually be added?
+function check_const_decl(name::String, b::Binding, scope, meta_dict)
+    # assumes `scopehasbinding(scope, name)`
+
+    # imported/using-ed bindings are never const decls
+    is_in_fexpr(b.name, x -> headof(x) === :import || headof(x) === :using) && return
+
+    b.val isa Binding && return check_const_decl(name, b.val, scope, meta_dict)
+    if b.val isa EXPR && (CSTParser.defines_datatype(b.val) || is_const(b))
+        seterror!(b.name, CannotDeclareConst, meta_dict)
+    else
+        prev = scope.names[name]
+        if (CoreTypes.isdatatype(prev.type) && !is_mask_binding_of_datatype(prev, meta_dict)) || is_const(prev)
+            if b.val isa EXPR && prev.val isa EXPR && !in_same_if_branch(b.val, prev.val)
+                return
+            end
+            if b.val isa EXPR
+                seterror!(b.val, InvalidRedefofConst, meta_dict)
+            else
+                # TODO check what's going on here
+                seterror!(b.name, InvalidRedefofConst, meta_dict)
+            end
+        end
+    end
+end
+
+function is_mask_binding_of_datatype(b::Binding, meta_dict)
+    # the `isa Binding` guard keeps the `.val` accesses off ref types without
+    # that field (e.g. a per-file-mode TreeRef)
+    b.val isa EXPR && CSTParser.isassignment(b.val) && (rhsref = refof(b.val.args[2], meta_dict)) !== nothing && (rhsref isa SymbolServer.DataTypeStore || (rhsref isa Binding && ((rhsref.val isa EXPR && rhsref.val isa SymbolServer.DataTypeStore) || (rhsref.val isa EXPR && CSTParser.defines_datatype(rhsref.val)))))
+end
+
+# check whether a and b are in all the same :if blocks and in the same branches
+in_same_if_branch(a::EXPR, b::EXPR) = in_same_if_branch(find_if_parents(a), find_if_parents(b))
+in_same_if_branch(a::Dict, b::EXPR) = in_same_if_branch(a, find_if_parents(b))
+function in_same_if_branch(a::Dict, b::Dict)
+    return length(a) == length(b) && all(k in keys(b) for k in keys(a)) && all(a[k] == b[k] for k in keys(a))
+end
+
+# find any parent nodes that are :if blocks and a pseudo-index of which branch
+# x is in
+function find_if_parents(x::EXPR, current=Int[], list=Dict{EXPR,Vector{Int}}())
+    if x.head in (:block, :elseif) && parentof(x) isa EXPR && headof(parentof(x)) in (:if, :elseif)
+        i = 1
+        while i <= length(parentof(x).args)
+            if parentof(x).args[i] == x
+                pushfirst!(current, i)
+                break
+            end
+            i += 1
+        end
+        if headof(parentof(x)) == :if
+            list[parentof(x)] = current
+            current = []
+        end
+    end
+    return parentof(x) isa EXPR ? find_if_parents(parentof(x), current, list) : list
+end
+
+is_const(x) = false
+is_const(b::Binding) = is_const(b.val)
+is_const(x::EXPR) = is_const_expr(parentof(x))
+
+is_const_expr(x) = false
+is_const_expr(x::EXPR) = headof(x) === :const
+
+
+"""
+    check_kw_default(x::EXPR, server)
+
+Check that the default value matches the type for keyword arguments. Following types are
+checked: `String, Symbol, Int, Char, Bool, Float32, Float64, UInt8, UInt16, UInt32,
+UInt64, UInt128`.
+"""
+function check_kw_default(x::EXPR, env::ExternalEnv, meta_dict)
+    if headof(x) == :kw && isdeclaration(x.args[1]) && CSTParser.isliteral(x.args[2]) && hasref(x.args[1].args[2], meta_dict)
+        decl_T = get_eventual_datatype(refof(x.args[1].args[2], meta_dict), env)
+        rhs = x.args[2]
+        rhsval = valof(rhs)
+        if decl_T == getsymbols(env)[:Core][:String] && !CSTParser.isstringliteral(rhs)
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][:Symbol] && headof(rhs) !== :IDENTIFIER
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][:Int] && headof(rhs) !== :INTEGER
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][Sys.WORD_SIZE == 64 ? :Int64 : :Int32] && headof(rhs) !== :INTEGER
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][:Bool] && !(headof(rhs) === :TRUE || headof(rhs) === :FALSE)
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][:Char] && headof(rhs) !== :CHAR
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][:Float64] && headof(rhs) !== :FLOAT
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        elseif decl_T == getsymbols(env)[:Core][:Float32] && !(headof(rhs) === :FLOAT && occursin("f", rhsval))
+            seterror!(rhs, KwDefaultMismatch, meta_dict)
+        else
+            for T in (UInt8, UInt16, UInt32, UInt64, UInt128)
+                if decl_T == getsymbols(env)[:Core][Symbol(T)]
+                    # count the digits without prefix (=0x, 0o, 0b) and make sure it fits
+                    # between upper and lower literal boundaries for `T` where the boundaries
+                    # depend on the type of literal (binary, octal, hex)
+                    n = count(x -> x != '_', rhsval) - 2
+                    ub = sizeof(T)
+                    lb = ub ÷ 2
+                    if headof(rhs) == :BININT
+                        8lb < n <= 8ub || seterror!(rhs, KwDefaultMismatch, meta_dict)
+                    elseif headof(rhs) == :OCTINT
+                        3lb < n <= 3ub || seterror!(rhs, KwDefaultMismatch, meta_dict)
+                    elseif headof(rhs) == :HEXINT
+                        2lb < n <= 2ub || seterror!(rhs, KwDefaultMismatch, meta_dict)
+                    else
+                        seterror!(rhs, KwDefaultMismatch, meta_dict)
+                    end
+                end
+            end
+            # signed integers of non native size can't be declared as literal
+            for T in (Int8, Int16, Sys.WORD_SIZE == 64 ? Int32 : Int64, Int128)
+                if decl_T == getsymbols(env)[:Core][Symbol(T)]
+                    seterror!(rhs, KwDefaultMismatch, meta_dict)
+                end
+            end
+
+        end
+    end
+end
+
+function check_use_of_literal(x::EXPR, meta_dict)
+    if CSTParser.defines_module(x) && length(x.args) > 1 && isbadliteral(x.args[2])
+        seterror!(x.args[2], InappropriateUseOfLiteral, meta_dict)
+    elseif (CSTParser.defines_abstract(x) || CSTParser.defines_primitive(x)) && isbadliteral(x.args[1])
+        seterror!(x.args[1], InappropriateUseOfLiteral, meta_dict)
+    elseif CSTParser.defines_struct(x) && isbadliteral(x.args[2])
+        seterror!(x.args[2], InappropriateUseOfLiteral, meta_dict)
+    elseif (isassignment(x) || iskwarg(x)) && isbadliteral(x.args[1])
+        seterror!(x.args[1], InappropriateUseOfLiteral, meta_dict)
+    elseif isdeclaration(x) && isbadliteral(x.args[2])
+        seterror!(x.args[2], InappropriateUseOfLiteral, meta_dict)
+    elseif isbinarycall(x, "isa") && isbadliteral(x.args[3])
+        seterror!(x.args[3], InappropriateUseOfLiteral, meta_dict)
+    end
+end
+
+isbadliteral(x::EXPR) = CSTParser.isliteral(x) && (CSTParser.isstringliteral(x) || headof(x) === :INTEGER || headof(x) === :FLOAT || headof(x) === :CHAR || headof(x) === :TRUE || headof(x) === :FALSE)
+
+function check_break_continue(x::EXPR, meta_dict)
+    if iskeyword(x) && (headof(x) === :CONTINUE || headof(x) === :BREAK) && !is_in_fexpr(x, x -> headof(x) in (:for, :while))
+        seterror!(x, ShouldBeInALoop, meta_dict)
+    end
+end
+
+function check_const(x::EXPR, meta_dict)
+    if headof(x) === :const
+        if VERSION < v"1.8.0-DEV.1500" && CSTParser.isassignment(x.args[1]) && CSTParser.isdeclaration(x.args[1].args[1])
+            seterror!(x, TypeDeclOnGlobalVariable, meta_dict)
+        elseif headof(x.args[1]) === :local
+            seterror!(x, UnsupportedConstLocalVariable, meta_dict)
+        end
+    end
+end
+
+function check_unused_binding(b::Binding, scope::Scope, meta_dict)
+    if headof(scope.expr) !== :struct && headof(scope.expr) !== :tuple && !all_underscore(valof(b.name))
+        refs = loose_refs(b, meta_dict)
+        if (isempty(refs) || length(refs) == 1 && refs[1] == b.name) &&
+                !is_sig_arg(b.name) && !is_overwritten_in_loop(b.name, meta_dict) &&
+                !is_overwritten_subsequently(b, scope, meta_dict) && !is_kw_of_macrocall(b) &&
+                !captures_outer_local(b, scope) && !is_label_binding(b)
+            seterror!(b.name, UnusedBinding, meta_dict)
+        end
+    end
+end
+
+# A binding whose name also exists as a local in an enclosing scope may be a
+# closure capturing that outer local (assigned-into rather than a fresh local),
+# so it shouldn't be reported as unused.
+function captures_outer_local(b::Binding, scope::Scope)
+    isidentifier(b.name) || return false
+    name = valofid(b.name)
+    name isa String || return false
+    return enclosing_local_binding_scope(scope, name) !== nothing
+end
+
+all_underscore(s) = false
+all_underscore(s::String) = all(==(0x5f), codeunits(s))
+
+function is_sig_arg(x)
+    is_in_fexpr(x, CSTParser.iscall)
+end
+
+function is_kw_of_macrocall(b::Binding)
+    b.val isa EXPR && isassignment(b.val) && parentof(b.val) isa EXPR && CSTParser.ismacrocall(parentof(b.val))
+end
+
+# `@label name` introduces a jump target for `@goto`, not a variable, so it
+# should never be reported as an unused binding (julia-vscode#3844).
+function is_label_binding(b::Binding)
+    (b.val isa EXPR && isidentifier(b.val) && parentof(b.val) isa EXPR) || return false
+    p = parentof(b.val)
+    (CSTParser.ismacrocall(p) && length(p.args) == 3 && p.args[3] === b.val) || return false
+    mname = p.args[1]
+    return valof(mname) == "@label" ||
+        (CSTParser.is_getfield_w_quotenode(mname) && valof(rhs_of_getfield(mname)) == "@label")
+end
+
+function is_overwritten_in_loop(x, meta_dict)
+    # Cuts out false positives for check_unused_binding - the linear nature of our
+    # semantic passes mean a variable declared at the end of a loop's block but used at
+    # the start won't appear to be referenced.
+
+    # Cheap version:
+    # is_in_fexpr(x, x -> x.head === :while || x.head === :for)
+
+    # We really want to check whether the enclosing scope(s) of the loop has a binding
+    # with matching name.
+    # Is this too expensive?
+    loop = maybe_get_parent_fexpr(x, x -> x.head === :while || x.head === :for)
+    if loop !== nothing
+        s = scopeof(loop, meta_dict)
+        if s isa Scope && parentof(s) isa Scope
+            # valofid also covers var"..." names, where valof is nothing
+            xname = isidentifier(x) ? valofid(x) : valof(x)
+            xname === nothing && return false
+            s2 = check_parent_scopes_for(s, xname)
+            if s2 isa Scope
+                prev_binding = parentof(s2).names[xname]
+                if prev_binding isa Binding
+                    return true
+                    # s = ComesBefore(prev_binding.name, s2.expr, 0)
+                    # traverse(parentof(s2).expr, s)
+                    # return s.result == 1
+                    # for r in prev_binding.refs
+                    #     if r isa EXPR && is_in_fexpr(r, x -> x === loop)
+                    #         return true
+                    #     end
+                    # end
+                else
+                    return false
+                end
+            end
+        else
+            return false
+        end
+    else
+        false
+    end
+    false
+end
+
+"""
+    ComesBefore
+
+Check whether x1 comes before x2
+"""
+mutable struct ComesBefore <: TraverseState
+    x1::EXPR
+    x2::EXPR
+    result::Int
+    meta_dict::Dict{UInt64,Meta}
+end
+
+function process_EXPR(x::EXPR, state::ComesBefore)
+    meta_dict = state.meta_dict
+
+    state.result > 0 && return
+    if x == state.x1
+        state.result = 1
+        return
+    elseif x == state.x2
+        state.result = 2
+        return
+    end
+    if !hasscope(x, meta_dict)
+        traverse(x, state)
+        state.result > 0 && return
+    end
+end
+
+"""
+    check_parent_scopes_for(s::Scope, name)
+
+Checks whether the parent scope of `s` has the name `name`.
+"""
+function check_parent_scopes_for(s::Scope, name)
+    # This returns `s` rather than the parent so that s.expr can be used in the linear
+    # search (e.g. `bound_before`)
+    if s.expr.head !== :module && parentof(s) isa Scope && haskey(parentof(s).names, name)
+        s
+    elseif s.parent isa Scope
+        check_parent_scopes_for(parentof(s), name)
+    end
+end
+
+function is_overwritten_subsequently(b::Binding, scope::Scope, meta_dict)
+    # valofid also covers var"..." names, where valof is nothing
+    bname = b.name isa EXPR && isidentifier(b.name) ? valofid(b.name) : valof(b.name)
+    bname === nothing && return false
+    s = BoundAfter(b.name, bname, 0, meta_dict)
+    traverse(scope.expr, s)
+    return s.result == 2
+end
+
+"""
+    ComesBefore
+
+Check whether x1 comes before x2
+"""
+mutable struct BoundAfter <: TraverseState
+    x1::EXPR
+    name::String
+    result::Int
+    meta_dict::Dict{UInt64,Meta}
+end
+
+function process_EXPR(x::EXPR, state::BoundAfter)
+    state.result > 1 && return
+    if x == state.x1
+        state.result = 1
+        return
+    end
+    if scopeof(x, state.meta_dict) isa Scope && haskey(scopeof(x, state.meta_dict).names, state.name)
+        state.result = 2
+        return
+    end
+    traverse(x, state)
+end
