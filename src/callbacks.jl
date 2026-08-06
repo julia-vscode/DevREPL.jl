@@ -11,6 +11,14 @@ Required callbacks (must be provided):
 
 Optional callbacks (default to `nothing`):
 - Process lifecycle: created, terminated, status_changed, output
+
+`duration` is **milliseconds**, or `nothing` when the controller synthesises a result the
+test process never reported (timeout, crash, environment activation failure).
+
+Each test item produces exactly one terminal callback (passed, failed, errored or skipped)
+per run, preceded by at most one `started`. Speculative work stealing means an item can
+genuinely execute on two processes at once, but the controller discards everything the
+non-owning process reports, so consumers never see a duplicate or a status going backwards.
 """
 struct ControllerCallbacks{F1<:Function,F2<:Function,F3<:Function,F4<:Function,F5<:Function,F6<:Function,F7<:Function,F8<:Union{Nothing,Function},F9<:Union{Nothing,Function},F10<:Union{Nothing,Function},F11<:Union{Nothing,Function}}
     on_testitem_started::F1              # (testrun_id, testitem_id, test_env_id) -> nothing

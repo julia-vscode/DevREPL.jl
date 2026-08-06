@@ -80,7 +80,7 @@ All are fire-and-forget (no response expected).
 |:------|:-----|:------------|
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
-| `duration` | `Float \| null` | Wall-clock seconds. |
+| `duration` | `Float \| null` | Wall-clock milliseconds. |
 
 #### `testItemFailed`
 
@@ -89,7 +89,7 @@ All are fire-and-forget (no response expected).
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
 | `messages` | `Array<TestMessage>` | Failure details (see below). |
-| `duration` | `Float \| null` | Wall-clock seconds. |
+| `duration` | `Float \| null` | Wall-clock milliseconds. |
 
 #### `testItemErrored`
 
@@ -98,7 +98,7 @@ All are fire-and-forget (no response expected).
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
 | `messages` | `Array<TestMessage>` | Error details. |
-| `duration` | `Float \| null` | Wall-clock seconds. |
+| `duration` | `Float \| null` | Wall-clock milliseconds. |
 
 #### `testItemSkipped`
 
