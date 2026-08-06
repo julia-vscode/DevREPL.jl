@@ -98,12 +98,17 @@ Every [`ControllerCallbacks`](@ref) must provide these functions:
 | Callback | Signature | Description |
 |:---------|:----------|:------------|
 | `on_testitem_started` | `(testrun_id, testitem_id, test_env_id) -> nothing` | Fired when a test item begins execution. |
-| `on_testitem_passed` | `(testrun_id, testitem_id, test_env_id, duration) -> nothing` | Fired when a test item passes. `duration` is seconds. |
-| `on_testitem_failed` | `(testrun_id, testitem_id, test_env_id, messages, duration) -> nothing` | Fired when a test item has assertion failures. `messages` is a `Vector{TestMessage}`. |
-| `on_testitem_errored` | `(testrun_id, testitem_id, test_env_id, messages, duration) -> nothing` | Fired when a test item throws an unhandled exception. |
+| `on_testitem_passed` | `(testrun_id, testitem_id, test_env_id, duration) -> nothing` | Fired when a test item passes. `duration` is milliseconds. |
+| `on_testitem_failed` | `(testrun_id, testitem_id, test_env_id, messages, duration) -> nothing` | Fired when a test item has assertion failures. `messages` is a `Vector{TestMessage}`. `duration` is milliseconds, or `nothing`. |
+| `on_testitem_errored` | `(testrun_id, testitem_id, test_env_id, messages, duration) -> nothing` | Fired when a test item throws an unhandled exception. `duration` is milliseconds, or `nothing` when the controller synthesised the result (timeout, crash, activation failure). |
 | `on_testitem_skipped` | `(testrun_id, testitem_id, test_env_id) -> nothing` | Fired when a test item is skipped (e.g. due to cancellation). |
 | `on_append_output` | `(testrun_id, testitem_id, test_env_id, output) -> nothing` | Captured `stdout`/`stderr` output. `testitem_id` may be `nothing` for process-level output. |
 | `on_attach_debugger` | `(testrun_id, debug_pipe_name) -> nothing` | Fired when a process is ready for a debug adapter to attach. |
+
+Each test item produces exactly one terminal callback (`passed`, `failed`, `errored` or
+`skipped`) per run, preceded by at most one `started`. Work stealing is speculative, so an
+item can genuinely execute on two processes at once; the controller discards everything the
+non-owning process reports, so a status never goes backwards and no result arrives twice.
 
 ### Optional callbacks
 

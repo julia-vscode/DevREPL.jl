@@ -147,6 +147,7 @@ function handle!(c::TestItemController, ::ShutdownMsg)
         if state(tr.fsm) ∉ (TestRunCancelled, TestRunCompleted)
             CancellationTokens.cancel(tr.cancellation_source)
             for ((testitem_id, test_env_id), _) in tr.remaining_work
+                push!(tr.reported_items, testitem_id)
                 c.callbacks.on_testitem_skipped(trid, testitem_id, test_env_id)
             end
             transition!(tr.fsm, TestRunCancelled; reason="shutdown")
@@ -543,6 +544,7 @@ function handle!(c::TestItemController, msg::TestRunCancelledMsg)
 
     # Report all remaining test items as skipped
     for ((testitem_id, test_env_id), _) in tr.remaining_work
+        push!(tr.reported_items, testitem_id)
         c.callbacks.on_testitem_skipped(msg.testrun_id, testitem_id, test_env_id)
     end
     empty!(tr.remaining_work)
@@ -643,6 +645,18 @@ function handle!(c::TestItemController, msg::TestItemStartedMsg)
         first(tr.test_environments).id
     end
 
+    # A speculatively stolen item can be running on two processes at once. Only the owner
+    # may report on it — see `_owns_testitem`. The process really is executing something,
+    # so `has_started_items` is still set, but we neither report the start nor make this
+    # process the item's timeout/crash victim.
+    if !_owns_testitem(tr, msg.testprocess_id, msg.testitem_id)
+        @info "Ignoring start of test item '$(msg.testitem_id)' from test process '$(msg.testprocess_id)', which no longer owns it (duplicate execution after a steal)"
+        if haskey(c.test_processes, msg.testprocess_id)
+            c.test_processes[msg.testprocess_id].has_started_items = true
+        end
+        return false
+    end
+
     c.callbacks.on_testitem_started(msg.testrun_id, msg.testitem_id, test_env_id)
 
     # Start timeout if work unit has one
@@ -702,6 +716,16 @@ function handle!(c::TestItemController, msg::TestItemPassedMsg)
         deleteat!(tr.stolen_ids_by_proc[msg.testprocess_id], stolen_idx)
     end
 
+    # Discard the result if another process owns this item — see `_owns_testitem`. The
+    # timeout was cancelled above, which matters: a process can lose ownership *after*
+    # arming one. Stealing still runs, because this process is now idle and needs work.
+    if !_owns_testitem(tr, msg.testprocess_id, msg.testitem_id)
+        _log_discarded_result(msg.testitem_id, msg.testprocess_id, "passed")
+        _check_stealing!(c, tr, msg.testprocess_id)
+        _check_testrun_complete!(c, tr)
+        return false
+    end
+
     # Resolve test_env_id
     test_env_id = if haskey(c.test_processes, msg.testprocess_id)
         _resolve_test_env_id(tr, c.test_processes[msg.testprocess_id].env)
@@ -714,12 +738,14 @@ function handle!(c::TestItemController, msg::TestItemPassedMsg)
         delete!(tr.remaining_work, work_key)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
+        push!(tr.reported_items, msg.testitem_id)
         c.callbacks.on_testitem_passed(msg.testrun_id, msg.testitem_id, test_env_id, msg.duration)
 
         if msg.coverage !== nothing
             append!(tr.coverage, map(i -> CoverageTools.FileCoverage(uri2filepath(i.uri), "", i.coverage), msg.coverage))
         end
     else
+        _log_unexpected_missing_work(tr, msg.testitem_id, msg.testprocess_id, test_env_id, "passed")
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
     end
 
@@ -758,6 +784,14 @@ function handle!(c::TestItemController, msg::TestItemFailedMsg)
         deleteat!(tr.stolen_ids_by_proc[msg.testprocess_id], stolen_idx)
     end
 
+    # Discard the result if another process owns this item — see `_owns_testitem`.
+    if !_owns_testitem(tr, msg.testprocess_id, msg.testitem_id)
+        _log_discarded_result(msg.testitem_id, msg.testprocess_id, "failed")
+        _check_stealing!(c, tr, msg.testprocess_id)
+        _check_testrun_complete!(c, tr)
+        return false
+    end
+
     # Resolve test_env_id
     test_env_id = if haskey(c.test_processes, msg.testprocess_id)
         _resolve_test_env_id(tr, c.test_processes[msg.testprocess_id].env)
@@ -770,6 +804,7 @@ function handle!(c::TestItemController, msg::TestItemFailedMsg)
         delete!(tr.remaining_work, work_key)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
+        push!(tr.reported_items, msg.testitem_id)
         c.callbacks.on_testitem_failed(
             msg.testrun_id,
             msg.testitem_id,
@@ -788,6 +823,7 @@ function handle!(c::TestItemController, msg::TestItemFailedMsg)
             msg.duration
         )
     else
+        _log_unexpected_missing_work(tr, msg.testitem_id, msg.testprocess_id, test_env_id, "failed")
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
     end
 
@@ -814,6 +850,14 @@ function handle!(c::TestItemController, msg::TestItemErroredMsg)
         deleteat!(tr.stolen_ids_by_proc[msg.testprocess_id], stolen_idx)
     end
 
+    # Discard the result if another process owns this item — see `_owns_testitem`.
+    if !_owns_testitem(tr, msg.testprocess_id, msg.testitem_id)
+        _log_discarded_result(msg.testitem_id, msg.testprocess_id, "errored")
+        _check_stealing!(c, tr, msg.testprocess_id)
+        _check_testrun_complete!(c, tr)
+        return false
+    end
+
     # Resolve test_env_id
     test_env_id = if haskey(c.test_processes, msg.testprocess_id)
         _resolve_test_env_id(tr, c.test_processes[msg.testprocess_id].env)
@@ -826,6 +870,7 @@ function handle!(c::TestItemController, msg::TestItemErroredMsg)
         delete!(tr.remaining_work, work_key)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
+        push!(tr.reported_items, msg.testitem_id)
         c.callbacks.on_testitem_errored(
             msg.testrun_id,
             msg.testitem_id,
@@ -844,6 +889,7 @@ function handle!(c::TestItemController, msg::TestItemErroredMsg)
             msg.duration
         )
     else
+        _log_unexpected_missing_work(tr, msg.testitem_id, msg.testprocess_id, test_env_id, "errored")
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
     end
 
@@ -960,6 +1006,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
             work_key = (testitem_id, test_env_id)
             if haskey(tr.remaining_work, work_key) && item !== nothing
                 delete!(tr.remaining_work, work_key)
+                push!(tr.reported_items, testitem_id)
                 c.callbacks.on_testitem_errored(
                     msg.testrun_id,
                     testitem_id,
@@ -990,6 +1037,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
             work_key = (testitem_id, test_env_id)
             if haskey(tr.remaining_work, work_key)
                 delete!(tr.remaining_work, work_key)
+                push!(tr.reported_items, testitem_id)
                 c.callbacks.on_testitem_skipped(msg.testrun_id, testitem_id, test_env_id)
             end
         end
@@ -1019,6 +1067,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
         else
             "Test process crashed while running test item '$(item.label)'"
         end
+        push!(tr.reported_items, crashed_item_id)
         c.callbacks.on_testitem_errored(
             msg.testrun_id,
             crashed_item_id,
@@ -1049,6 +1098,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
                 work_key = (testitem_id, test_env_id)
                 if haskey(tr.remaining_work, work_key) && item !== nothing
                     delete!(tr.remaining_work, work_key)
+                    push!(tr.reported_items, testitem_id)
                     c.callbacks.on_testitem_errored(
                         msg.testrun_id,
                         testitem_id,
@@ -1079,6 +1129,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
                 work_key = (testitem_id, test_env_id)
                 if haskey(tr.remaining_work, work_key) && item !== nothing
                     delete!(tr.remaining_work, work_key)
+                    push!(tr.reported_items, testitem_id)
                     c.callbacks.on_testitem_errored(
                         msg.testrun_id,
                         testitem_id,
@@ -1234,6 +1285,7 @@ function handle!(c::TestItemController, msg::TestItemTimeoutMsg)
         delete!(tr.remaining_work, work_key)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
+        push!(tr.reported_items, msg.testitem_id)
         c.callbacks.on_testitem_errored(
             msg.testrun_id,
             msg.testitem_id,
@@ -1462,6 +1514,7 @@ function handle!(c::TestItemController, msg::ActivationFailedMsg)
             item = get(tr.test_items, testitem_id, nothing)
             if haskey(tr.remaining_work, work_key) && item !== nothing
                 delete!(tr.remaining_work, work_key)
+                push!(tr.reported_items, testitem_id)
                 c.callbacks.on_testitem_errored(
                     testrun_id,
                     testitem_id,
@@ -1503,6 +1556,7 @@ function handle!(c::TestItemController, msg::ActivationFailedMsg)
                 item = get(tr.test_items, testitem_id, nothing)
                 if haskey(tr.remaining_work, work_key) && item !== nothing
                     delete!(tr.remaining_work, work_key)
+                    push!(tr.reported_items, testitem_id)
                     c.callbacks.on_testitem_errored(
                         testrun_id,
                         testitem_id,
@@ -1976,6 +2030,60 @@ function _remove_from_proc_queue!(tr::TestRunState, proc_id::String, testitem_id
     end
 end
 
+"""
+Is `proc_id` the process currently in charge of running `testitem_id`?
+
+`testitem_ids_by_proc` is the single authority on assignment: it is updated on every
+reassignment path (initial chunking, work stealing, redistribution after a process dies,
+process-id migration on restart) and pruned by `_remove_from_proc_queue!` as soon as a
+result is accepted.
+
+This matters because work stealing is speculative — `_check_stealing!` hands an item to the
+thief without waiting for the victim to confirm it gave the item up, and a victim that has
+already started the item runs it to completion anyway. Both processes therefore report on
+it, and only the owner's messages may be acted on; otherwise a late duplicate resets an
+already-resolved item to "running" and its terminal result is dropped, leaving the item
+stuck non-terminal in a completed run. Because the item leaves the owner's queue once its
+result is accepted, this also makes a repeat result from the *same* process a no-op.
+"""
+function _owns_testitem(tr::TestRunState, proc_id::String, testitem_id::String)
+    return testitem_id in get(tr.testitem_ids_by_proc, proc_id, String[])
+end
+
+"""
+A duplicate result from a process that no longer owns the item. Expected but rare, and the
+only way to measure how often speculative stealing actually causes double execution.
+"""
+function _log_discarded_result(testitem_id::String, proc_id::String, kind::String)
+    @info "Discarding '$(kind)' result for test item '$(testitem_id)' from test process '$(proc_id)', which no longer owns it (duplicate execution after a steal)"
+end
+
+"""
+The owning process reported a result, but the work unit is gone. With the ownership check
+in place this should be unreachable: ownership is stricter than presence in
+`remaining_work`. It fires if the two disagree — most plausibly because `_resolve_test_env_id`
+matched the wrong `TestEnvironment` when several share identical `ProcessEnv` fields, which
+would leave the item unresolvable and hang the run.
+"""
+function _log_unexpected_missing_work(tr::TestRunState, testitem_id::String, proc_id::String, test_env_id::String, kind::String)
+    @error "Dropping '$(kind)' result for test item '$(testitem_id)' from its owning test process '$(proc_id)': no work unit for env '$(test_env_id)'. This is an internal inconsistency." known_envs=[e.id for e in tr.test_environments]
+end
+
+"""
+Assert the invariant every consumer relies on: by the time a run reports complete, each of
+its test items has produced exactly one terminal callback. Breaking it is what let a run be
+reported as completed while one item was still "running".
+
+Diagnostic only — it reports nothing to callbacks and changes no state.
+"""
+function _check_all_items_reported(tr::TestRunState)
+    unreported = [id for id in keys(tr.test_items) if id ∉ tr.reported_items]
+    if !isempty(unreported)
+        @error "Test run '$(tr.id)' is completing with $(length(unreported)) test item(s) that never produced a result. Consumers will show them as still running." unreported=sort(unreported)
+    end
+    return unreported
+end
+
 """Get items for a ProcessEnv that haven't been assigned to a process yet."""
 function _get_unchunked_items(tr::TestRunState, env::ProcessEnv)
     assigned = Set{String}()
@@ -2100,6 +2208,7 @@ function _check_testrun_complete!(c::TestItemController, tr::TestRunState)
         end
 
         @info "Test run '$(tr.id)' completed"
+        _check_all_items_reported(tr)
         transition!(tr.fsm, TestRunCompleted; reason="all items done")
 
         # Return all processes to pool

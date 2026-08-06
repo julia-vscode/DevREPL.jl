@@ -24,12 +24,16 @@ export TestEnvironment, TestRunItem, TestItemDetail, TestSetupDetail
 export TestMessage, TestMessageStackFrame, FileCoverage
 export ControllerCallbacks
 export execute_testrun
+export TestrunResult, TestrunResultTestitem, TestrunResultTestitemProfile,
+    TestrunResultMessage, TestrunResultStackFrame, TestrunResultDefinitionError
 
 include("json_protocol.jl")
 include("../shared/testserver_protocol.jl")
 include("../shared/urihelper.jl")
 
 include("datatypes.jl")
+include("results.jl")
+using .Results
 include("testenvironment.jl")
 
 include("fsm.jl")

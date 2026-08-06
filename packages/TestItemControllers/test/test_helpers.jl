@@ -36,6 +36,11 @@
         end
     end
 
+    # `position_at` used to return a `(line, column)` tuple and now returns a
+    # `JuliaWorkspaces.Position`. Accept either.
+    _line(pos) = hasproperty(pos, :line) ? pos.line : pos[1]
+    _column(pos) = hasproperty(pos, :column) ? pos.column : pos[2]
+
     function discover_test_items(pkg_path::String)
         jw = workspace_from_folders([pkg_path])
         td_dict = get_test_items(jw)
@@ -70,11 +75,11 @@
                     env.package_uri === nothing ? "" : string(env.package_uri),  # package_uri
                     ti.option_default_imports,                 # option_default_imports
                     String[string(s) for s in ti.option_setup],  # test_setups
-                    pos[1],                                    # line
-                    pos[2],                                    # column
+                    _line(pos),                                # line
+                    _column(pos),                              # column
                     ti.code,                                  # code
-                    code_pos[1],                               # code_line
-                    code_pos[2],                               # code_column
+                    _line(code_pos),                           # code_line
+                    _column(code_pos),                         # code_column
                 ))
             end
 
@@ -89,8 +94,8 @@
                     string(ts.name),
                     string(ts.kind),
                     string(ts.uri),
-                    pos[1],
-                    pos[2],
+                    _line(pos),
+                    _column(pos),
                     ts.code
                 ))
             end

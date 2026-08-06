@@ -95,6 +95,7 @@ mutable struct TestRunState
     coverage::Vector{CoverageTools.FileCoverage}
     cancellation_source::CancellationTokens.CancellationTokenSource
     completion_channel::Channel{Any}    # reactor puts result here; execute_testrun waits on it
+    reported_items::Set{String}         # testitem_ids for which a terminal callback was emitted
 end
 
 function TestRunState(
@@ -131,6 +132,7 @@ function TestRunState(
         CoverageTools.FileCoverage[],               # coverage
         cancellation_source,
         Channel{Any}(1),                            # completion_channel
+        Set{String}(),                              # reported_items
     )
 end
 
