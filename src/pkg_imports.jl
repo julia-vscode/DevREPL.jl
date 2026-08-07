@@ -35,9 +35,14 @@ module Salsa
 end
 
 module JuliaWorkspaces
+    import Logging
+    import Sockets
     import UUIDs
     using UUIDs: UUID, uuid4
-    
+
+    import ..CSTParser
+    import ..Scratch
+    import ..TestItemControllers.JSONRPC
     using ..JuliaSyntax
     using ..JuliaSyntax: @K_str, kind, children, haschildren, first_byte, last_byte, SyntaxNode
     using ..AutoHashEquals
