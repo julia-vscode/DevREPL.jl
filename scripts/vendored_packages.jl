@@ -18,12 +18,16 @@ checkout can be reproduced. `update_vendored_packages.jl` moves them to the newe
 const TAGGED_SUBTREES = [
     "packages/AutoHashEquals"     => ("JuliaServices/AutoHashEquals.jl", "v2.2.0"),
     "packages/CancellationTokens" => ("davidanthoff/CancellationTokens.jl", "v2.3.0"),
+    "packages/CSTParser"          => ("julia-vscode/CSTParser.jl", "v3.5.0"),
     "packages/ExceptionUnwrapping" => ("NHDaly/ExceptionUnwrapping.jl", "v0.1.11"),
+    "packages/Glob"               => ("vtjnash/Glob.jl", "v1.5.0"),
     "packages/JuliaSyntax"        => ("JuliaLang/JuliaSyntax.jl", "v1.0.2"),
     "packages/MacroTools"         => ("FluxML/MacroTools.jl", "v0.5.16"),
     "packages/PrecompileTools"    => ("JuliaLang/PrecompileTools.jl", "v1.3.4"),
     "packages/ProgressMeter"      => ("timholy/ProgressMeter.jl", "v1.11.0"),
     "packages/ReplMaker"          => ("MasonProtter/ReplMaker.jl", "v0.2.7"),
+    "packages/Scratch"            => ("JuliaPackaging/Scratch.jl", "v1.3.0"),
+    "packages/Tokenize"           => ("JuliaLang/Tokenize.jl", "v0.5.29"),
 ]
 
 """
