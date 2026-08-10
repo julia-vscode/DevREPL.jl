@@ -18,6 +18,7 @@ using Logging
 using Dates
 import REPL
 import REPL.TerminalMenus
+import InteractiveUtils
 
 # ── Logging filter (suppress TestItemControllers below Warn) ──────────
 
@@ -829,6 +830,8 @@ end
 const _bg_run = Ref{Union{Nothing,BackgroundRun}}(nothing)
 const _last_result = Ref{Union{Nothing,TestrunResult}}(nothing)
 const _last_run_id = Ref{Union{Nothing,String}}(nothing)
+# Last foreground selection: (path=..., run_kwargs=...) for 'test -'
+const _last_selection = Ref{Any}(nothing)
 
 # ── Argument parsing ──────────────────────────────────────────────────
 
@@ -861,6 +864,9 @@ function cmd_help()
     println("  test [+channel] [path|name]     Run test items (blocking, ESC to cancel)")
     println("  test pick [query] [path]        Fuzzy-pick test items to run interactively")
     println("                                  (bare 'test' also opens the picker; 'a' selects all)")
+    println("  test -                          Repeat the last test run")
+    println("  test failed                     Rerun only the failing items of the last run")
+    println("  @                               Browse failures of the last run (jump to editor)")
     println("  test +lts                       Run using a Juliaup channel")
     println("  test --tags=t1,t2               Filter by tags")
     println("  test --workers=N                Max parallel workers (default: min(nthreads,8))")
@@ -1034,6 +1040,153 @@ function cmd_pick(args)
     return _run_blocking(path, run_kwargs)
 end
 
+# ── Rerun and failure browsing ────────────────────────────────────────
+
+function cmd_rerun()
+    _check_bg_completion()
+    sel = _last_selection[]
+    if sel === nothing
+        println("No previous test run to repeat.")
+        return nothing
+    end
+    printstyled("Repeating last test run...\n"; color=:cyan)
+    return _run_blocking(sel.path, copy(sel.run_kwargs))
+end
+
+# The last run's result plus the path it ran on (from the run history).
+function _last_result_and_path()
+    run_id = _last_run_id[]
+    result = run_id === nothing ? _last_result[] : something(get_run_result(run_id), _last_result[], Some(nothing))
+    result === nothing && return nothing, nothing
+    path = nothing
+    if run_id !== nothing
+        for r in get_run_history()
+            if r.id == run_id
+                path = r.path
+                break
+            end
+        end
+    end
+    if path === nothing && _last_selection[] !== nothing
+        path = _last_selection[].path
+    end
+    return result, path
+end
+
+function _failure_entries(result)
+    entries = []
+    for ti in result.testitems, prof in ti.profiles
+        prof.status in (:failed, :errored) || continue
+        filepath = uri2filepath(ti.uri)
+        line = 1
+        if prof.messages !== missing && !isempty(prof.messages)
+            m1 = prof.messages[1]
+            mpath = try
+                p = uri2filepath(m1.uri)
+                isempty(p) ? nothing : p
+            catch
+                nothing
+            end
+            if mpath !== nothing
+                filepath = mpath
+                line = max(m1.line, 1)
+            end
+        end
+        push!(entries, (ti=ti, prof=prof, filepath=filepath, line=line))
+    end
+    return entries
+end
+
+function cmd_run_failed()
+    _check_bg_completion()
+    result, path = _last_result_and_path()
+    if result === nothing
+        println("No test run results available.")
+        return nothing
+    end
+    failing = Set{Tuple{String,String}}()
+    for ti in result.testitems
+        if any(p -> p.status in (:failed, :errored), ti.profiles)
+            push!(failing, (uri2filepath(ti.uri), ti.name))
+        end
+    end
+    if isempty(failing)
+        printstyled("No failed or errored test items in the last run.\n"; color=:green)
+        return nothing
+    end
+    if path === nothing
+        path = pwd()
+    end
+
+    run_kwargs = _last_selection[] === nothing ? Dict{Symbol,Any}() : copy(_last_selection[].run_kwargs)
+    run_kwargs[:filter] = info -> (info.filename, string(info.name)) in failing
+
+    printstyled("Rerunning $(length(failing)) failing test item(s)...\n"; color=:cyan)
+    return _run_blocking(path, run_kwargs)
+end
+
+function _print_failure(e)
+    println()
+    label = e.prof.status == :failed ? "FAIL" : "ERROR"
+    printstyled("  [$label] $(e.ti.name)"; color=:red, bold=true)
+    e.prof.duration !== missing && print(" ($(e.prof.duration)ms)")
+    println()
+    println("  at $(e.filepath):$(e.line)")
+    if e.prof.messages !== missing
+        for m in e.prof.messages
+            println()
+            println("    ", replace(m.message, "\n" => "\n    "))
+        end
+    end
+    if e.prof.output !== missing && !isempty(strip(e.prof.output))
+        println()
+        printstyled("  Output:\n"; bold=true)
+        println("    ", replace(rstrip(e.prof.output), "\n" => "\n    "))
+    end
+    println()
+end
+
+function cmd_failures()
+    _check_bg_completion()
+    result, _ = _last_result_and_path()
+    if result === nothing
+        println("No test run results available.")
+        return nothing
+    end
+    entries = _failure_entries(result)
+    if isempty(entries)
+        printstyled("No failed or errored test items in the last run.\n"; color=:green)
+        return nothing
+    end
+
+    if !(stdin isa Base.TTY)
+        foreach(_print_failure, entries)
+        return nothing
+    end
+
+    while true
+        labels = ["$(e.ti.name) ($(e.prof.status))  $(e.filepath):$(e.line)" for e in entries]
+        push!(labels, "quit")
+        menu = TerminalMenus.RadioMenu(labels; pagesize=min(12, length(labels)))
+        choice = TerminalMenus.request("Failures in last run:", menu)
+        (choice == -1 || choice == length(labels)) && return nothing
+        e = entries[choice]
+        _print_failure(e)
+        action = TerminalMenus.request(
+            "Action:",
+            TerminalMenus.RadioMenu(["Back to failures", "Open in editor", "Quit"]))
+        if action == 2
+            try
+                InteractiveUtils.edit(e.filepath, e.line)
+            catch err
+                printstyled("Could not open editor: $err\n"; color=:red)
+            end
+        elseif action != 1
+            return nothing
+        end
+    end
+end
+
 function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{Nothing,String}=nothing)
     positional, kwargs, flags = parse_args(args)
     path = nothing
@@ -1111,6 +1264,10 @@ end
 # Run tests in the foreground with ESC-to-cancel handling. run_kwargs may
 # already contain a filter; cancellation and result bookkeeping are added here.
 function _run_blocking(path, run_kwargs)
+    # Remember the selection so 'test -' can replay it (without the
+    # run-specific cancellation state).
+    _last_selection[] = (path=path, run_kwargs=copy(run_kwargs))
+
     cts = CancellationTokenSource()
     run_kwargs[:cancellation_source] = cts
     run_kwargs[:return_results] = false
@@ -1785,6 +1942,8 @@ function repl_parser(input::String)
 
     if cmd == "help" || cmd == "?"
         return cmd_help()
+    elseif cmd == "@"
+        return cmd_failures()
     elseif cmd == "test" || cmd == "t"
         return _dispatch_test(args, bg_run)
     elseif haskey(_LEGACY_COMMAND_HINTS, cmd)
@@ -1807,6 +1966,10 @@ function _dispatch_test(args, bg_run::Bool)
         return cmd_pick(rest)
     elseif sub == "pick"
         return cmd_pick(rest)
+    elseif sub == "-"
+        return cmd_rerun()
+    elseif sub == "failed"
+        return cmd_run_failed()
     elseif sub in ("list", "ls")
         return cmd_list(rest)
     elseif sub in ("status", "st")
