@@ -955,20 +955,35 @@ function _collect_testitem_candidates(jw)
     return candidates
 end
 
-# Order candidates by fuzzy score against the query; falls back to substring
-# matching on name/file/tags when nothing fuzzy-matches the name.
+# fzf-style match: all query characters appear in order (case-insensitive).
+function _is_subsequence(query::AbstractString, s::AbstractString)
+    q = lowercase(query)
+    qi = firstindex(q)
+    for c in lowercase(s)
+        qi > lastindex(q) && break
+        if c == q[qi]
+            qi = nextind(q, qi)
+        end
+    end
+    return qi > lastindex(q)
+end
+
+# Candidates whose name matches the query as a subsequence, ranked by fuzzy
+# score; candidates that only match via a substring of their file or tags are
+# appended after the name matches.
 function _fuzzy_sort(query::AbstractString, candidates)
     isempty(query) && return candidates
-    scored = [(c, REPL.fuzzyscore(query, c.name)) for c in candidates]
-    matches = [x for x in scored if x[2] > 0]
-    if isempty(matches)
-        q = lowercase(query)
-        return [c for c in candidates if contains(lowercase(c.name), q) ||
-            contains(lowercase(c.filepath), q) ||
-            any(t -> contains(lowercase(string(t)), q), c.tags)]
-    end
+    matches = [(c, REPL.fuzzyscore(query, c.name)) for c in candidates if _is_subsequence(query, c.name)]
     sort!(matches, by=x -> x[2], rev=true)
-    return [x[1] for x in matches]
+    result = [x[1] for x in matches]
+    q = lowercase(query)
+    for c in candidates
+        c in result && continue
+        if contains(lowercase(c.filepath), q) || any(t -> contains(lowercase(string(t)), q), c.tags)
+            push!(result, c)
+        end
+    end
+    return result
 end
 
 function _candidate_label(c, path)
@@ -2023,9 +2038,12 @@ function cmd_format(args)
     jw = JuliaWorkspaces.workspace_from_folders([folder])
     target_uris = collect(JuliaWorkspaces.get_julia_files(jw))
     if target_file !== nothing
+        # Case-insensitive comparison: on Windows uri2filepath yields a
+        # lowercase drive letter while abspath keeps the typed case.
+        wanted = lowercase(target_file)
         filter!(uri -> begin
             p = uri2filepath(uri)
-            p !== nothing && normpath(abspath(p)) == target_file
+            p !== nothing && lowercase(normpath(abspath(p))) == wanted
         end, target_uris)
     end
     sort!(target_uris, by=uri -> something(uri2filepath(uri), ""))
