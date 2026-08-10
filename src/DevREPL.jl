@@ -1,18 +1,19 @@
 module DevREPL
 
-include("pkg_imports.jl")
-
-using .ReplMaker
-# import ProgressMeter
-# import TestItemControllers
-using .TestItemControllers: TestItemController, ControllerCallbacks
-using .TestItemControllers.CancellationTokens: CancellationTokenSource, CancellationToken,
+# TEMP: regular Pkg deps instead of vendored subtrees (see src/pkg_imports.jl
+# and packages/ for the vendored wiring, to be restored once all upstream deps
+# support the packagedef format).
+using ReplMaker
+import ProgressMeter
+import TestItemControllers
+using TestItemControllers: TestItemController, ControllerCallbacks
+using TestItemControllers.CancellationTokens: CancellationTokenSource, CancellationToken,
     cancel, get_token, is_cancellation_requested
-using .AutoHashEquals: @auto_hash_equals
-using .JuliaWorkspaces
-using .JuliaWorkspaces.URIs2: URI, filepath2uri, uri2filepath
-using .TestItemControllers.JSON
-using .PrecompileTools: @compile_workload, @setup_workload
+using AutoHashEquals: @auto_hash_equals
+using JuliaWorkspaces
+using JuliaWorkspaces.URIs2: URI, filepath2uri, uri2filepath
+using TestItemControllers.JSON
+using PrecompileTools: @compile_workload, @setup_workload
 using Logging
 using Dates
 
@@ -26,10 +27,17 @@ Logging.shouldlog(logger::ModuleFilterLogger, level, _module, group, id) = true
 Logging.min_enabled_level(logger::ModuleFilterLogger) = Logging.Debug
 Logging.catch_exceptions(logger::ModuleFilterLogger) = Logging.catch_exceptions(logger.wrapped)
 
+function _in_module_tree(m::Module, root::Module)
+    while true
+        m === root && return true
+        parentmodule(m) === m && return false
+        m = parentmodule(m)
+    end
+end
+
 function Logging.handle_message(logger::ModuleFilterLogger, level, message, _module, group, id, filepath, line; kwargs...)
     # Suppress TestItemControllers logs below Warn
-    mod_name = string(parentmodule(_module))
-    if (mod_name == "DevREPL.TestItemControllers" || string(_module) == "DevREPL.TestItemControllers") && level < Logging.Warn
+    if level < Logging.Warn && _module isa Module && _in_module_tree(_module, TestItemControllers)
         return nothing
     end
     Logging.handle_message(logger.wrapped, level, message, _module, group, id, filepath, line; kwargs...)
@@ -88,6 +96,7 @@ end
 mutable struct RunContext
     testitems_by_id::Dict{String,TestItemControllers.TestItemDetail}
     environments::Vector{RunProfile}
+    profiles_by_env_id::Dict{String,RunProfile}
     environment_name::String
     progress_ui::Symbol
     progressbar_next::Function
@@ -121,6 +130,7 @@ mutable struct TestItemRunner
     run_contexts::Dict{String,RunContext}
     processes::Dict{String,ProcessInfo}
     process_outputs::Dict{String,Vector{String}}
+    env_package_names::Dict{String,String}  # test_env_id => package_name
     run_history::Vector{TestrunRecord}
     run_counter::Ref{Int}
     max_history::Int
@@ -134,6 +144,7 @@ function TestItemRunner(controller::TestItemController; max_history::Int=20)
         Dict{String,RunContext}(),
         Dict{String,ProcessInfo}(),
         Dict{String,Vector{String}}(),
+        Dict{String,String}(),
         Vector{TestrunRecord}(),
         Ref(0),
         max_history,
@@ -223,7 +234,7 @@ function _build_result_from_context(runner::TestItemRunner, testrun_id::String, 
                 ti.testenvironment.name,
                 ti.result.status,
                 ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === missing ? URI("") : URI(msg.uri), coalesce(msg.line, 0), coalesce(msg.column, 0)) for msg in ti.result.messages],
+                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
                 haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
             )]
         ) for ti in ctx.responses
@@ -253,8 +264,9 @@ function get_runner()
         _g_runner[] !== nothing && return _g_runner[]
 
         callbacks = TestItemControllers.ControllerCallbacks(
-            on_testitem_started = (testrun_id, testitem_id) -> nothing,
-            on_testitem_passed = (testrun_id, testitem_id, duration) -> begin
+            on_testitem_started = (testrun_id, testitem_id, test_env_id) -> nothing,
+            on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration) -> begin
+                duration = something(duration, missing)
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_success += 1
@@ -266,9 +278,10 @@ function get_runner()
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:passed, messages=missing, duration=duration)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:passed, messages=missing, duration=duration)))
             end,
-            on_testitem_failed = (testrun_id, testitem_id, messages, duration) -> begin
+            on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
+                duration = something(duration, missing)
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_fail += 1
@@ -280,9 +293,10 @@ function get_runner()
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:failed, messages=messages, duration=duration)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:failed, messages=messages, duration=duration)))
             end,
-            on_testitem_errored = (testrun_id, testitem_id, messages, duration) -> begin
+            on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
+                duration = something(duration, missing)
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_error += 1
@@ -294,9 +308,9 @@ function get_runner()
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:errored, messages=messages, duration=duration)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:errored, messages=messages, duration=duration)))
             end,
-            on_testitem_skipped = (testrun_id, testitem_id) -> begin
+            on_testitem_skipped = (testrun_id, testitem_id, test_env_id) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_skipped += 1
@@ -307,9 +321,9 @@ function get_runner()
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:skipped, messages=missing, duration=missing)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:skipped, messages=missing, duration=missing)))
             end,
-            on_append_output = (testrun_id, testitem_id, output) -> begin
+            on_append_output = (testrun_id, testitem_id, test_env_id, output) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 testitem_id === nothing && return  # process-level output; captured by on_process_output
@@ -319,9 +333,10 @@ function get_runner()
                 push!(ctx.outputs[testitem_id], output)
             end,
             on_attach_debugger = (testrun_id, debug_pipename) -> nothing,
-            on_process_created = (id, package_name, package_uri, project_uri, coverage, env) -> begin
+            on_process_created = (id, test_env_id) -> begin
                 runner = _g_runner[]
                 lock(runner.lock) do
+                    package_name = get(runner.env_package_names, test_env_id, "")
                     runner.processes[id] = ProcessInfo(id, package_name, "Launching")
                 end
             end,
@@ -417,7 +432,7 @@ function run_tests(
     end
 
     jw = JuliaWorkspaces.workspace_from_folders(([path]))
-    _add_active_project!(jw, path)
+    _add_active_project!(jw)
 
     testitems = []
     testerrors = []
@@ -425,8 +440,8 @@ function run_tests(
         project_details = JuliaWorkspaces.get_test_env(jw, uri)
         textfile = JuliaWorkspaces.get_text_file(jw, uri)
 
-        for item in items.testitems            
-            line, column = JuliaWorkspaces.position_at(textfile.content, item.code_range.start)
+        for item in items.testitems
+            (; line, column) = JuliaWorkspaces.position_at(textfile.content, item.code_range.start)
             push!(testitems, (
                 uri=uri,
                 line=line,
@@ -438,7 +453,7 @@ function run_tests(
         end
 
         for item in items.testerrors
-            line, column = JuliaWorkspaces.position_at(textfile.content, item.range.start)
+            (; line, column) = JuliaWorkspaces.position_at(textfile.content, item.range.start)
             push!(testerrors,
                 (
                     uri=string(uri),
@@ -476,37 +491,60 @@ function run_tests(
 
         Logging.with_logger(debuglogger) do
 
+            # Build test environments (one per run profile × package test env),
+            # test item details, and the work units pairing them up.
             testitems_to_run_by_id = Dict{String, TestItemControllers.TestItemDetail}()
-                    for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
-                        project_details = JuliaWorkspaces.get_test_env(jw, uri)
-                        textfile = JuliaWorkspaces.get_text_file(jw, uri)
-                        for item in file_info.testitems
-                            testitems_to_run_by_id[item.id] = TestItemControllers.TestItemDetail(
-                                item.id,
-                                string(item.uri),
-                                item.name,
-                                project_details.package_name,
-                                string(project_details.package_uri),
-                                project_details.project_uri === nothing ? nothing : string(project_details.project_uri),
-                                string(project_details.env_content_hash),
-                                item.option_default_imports,
-                                string.(item.option_setup),
-                                JuliaWorkspaces.position_at(textfile.content, item.code_range.start)[1],
-                                JuliaWorkspaces.position_at(textfile.content, item.code_range.start)[2],
-                                textfile.content.content[item.code_range],
-                                JuliaWorkspaces.position_at(textfile.content, item.code_range.stop)[1],
-                                JuliaWorkspaces.position_at(textfile.content, item.code_range.stop)[2],
-                                Float64(timeout)
-                            )
-                        end
-                    end
+            test_environments = TestItemControllers.TestEnvironment[]
+            profiles_by_env_id = Dict{String,RunProfile}()
+            env_id_by_key = Dict{Any,String}()
+            work_units = TestItemControllers.TestRunItem[]
 
-            if filter !== nothing
-                filtered_ids = Set(i.detail.id for i in testitems)
-                for id in collect(keys(testitems_to_run_by_id))
-                    if !(id in filtered_ids)
-                        delete!(testitems_to_run_by_id, id)
+            for i in testitems
+                textfile = JuliaWorkspaces.get_text_file(jw, i.uri)
+                item = i.detail
+                pos = JuliaWorkspaces.position_at(textfile.content, item.range.start)
+                code_pos = JuliaWorkspaces.position_at(textfile.content, item.code_range.start)
+                testitems_to_run_by_id[item.id] = TestItemControllers.TestItemDetail(
+                    item.id,
+                    string(item.uri),
+                    item.name,
+                    i.env.package_name,
+                    string(i.env.package_uri),
+                    item.option_default_imports,
+                    string.(item.option_setup),
+                    pos.line,
+                    pos.column,
+                    textfile.content.content[item.code_range],
+                    code_pos.line,
+                    code_pos.column,
+                )
+
+                for profile in environments
+                    env_key = (profile.name, i.env.package_uri, i.env.project_uri)
+                    env_id = get!(env_id_by_key, env_key) do
+                        new_id = "$(testrun_id)-env-$(length(env_id_by_key) + 1)"
+                        push!(test_environments, TestItemControllers.TestEnvironment(
+                            new_id,
+                            julia_cmd,
+                            julia_args,
+                            nothing,
+                            Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k, v) in profile.env),
+                            profile.coverage ? "Coverage" : "Normal",
+                            i.env.package_name,
+                            string(i.env.package_uri),
+                            i.env.project_uri === nothing ? nothing : string(i.env.project_uri),
+                            i.env.env_content_hash === nothing ? nothing : string(i.env.env_content_hash),
+                        ))
+                        profiles_by_env_id[new_id] = profile
+                        new_id
                     end
+                    push!(work_units, TestItemControllers.TestRunItem(item.id, env_id, Float64(timeout), :Info))
+                end
+            end
+
+            lock(runner.lock) do
+                for env in test_environments
+                    runner.env_package_names[env.id] = env.package_name
                 end
             end
 
@@ -517,6 +555,7 @@ function run_tests(
             ctx = RunContext(
                 testitems_to_run_by_id,
                 environments,
+                profiles_by_env_id,
                 environment_name,
                 progress_ui,
                 () -> nothing,
@@ -560,21 +599,9 @@ function run_tests(
                 TestItemControllers.execute_testrun(
                     tic,
                     testrun_id,
-                    [
-                        TestItemControllers.TestProfile(
-                            i.name,
-                            "$(i.name) Profile",
-                            julia_cmd,
-                            julia_args,
-                            missing,
-                            Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k,v) in i.env),
-                            max_workers,
-                            i.coverage ? "Coverage" : "Normal",
-                            nothing,
-                            :Info
-                        ) for i in environments
-                    ],
+                    test_environments,
                     collect(TestItemControllers.TestItemDetail, values(testitems_to_run_by_id)),
+                    work_units,
                     let
                         setups = TestItemControllers.TestSetupDetail[]
                         for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
@@ -587,14 +614,15 @@ function run_tests(
                                     string(setup.name),
                                     string(setup.kind),
                                     string(uri),
-                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start)[1],
-                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start)[2],
+                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start).line,
+                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start).column,
                                     textfile.content.content[setup.code_range]
                                 ))
                             end
                         end
                         setups
                     end,
+                    max_workers,
                     token,
                 )
             catch err
@@ -689,7 +717,7 @@ function run_tests(
                 ti.testenvironment.name,
                 ti.result.status,
                 ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === missing ? URI("") : URI(msg.uri), coalesce(msg.line, 0), coalesce(msg.column, 0)) for msg in ti.result.messages],
+                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
                 haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
             )]
         ) for ti in responses
@@ -743,20 +771,12 @@ end
 
 # ── Active project helper ─────────────────────────────────────────────
 
-function _add_active_project!(jw, path)
+function _add_active_project!(jw)
     proj = Base.active_project()
     proj === nothing && return
-    project_folder = dirname(proj)
-    # Set fallback regardless — harmless if project is already discovered
-    JuliaWorkspaces.set_input_fallback_test_project!(jw.runtime, filepath2uri(project_folder))
-    # If project folder is outside the scanned path, add its files
-    norm_path = normpath(path) * Base.Filesystem.path_separator
-    norm_proj = normpath(project_folder) * Base.Filesystem.path_separator
-    if !startswith(norm_proj, norm_path)
-        isfile(proj) && JuliaWorkspaces.add_file_from_disc!(jw, proj)
-        manifest = joinpath(project_folder, "Manifest.toml")
-        isfile(manifest) && JuliaWorkspaces.add_file_from_disc!(jw, manifest)
-    end
+    # Serves as fallback env and fallback test project; out-of-workspace
+    # Project/Manifest files are loaded lazily by JuliaWorkspaces itself.
+    JuliaWorkspaces.set_active_project!(jw, filepath2uri(dirname(proj)))
 end
 
 # ── Juliaup channel resolution ────────────────────────────────────────
@@ -866,7 +886,7 @@ function cmd_list(args)
     end
 
     jw = JuliaWorkspaces.workspace_from_folders([path])
-    _add_active_project!(jw, path)
+    _add_active_project!(jw)
     all_items = JuliaWorkspaces.get_test_items(jw)
 
     tag_filter = if haskey(kwargs, :tags)
@@ -883,7 +903,7 @@ function cmd_list(args)
             if tag_filter !== nothing && isempty(intersect(Set(item.option_tags), tag_filter))
                 continue
             end
-            line, _ = JuliaWorkspaces.position_at(textfile.content, item.code_range.start)
+            line = JuliaWorkspaces.position_at(textfile.content, item.code_range.start).line
             tags_str = isempty(item.option_tags) ? "" : " [$(join(item.option_tags, ", "))]"
             printstyled("  $(item.name)"; bold=true)
             print("  $filepath:$line")
