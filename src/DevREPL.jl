@@ -2105,6 +2105,94 @@ function cmd_format(args)
     nothing
 end
 
+# ── Tab completion ────────────────────────────────────────────────────
+
+struct DevREPLCompletionProvider <: REPL.LineEdit.CompletionProvider end
+
+const _TOP_COMMANDS = ["test", "test&", "lint", "format", "help"]
+const _TEST_SUBCOMMANDS = ["pick", "failed", "list", "status", "cancel", "results", "runs", "procs", "kill", "plog"]
+const _TEST_RUN_FLAGS = ["--tags=", "--workers=", "--timeout=", "--coverage"]
+const _RESULTS_FLAGS = ["--name=", "--verbose", "--output"]
+
+function _juliaup_channel_names()
+    config = _load_juliaup_config()
+    config === :unavailable && return String[]
+    names = String[]
+    try
+        push!(names, config["DefaultChannel"]["Name"])
+        for ch in config["OtherChannels"]
+            push!(names, ch["Name"])
+        end
+    catch
+    end
+    return names
+end
+
+function _complete_dirs(prefix::AbstractString)
+    dir, base = splitdir(prefix)
+    lookin = isempty(dir) ? pwd() : dir
+    isdir(lookin) || return String[]
+    out = String[]
+    sep = Base.Filesystem.path_separator
+    for name in try readdir(lookin) catch; return String[] end
+        startswith(name, base) || continue
+        isdir(joinpath(lookin, name)) || continue
+        push!(out, (isempty(dir) ? name : joinpath(dir, name)) * sep)
+    end
+    return out
+end
+
+# Completion candidates for the token being typed, given the text before the
+# cursor. Returns (matches, token-to-replace).
+function _devrepl_completions(partial::AbstractString)
+    tokens = split(partial)
+    ends_with_space = isempty(partial) || isspace(partial[end])
+    cur = ends_with_space ? "" : String(last(tokens))
+    prev = ends_with_space ? String.(tokens) : String.(tokens[1:end-1])
+
+    cands = String[]
+    if isempty(prev)
+        cands = _TOP_COMMANDS
+    else
+        cmd = lowercase(prev[1])
+        cmd == "t" && (cmd = "test")
+        cmd in ("t&", "test&") && (cmd = "test")
+        if cmd == "test"
+            sub = length(prev) >= 2 ? lowercase(prev[2]) : nothing
+            if startswith(cur, "+")
+                cands = ["+" * n for n in _juliaup_channel_names()]
+            elseif sub === nothing
+                cands = startswith(cur, "--") ? _TEST_RUN_FLAGS :
+                    vcat(_TEST_SUBCOMMANDS, _complete_dirs(cur))
+            elseif sub in ("results", "res")
+                cands = _RESULTS_FLAGS
+            elseif sub == "runs"
+                cands = ["--active"]
+            elseif sub in ("list", "ls", "pick")
+                cands = startswith(cur, "--") ? ["--tags="] : _complete_dirs(cur)
+            elseif sub in ("status", "st", "cancel", "kill", "plog", "process-log", "procs", "processes", "ps", "failed", "-")
+                cands = String[]
+            else
+                # First arg was a path/name query: still completing run args
+                cands = startswith(cur, "--") ? _TEST_RUN_FLAGS : _complete_dirs(cur)
+            end
+        elseif cmd == "lint"
+            cands = _complete_dirs(cur)
+        elseif cmd == "format"
+            cands = startswith(cur, "--") ? ["--check"] : _complete_dirs(cur)
+        end
+    end
+
+    matches = sort!(filter(c -> startswith(c, cur), unique(cands)))
+    return matches, cur
+end
+
+function REPL.LineEdit.complete_line(::DevREPLCompletionProvider, s; hint::Bool=false)
+    partial = REPL.beforecursor(REPL.LineEdit.buffer(s))
+    matches, cur = _devrepl_completions(partial)
+    return matches, cur, !isempty(matches)
+end
+
 # ── REPL parser ───────────────────────────────────────────────────────
 
 # The pre-`test`-group command names, mapped to their new spelling so users
@@ -2236,6 +2324,7 @@ function _register_repl_mode()
         mode_name="TestItem",
         sticky_mode=true,
         valid_input_checker=s -> true,
+        completion_provider=DevREPLCompletionProvider(),
     )
 end
 
