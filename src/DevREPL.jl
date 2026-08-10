@@ -23,8 +23,9 @@ struct ModuleFilterLogger <: AbstractLogger
     wrapped::AbstractLogger
 end
 
-Logging.shouldlog(logger::ModuleFilterLogger, level, _module, group, id) = true
-Logging.min_enabled_level(logger::ModuleFilterLogger) = Logging.Debug
+Logging.shouldlog(logger::ModuleFilterLogger, level, _module, group, id) =
+    Logging.shouldlog(logger.wrapped, level, _module, group, id)
+Logging.min_enabled_level(logger::ModuleFilterLogger) = Logging.min_enabled_level(logger.wrapped)
 Logging.catch_exceptions(logger::ModuleFilterLogger) = Logging.catch_exceptions(logger.wrapped)
 
 function _in_module_tree(m::Module, root::Module)
@@ -397,7 +398,6 @@ end
 function run_tests(
             path;
             filter=nothing,
-            verbose=false,
             max_workers::Int=min(Sys.CPU_THREADS, 8),
             timeout=60*5,
             fail_on_detection_error=true,
@@ -408,11 +408,18 @@ function run_tests(
             environments=[RunProfile("Default", false, Dict{String,Any}())],
             julia_cmd::String="julia",
             julia_args::Vector{String}=String[],
-            token=nothing
+            token=nothing,
+            cancellation_source::Union{Nothing,CancellationTokenSource}=nothing
         )
     if progress_ui == :none
         print_summary = false
         print_failed_results = false
+    end
+
+    # Recording the source (not just a token) in the history lets 'test cancel <id>'
+    # cancel this run later.
+    if token === nothing && cancellation_source !== nothing
+        token = get_token(cancellation_source)
     end
 
     runner = get_runner()
@@ -420,12 +427,7 @@ function run_tests(
     runner.run_counter[] += 1
     testrun_id = string(runner.run_counter[])
 
-    cts_for_history = if token !== nothing
-        nothing
-    else
-        nothing
-    end
-    record = TestrunRecord(testrun_id, time(), nothing, :running, nothing, string(path), cts_for_history)
+    record = TestrunRecord(testrun_id, time(), nothing, :running, nothing, string(path), cancellation_source)
     lock(runner.lock) do
         pushfirst!(runner.run_history, record)
         _prune_history!(runner)
@@ -852,26 +854,26 @@ end
 
 function cmd_help()
     printstyled("DevREPL commands:\n\n"; bold=true)
-    println("  help                          Show this help message")
-    println("  list [path]                   List discovered test items")
-    println("  list --tags=tag1,tag2         Filter by tags")
-    println("  run [+channel] [path|name]    Run tests (blocking, ESC to cancel)")
-    println("  run +lts                      Run tests using a Juliaup channel")
-    println("  run --tags=t1,t2              Filter by tags")
-    println("  run --workers=N               Max parallel workers (default: min(nthreads,8))")
-    println("  run --timeout=S               Timeout in seconds (default: 300)")
-    println("  run --coverage                Enable coverage")
-    println("  run& [same options]           Run tests in background")
-    println("  status                        Show background run status")
-    println("  cancel [id]                   Cancel background run (or run by id)")
-    println("  results [id]                  Show results (last run, or run #id)")
-    println("  results --name=<pattern>      Filter results by test item name")
-    println("  results --verbose             Show full per-profile details")
-    println("  results --output              Show captured output for test items")
-    println("  process-log <id>              Show output log for a test process")
-    println("  runs [--active]               List all test runs (history)")
-    println("  processes                     Show active test processes")
-    println("  kill [process-id]             Kill all or a specific test process")
+    println("  help                            Show this help message")
+    printstyled("\n  Testing ('t' is a shorthand for 'test'):\n"; bold=true)
+    println("  test [+channel] [path|name]     Run test items (blocking, ESC to cancel)")
+    println("  test +lts                       Run using a Juliaup channel")
+    println("  test --tags=t1,t2               Filter by tags")
+    println("  test --workers=N                Max parallel workers (default: min(nthreads,8))")
+    println("  test --timeout=S                Timeout in seconds (default: 300)")
+    println("  test --coverage                 Enable coverage")
+    println("  test& [same options]            Run test items in background")
+    println("  test list [path] [--tags=...]   List discovered test items")
+    println("  test status                     Show background run status")
+    println("  test cancel [id]                Cancel background run (or run by id)")
+    println("  test results [id]               Show results (last run, or run #id)")
+    println("  test results --name=<pattern>   Filter results by test item name")
+    println("  test results --verbose          Show full per-profile details")
+    println("  test results --output           Show captured output for test items")
+    println("  test runs [--active]            List all test runs (history)")
+    println("  test procs                      Show active test processes")
+    println("  test kill [process-id]          Kill all or a specific test process")
+    println("  test plog <id>                  Show output log for a test process")
     nothing
 end
 
@@ -997,7 +999,7 @@ function cmd_run(args; juliaup_channel::Union{Nothing,String}=nothing)
     end
 
     cts = CancellationTokenSource()
-    run_kwargs[:token] = get_token(cts)
+    run_kwargs[:cancellation_source] = cts
     run_kwargs[:return_results] = false
     run_kwargs[:print_failed_results] = true
     run_kwargs[:print_summary] = true
@@ -1101,7 +1103,7 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     _check_bg_completion()
 
     if _bg_run[] !== nothing && !istaskdone(_bg_run[].task)
-        printstyled("A background run is already active. Use 'cancel' first.\n"; color=:yellow)
+        printstyled("A background run is already active. Use 'test cancel' first.\n"; color=:yellow)
         return nothing
     end
 
@@ -1114,7 +1116,7 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
         return nothing
     end
     cts = CancellationTokenSource()
-    run_kwargs[:token] = get_token(cts)
+    run_kwargs[:cancellation_source] = cts
     run_kwargs[:progress_ui] = :none
     run_kwargs[:print_summary] = false
     run_kwargs[:print_failed_results] = false
@@ -1179,7 +1181,7 @@ function cmd_status()
             println(" after $(elapsed)s: $(bg.error)")
         else
             printstyled("Background run completed"; color=:green, bold=true)
-            println(" in $(elapsed)s. Use 'results' to see details.")
+            println(" in $(elapsed)s. Use 'test results' to see details.")
         end
     else
         printstyled("Background run in progress"; color=:yellow, bold=true)
@@ -1620,7 +1622,7 @@ function cmd_runs(args)
         println(r.path)
     end
     println()
-    println("$(length(history)) run(s). Use 'results <id>' to inspect a run.")
+    println("$(length(history)) run(s). Use 'test results <id>' to inspect a run.")
     nothing
 end
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -1630,7 +1632,7 @@ function _check_bg_completion()
     if bg !== nothing && istaskdone(bg.task)
         if bg.result !== nothing && bg.error === nothing
             elapsed = round(time() - bg.start_time; digits=1)
-            printstyled("Background run completed in $(elapsed)s. Use 'results' to see details.\n"; color=:green)
+            printstyled("Background run completed in $(elapsed)s. Use 'test results' to see details.\n"; color=:green)
         elseif bg.error !== nothing
             printstyled("Background run errored: $(bg.error)\n"; color=:red)
         end
@@ -1639,27 +1641,72 @@ end
 
 # ── REPL parser ───────────────────────────────────────────────────────
 
+# The pre-`test`-group command names, mapped to their new spelling so users
+# get a pointer instead of a bare "unknown command".
+const _LEGACY_COMMAND_HINTS = Dict(
+    "run" => "test", "run&" => "test&",
+    "list" => "test list", "ls" => "test list",
+    "status" => "test status", "st" => "test status",
+    "cancel" => "test cancel",
+    "results" => "test results", "res" => "test results",
+    "process-log" => "test plog", "plog" => "test plog",
+    "runs" => "test runs",
+    "processes" => "test procs", "procs" => "test procs", "ps" => "test procs",
+    "kill" => "test kill",
+)
+
 function repl_parser(input::String)
     input = strip(input)
     isempty(input) && return nothing
-
-    # Handle run& syntax: treat "run&" as background run command
-    bg_run = false
-    if startswith(input, "run&")
-        bg_run = true
-        input = "run" * input[5:end]  # remove the &
-    end
 
     parts = split(input)
     cmd = lowercase(parts[1])
     args = parts[2:end]
 
+    # Handle test& syntax: treat "test&" as background run command
+    bg_run = false
+    if cmd in ("test&", "t&")
+        bg_run = true
+        cmd = "test"
+    end
+
     if cmd == "help" || cmd == "?"
         return cmd_help()
-    elseif cmd == "list" || cmd == "ls"
-        return cmd_list(args)
-    elseif cmd == "run"
-        # Extract +channel modifier from args
+    elseif cmd == "test" || cmd == "t"
+        return _dispatch_test(args, bg_run)
+    elseif haskey(_LEGACY_COMMAND_HINTS, cmd)
+        printstyled("Unknown command: $cmd\n"; color=:red)
+        println("Test commands now live under 'test' — did you mean '$(_LEGACY_COMMAND_HINTS[cmd])'?")
+        return nothing
+    else
+        printstyled("Unknown command: $cmd\n"; color=:red)
+        println("Type 'help' for available commands.")
+        return nothing
+    end
+end
+
+function _dispatch_test(args, bg_run::Bool)
+    sub = isempty(args) ? "" : lowercase(args[1])
+    rest = isempty(args) ? SubString{String}[] : args[2:end]
+
+    if sub in ("list", "ls")
+        return cmd_list(rest)
+    elseif sub in ("status", "st")
+        return cmd_status()
+    elseif sub == "cancel"
+        return cmd_cancel(rest)
+    elseif sub in ("results", "res")
+        return cmd_results(rest)
+    elseif sub in ("plog", "process-log")
+        return cmd_process_log(rest)
+    elseif sub == "runs"
+        return cmd_runs(rest)
+    elseif sub in ("procs", "processes", "ps")
+        return cmd_processes()
+    elseif sub == "kill"
+        return cmd_kill(rest)
+    else
+        # Anything else is run arguments: paths, name queries, +channel, --flags
         juliaup_channel = nothing
         remaining_args = SubString{String}[]
         for a in args
@@ -1674,24 +1721,6 @@ function repl_parser(input::String)
         else
             return cmd_run(remaining_args; juliaup_channel)
         end
-    elseif cmd == "status" || cmd == "st"
-        return cmd_status()
-    elseif cmd == "cancel"
-        return cmd_cancel(args)
-    elseif cmd == "results" || cmd == "res"
-        return cmd_results(args)
-    elseif cmd == "process-log" || cmd == "plog"
-        return cmd_process_log(args)
-    elseif cmd == "runs"
-        return cmd_runs(args)
-    elseif cmd == "processes" || cmd == "procs" || cmd == "ps"
-        return cmd_processes()
-    elseif cmd == "kill"
-        return cmd_kill(args)
-    else
-        printstyled("Unknown command: $cmd\n"; color=:red)
-        println("Type 'help' for available commands.")
-        return nothing
     end
 end
 
