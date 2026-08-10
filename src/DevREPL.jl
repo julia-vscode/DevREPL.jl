@@ -16,6 +16,8 @@ using TestItemControllers.JSON
 using PrecompileTools: @compile_workload, @setup_workload
 using Logging
 using Dates
+import REPL
+import REPL.TerminalMenus
 
 # ── Logging filter (suppress TestItemControllers below Warn) ──────────
 
@@ -857,6 +859,8 @@ function cmd_help()
     println("  help                            Show this help message")
     printstyled("\n  Testing ('t' is a shorthand for 'test'):\n"; bold=true)
     println("  test [+channel] [path|name]     Run test items (blocking, ESC to cancel)")
+    println("  test pick [query] [path]        Fuzzy-pick test items to run interactively")
+    println("                                  (bare 'test' also opens the picker; 'a' selects all)")
     println("  test +lts                       Run using a Juliaup channel")
     println("  test --tags=t1,t2               Filter by tags")
     println("  test --workers=N                Max parallel workers (default: min(nthreads,8))")
@@ -924,6 +928,110 @@ function cmd_list(args)
         println("$count test item(s) found.")
     end
     nothing
+end
+
+# ── Fuzzy test-item picker ────────────────────────────────────────────
+
+function _collect_testitem_candidates(jw)
+    candidates = NamedTuple{(:name, :tags, :filepath, :line),Tuple{String,Vector{Symbol},String,Int}}[]
+    for (uri, items) in pairs(JuliaWorkspaces.get_test_items(jw))
+        textfile = JuliaWorkspaces.get_text_file(jw, uri)
+        filepath = uri2filepath(uri)
+        for item in items.testitems
+            line = JuliaWorkspaces.position_at(textfile.content, item.range.start).line
+            push!(candidates, (name=item.name, tags=item.option_tags, filepath=filepath, line=line))
+        end
+    end
+    return candidates
+end
+
+# Order candidates by fuzzy score against the query; falls back to substring
+# matching on name/file/tags when nothing fuzzy-matches the name.
+function _fuzzy_sort(query::AbstractString, candidates)
+    isempty(query) && return candidates
+    scored = [(c, REPL.fuzzyscore(query, c.name)) for c in candidates]
+    matches = [x for x in scored if x[2] > 0]
+    if isempty(matches)
+        q = lowercase(query)
+        return [c for c in candidates if contains(lowercase(c.name), q) ||
+            contains(lowercase(c.filepath), q) ||
+            any(t -> contains(lowercase(string(t)), q), c.tags)]
+    end
+    sort!(matches, by=x -> x[2], rev=true)
+    return [x[1] for x in matches]
+end
+
+function _candidate_label(c, path)
+    tags_str = isempty(c.tags) ? "" : "  [$(join(c.tags, ", "))]"
+    file = try
+        relpath(c.filepath, path)
+    catch
+        c.filepath
+    end
+    return "$(c.name)$(tags_str)  $(file):$(c.line)"
+end
+
+function cmd_pick(args)
+    _check_bg_completion()
+
+    if !(stdin isa Base.TTY)
+        printstyled("Error: "; color=:red, bold=true)
+        println("'test pick' needs an interactive terminal.")
+        return nothing
+    end
+
+    juliaup_channel = nothing
+    path = pwd()
+    query = ""
+    flag_args = SubString{String}[]
+    for a in args
+        if startswith(a, "+")
+            juliaup_channel = String(a[2:end])
+        elseif startswith(a, "--")
+            push!(flag_args, a)
+        elseif isdir(a)
+            path = String(a)
+        else
+            query = String(a)
+        end
+    end
+
+    jw = JuliaWorkspaces.workspace_from_folders([path])
+    _add_active_project!(jw)
+    candidates = _collect_testitem_candidates(jw)
+    if isempty(candidates)
+        println("No test items found in '$path'.")
+        return nothing
+    end
+
+    candidates = _fuzzy_sort(query, candidates)
+    if isempty(candidates)
+        println("No test items match '$query'.")
+        return nothing
+    end
+
+    labels = [_candidate_label(c, path) for c in candidates]
+    menu = TerminalMenus.MultiSelectMenu(labels; pagesize=min(12, length(labels)))
+    chosen = TerminalMenus.request("Select test items (space: toggle, enter: run):", menu)
+    if isempty(chosen)
+        println("Nothing selected.")
+        return nothing
+    end
+    selected = candidates[sort!(collect(chosen))]
+
+    local run_kwargs
+    try
+        _, run_kwargs = _build_run_kwargs(flag_args; juliaup_channel)
+    catch e
+        printstyled("Error: "; color=:red, bold=true)
+        println(e.msg)
+        return nothing
+    end
+    sel_keys = Set((c.filepath, c.name) for c in selected)
+    run_kwargs[:filter] = info -> (info.filename, string(info.name)) in sel_keys
+
+    printstyled("Running $(length(selected)) selected test item(s)...\n"; color=:cyan)
+    return _run_blocking(path, run_kwargs)
 end
 
 function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{Nothing,String}=nothing)
@@ -997,7 +1105,12 @@ function cmd_run(args; juliaup_channel::Union{Nothing,String}=nothing)
         println(e.msg)
         return nothing
     end
+    return _run_blocking(path, run_kwargs)
+end
 
+# Run tests in the foreground with ESC-to-cancel handling. run_kwargs may
+# already contain a filter; cancellation and result bookkeeping are added here.
+function _run_blocking(path, run_kwargs)
     cts = CancellationTokenSource()
     run_kwargs[:cancellation_source] = cts
     run_kwargs[:return_results] = false
@@ -1689,7 +1802,12 @@ function _dispatch_test(args, bg_run::Bool)
     sub = isempty(args) ? "" : lowercase(args[1])
     rest = isempty(args) ? SubString{String}[] : args[2:end]
 
-    if sub in ("list", "ls")
+    if sub == "" && !bg_run && stdin isa Base.TTY
+        # Bare 'test' in an interactive session: offer the picker ('a' selects all)
+        return cmd_pick(rest)
+    elseif sub == "pick"
+        return cmd_pick(rest)
+    elseif sub in ("list", "ls")
         return cmd_list(rest)
     elseif sub in ("status", "st")
         return cmd_status()
