@@ -884,6 +884,10 @@ function cmd_help()
     println("  test procs                      Show active test processes")
     println("  test kill [process-id]          Kill all or a specific test process")
     println("  test plog <id>                  Show output log for a test process")
+    printstyled("\n  Linting and formatting:\n"; bold=true)
+    println("  lint [path]                     Lint a folder (respects JuliaLint.toml)")
+    println("  format [path]                   Format a file or folder in place")
+    println("  format --check [path]           Report what would be reformatted")
     nothing
 end
 
@@ -1909,6 +1913,198 @@ function _check_bg_completion()
     end
 end
 
+# ── Lint ──────────────────────────────────────────────────────────────
+
+const _LINT_SEVERITY_COLORS = Dict(
+    :error => :red,
+    :warning => :yellow,
+    :information => :cyan,
+    :hint => :light_black,
+)
+
+# The stable rule id, as named in JuliaLint.toml (falls back to the source
+# for diagnostics that predate rule ids) — same convention as julialint.
+_lint_rule_id(diag) = diag.code === nothing ? diag.source : string(diag.code)
+
+function cmd_lint(args)
+    positional, _, _ = parse_args(args)
+    path = isempty(positional) ? pwd() : String(positional[1])
+    if !isdir(path)
+        printstyled("Error: "; color=:red, bold=true)
+        println("'$path' is not a directory")
+        return nothing
+    end
+
+    printstyled("Analyzing $path...\n"; color=:cyan)
+    local jw, all_diagnostics
+    try
+        Logging.with_logger(Logging.ConsoleLogger(stderr, Logging.Warn)) do
+            jw = JuliaWorkspaces.workspace_from_folders([path];
+                dynamic=JuliaWorkspaces.DynamicIndexingOnly,
+                symbolcache_download=true)
+            try
+                JuliaWorkspaces.parse_files_blocking(jw)
+                JuliaWorkspaces.wait_until_ready(jw)
+                all_diagnostics = JuliaWorkspaces.get_diagnostics_blocking(jw)
+            finally
+                # Stop the dynamic feature's child processes; a REPL session may
+                # run many lints and must not accumulate reactors.
+                try
+                    put!(jw.dynamic_feature.in_channel, JuliaWorkspaces.ShutdownMsg())
+                catch
+                end
+            end
+        end
+    catch err
+        err isa InterruptException && rethrow()
+        printstyled("Error: "; color=:red, bold=true)
+        println("lint failed for $path: ", sprint(showerror, err))
+        return nothing
+    end
+
+    entries = []
+    for (uri, diagnostics) in all_diagnostics
+        isempty(diagnostics) && continue
+        text_file = JuliaWorkspaces.get_text_file(jw, uri)
+        abs_path = uri2filepath(uri)
+        for diag in diagnostics
+            push!(entries, (abs_path, first(diag.range), diag, text_file))
+        end
+    end
+    sort!(entries, by=x -> (x[1], x[2]))
+
+    counts = Dict{Symbol,Int}()
+    for (abs_path, _, diag, text_file) in entries
+        pos = JuliaWorkspaces.position_at(text_file.content, first(diag.range))
+        print("  $abs_path:$(pos.line):$(pos.column): ")
+        printstyled(string(diag.severity); color=get(_LINT_SEVERITY_COLORS, diag.severity, :default))
+        print(": ", diag.message)
+        rule = _lint_rule_id(diag)
+        isempty(rule) || printstyled(" [$rule]"; color=:light_black)
+        println()
+        counts[diag.severity] = get(counts, diag.severity, 0) + 1
+    end
+
+    println()
+    if isempty(entries)
+        printstyled("No lint findings.\n"; color=:green)
+    else
+        parts = String[]
+        for sev in (:error, :warning, :information, :hint)
+            n = get(counts, sev, 0)
+            n > 0 && push!(parts, "$n $(sev == :information ? "info" : sev)$(n == 1 ? "" : "s")")
+        end
+        println(join(parts, ", "), ".")
+    end
+    nothing
+end
+
+# ── Format ────────────────────────────────────────────────────────────
+
+function cmd_format(args)
+    positional, _, flags = parse_args(args)
+    check = :check in flags
+    path = isempty(positional) ? pwd() : String(positional[1])
+
+    target_file = nothing
+    if isfile(path)
+        target_file = normpath(abspath(path))
+        folder = dirname(target_file)
+    elseif isdir(path)
+        folder = path
+    else
+        printstyled("Error: "; color=:red, bold=true)
+        println("'$path' is not a file or directory")
+        return nothing
+    end
+
+    # Formatting is purely syntactic, so no dynamic environment analysis is
+    # needed — same as juliaformat.
+    jw = JuliaWorkspaces.workspace_from_folders([folder])
+    target_uris = collect(JuliaWorkspaces.get_julia_files(jw))
+    if target_file !== nothing
+        filter!(uri -> begin
+            p = uri2filepath(uri)
+            p !== nothing && normpath(abspath(p)) == target_file
+        end, target_uris)
+    end
+    sort!(target_uris, by=uri -> something(uri2filepath(uri), ""))
+
+    if isempty(target_uris)
+        printstyled("No Julia files found to format.\n"; color=:yellow)
+        return nothing
+    end
+
+    n_reformatted = 0
+    n_unchanged = 0
+    n_errors = 0
+    n_skipped = 0
+
+    for uri in target_uris
+        fp = uri2filepath(uri)
+
+        if JuliaWorkspaces.is_format_excluded(jw, uri)
+            n_skipped += 1
+            continue
+        end
+
+        local edit
+        try
+            edit = JuliaWorkspaces.get_format_edits(jw, uri)
+        catch err
+            n_errors += 1
+            printstyled("  error"; color=:red, bold=true)
+            println(": failed to format $fp: ", sprint(showerror, err))
+            continue
+        end
+
+        if edit === nothing
+            n_skipped += 1
+            continue
+        end
+        if isempty(edit.edits)
+            n_unchanged += 1
+            continue
+        end
+
+        n_reformatted += 1
+        if check
+            println("  would reformat $fp")
+        else
+            try
+                open(fp, "w") do io
+                    print(io, edit.edits[1].new_text)
+                end
+            catch err
+                n_reformatted -= 1
+                n_errors += 1
+                printstyled("  error"; color=:red, bold=true)
+                println(": failed to write $fp: ", sprint(showerror, err))
+                continue
+            end
+            printstyled("  formatted"; color=:cyan)
+            println(" $fp")
+        end
+    end
+
+    parts = String[]
+    if check
+        if n_reformatted > 0
+            push!(parts, "$n_reformatted file$(n_reformatted == 1 ? "" : "s") would be reformatted")
+            push!(parts, "$n_unchanged already formatted")
+        else
+            push!(parts, "all $n_unchanged file$(n_unchanged == 1 ? "" : "s") already formatted")
+        end
+    else
+        n_reformatted > 0 && push!(parts, "$n_reformatted reformatted")
+        n_unchanged > 0 && push!(parts, "$n_unchanged unchanged")
+    end
+    n_errors > 0 && push!(parts, "$n_errors error$(n_errors == 1 ? "" : "s")")
+    n_skipped > 0 && push!(parts, "$n_skipped excluded")
+    isempty(parts) || println(join(parts, ", "), ".")
+    nothing
+end
+
 # ── REPL parser ───────────────────────────────────────────────────────
 
 # The pre-`test`-group command names, mapped to their new spelling so users
@@ -1946,6 +2142,10 @@ function repl_parser(input::String)
         return cmd_failures()
     elseif cmd == "test" || cmd == "t"
         return _dispatch_test(args, bg_run)
+    elseif cmd == "lint"
+        return cmd_lint(args)
+    elseif cmd == "format"
+        return cmd_format(args)
     elseif haskey(_LEGACY_COMMAND_HINTS, cmd)
         printstyled("Unknown command: $cmd\n"; color=:red)
         println("Test commands now live under 'test' — did you mean '$(_LEGACY_COMMAND_HINTS[cmd])'?")
