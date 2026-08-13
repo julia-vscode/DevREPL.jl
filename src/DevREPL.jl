@@ -47,6 +47,92 @@ function Logging.handle_message(logger::ModuleFilterLogger, level, message, _mod
     Logging.handle_message(logger.wrapped, level, message, _module, group, id, filepath, line; kwargs...)
 end
 
+# ── Background scheduling ─────────────────────────────────────────────
+#
+# Nothing long-running may run on the REPL's task. `@async` is *sticky* — it
+# pins the new task to the spawning thread, which in a REPL session is thread 1,
+# the same thread as the line editor, the REPL backend and every `julia>`
+# evaluation. So `@async` is the wrong tool for anything long-running, and the
+# helpers below are how such work gets scheduled instead. It survives in exactly
+# two places where sticky-to-the-current-thread is the point: registering the
+# REPL mode, and the per-run event drain.
+#
+# Which threadpool depends on what the work *is*, and the two answers differ.
+# Measured on Julia 1.12 (see the notes on each helper):
+#
+#   * Thread 1 owns Julia's libuv event loop. While a CPU-bound task occupies
+#     it, every timer and every socket/pipe read in the whole process stalls, no
+#     matter which thread they were issued from — `sleep(0.1)` on another thread
+#     measured 5.1s behind a 5s spin on thread 1, versus 0.1s behind the same
+#     spin on a worker thread. So CPU-heavy work must be guaranteed *off*
+#     thread 1, and only `:default` guarantees that: `:interactive` spawns were
+#     observed landing on thread 1 whenever it was idle.
+#
+#   * User parallel code (`Threads.@spawn`, `@threads`) saturates `:default` and
+#     never touches `:interactive`. A latency-sensitive listener sitting in
+#     `:default` was starved to a median 288-447ms wakeup (max ~1.2s) while user
+#     work ran, against 0ms median / ≤1ms max in `:interactive`.
+#
+# Hence: CPU-bound work to `:default`, the I/O-bound reactor to `:interactive`.
+# Both hold with a stock `julia` — no `-t` flag is needed, because the reactor
+# is always parked on a channel and so never occupies the thread it sits on.
+#
+# The one thing this cannot fix is CPU-bound code the *user* runs at `julia>`:
+# that occupies thread 1 by definition and stalls the event loop process-wide.
+# No threadpool choice reaches it.
+
+"""
+    _spawn_reactor(f)
+
+Run `f()` on the `:interactive` threadpool: for tasks that spend their life
+blocked on a channel or socket and must wake promptly even while the user's own
+parallel code saturates `:default`.
+
+Only for work that is genuinely I/O-bound. Interactive tasks may be scheduled
+onto thread 1, so CPU-bound work here would stall the process-wide event loop —
+use [`_spawn_bg`](@ref) for that.
+"""
+function _spawn_reactor(f)
+    t = Threads.@spawn :interactive f()
+    Base.errormonitor(t)
+    return t
+end
+
+"""
+    _spawn_bg(f)
+
+Run `f()` on the `:default` threadpool and return the task. This is the home for
+CPU-bound work, because `:default` never includes thread 1 and so can never
+stall the event loop the rest of the session depends on.
+"""
+function _spawn_bg(f; monitor::Bool=true)
+    t = Threads.@spawn :default f()
+    monitor && Base.errormonitor(t)
+    return t
+end
+
+"""
+    _await_bg(f)
+
+Run `f()` off the REPL's thread and block until it returns its value. The point
+is not concurrency but responsiveness: the REPL task is merely parked on `fetch`
+instead of executing the work, so the event loop keeps turning, the prompt still
+redraws, and any test run already in flight keeps making progress.
+
+Errors surface exactly as if `f` had run inline, so callers keep their existing
+`try`/`catch`. An interrupt abandons the *wait*, not the work — the spawned task
+runs on so that its own `finally` cleanup still happens.
+"""
+function _await_bg(f)
+    task = _spawn_bg(f; monitor=false)
+    try
+        return fetch(task)
+    catch err
+        err isa TaskFailedException && rethrow(err.task.result)
+        rethrow()
+    end
+end
+
 # ── Public types (inlined from TestItemRunnerCore) ────────────────────
 
 @auto_hash_equals struct RunProfile
@@ -97,6 +183,31 @@ end
 
 # ── Per-run context (keyed by testrun_id) ─────────────────────────────
 
+# ── Progress events ───────────────────────────────────────────────────
+#
+# Controller callbacks run inline on the TestItemControllers reactor task, which
+# now lives on a different thread than the REPL. They must therefore neither
+# touch shared run state nor write to the terminal. Instead they push one of
+# these events, and a single drain task per test run applies them and owns all
+# rendering — keeping exactly one writer to both `RunContext` and stdout.
+
+struct TestItemEvent
+    kind::Symbol            # :passed, :failed, :errored or :skipped
+    testitem_id::String
+    test_env_id::String
+    messages::Any
+    duration::Any
+end
+
+struct OutputEvent
+    testitem_id::String
+    output::String
+end
+
+struct ProcessLaunchingEvent end
+
+const ProgressEvent = Union{TestItemEvent,OutputEvent,ProcessLaunchingEvent}
+
 mutable struct RunContext
     testitems_by_id::Dict{String,TestItemControllers.TestItemDetail}
     environments::Vector{RunProfile}
@@ -112,6 +223,24 @@ mutable struct RunContext
     responses::Vector{Any}
     outputs::Dict{String,Vector{String}}
     launch_header_printed::Bool
+    events::Channel{ProgressEvent}
+    lock::ReentrantLock
+end
+
+"""
+    emit!(ctx, event)
+
+Push a progress event from the reactor task. Never blocks (the channel is
+unbounded) and never throws: a run whose channel has already been closed can
+still have late events in flight, and dropping those is correct.
+"""
+function emit!(ctx::RunContext, event::ProgressEvent)
+    try
+        put!(ctx.events, event)
+    catch
+        # Channel closed — the run is already being torn down.
+    end
+    return nothing
 end
 
 # ── Run history ───────────────────────────────────────────────────────
@@ -225,8 +354,84 @@ function get_run_result(id::String)
     _build_result_from_context(runner, id, ctx)
 end
 
+# ── Progress event drain ──────────────────────────────────────────────
+
+"""
+    _apply_event!(ctx, event)
+
+Apply one progress event: update run state under `ctx.lock`, then render. Only
+ever called from the run's drain task, so it is the single writer to both.
+"""
+function _apply_event!(ctx::RunContext, ev::TestItemEvent)
+    testitem = ctx.testitems_by_id[ev.testitem_id]
+    lock(ctx.lock) do
+        if ev.kind === :passed
+            ctx.count_success += 1
+        elseif ev.kind === :failed
+            ctx.count_fail += 1
+        elseif ev.kind === :errored
+            ctx.count_error += 1
+        else
+            ctx.count_skipped += 1
+        end
+        push!(ctx.responses, (
+            testitem = testitem,
+            testenvironment = get(ctx.profiles_by_env_id, ev.test_env_id, ctx.environments[1]),
+            result = (status=ev.kind, messages=ev.messages, duration=ev.duration),
+        ))
+    end
+
+    if ctx.progress_ui == :log
+        glyph = ev.kind === :passed ? "✓" : ev.kind === :skipped ? "⊘" : "✗"
+        duration_string = ev.duration !== missing ? " ($(ev.duration)ms)" : ""
+        println("$glyph $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → $(ev.kind)$duration_string")
+    elseif ctx.progress_ui == :bar
+        ctx.progressbar_next()
+    end
+    return nothing
+end
+
+function _apply_event!(ctx::RunContext, ev::OutputEvent)
+    lock(ctx.lock) do
+        push!(get!(() -> String[], ctx.outputs, ev.testitem_id), ev.output)
+    end
+    return nothing
+end
+
+function _apply_event!(ctx::RunContext, ::ProcessLaunchingEvent)
+    ctx.progress_ui == :bar || return nothing
+    if !ctx.launch_header_printed
+        ctx.launch_header_printed = true
+        printstyled("  Launching test processes"; color=:cyan)
+    end
+    printstyled("."; color=:cyan)
+    return nothing
+end
+
+"""
+    _drain_events!(ctx)
+
+Consume `ctx.events` until it is closed. Runs as its own task for the lifetime
+of a test run; `run_tests` closes the channel and waits for this to return
+before reading the accumulated results.
+"""
+function _drain_events!(ctx::RunContext)
+    for ev in ctx.events
+        try
+            _apply_event!(ctx, ev)
+        catch err
+            err isa InterruptException && rethrow()
+            @debug "Failed to apply progress event" exception=(err, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
 function _build_result_from_context(runner::TestItemRunner, testrun_id::String, ctx::RunContext)
-    testitem_outputs = ctx.outputs
+    # Snapshot under ctx.lock: the drain task may still be appending.
+    testitem_outputs, responses = lock(ctx.lock) do
+        (Dict(k => copy(v) for (k, v) in ctx.outputs), copy(ctx.responses))
+    end
     collected_process_outputs = lock(runner.lock) do
         Dict{String,String}(pid => join(chunks) for (pid, chunks) in runner.process_outputs)
     end
@@ -241,7 +446,7 @@ function _build_result_from_context(runner::TestItemRunner, testrun_id::String, 
                 ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
                 haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
             )]
-        ) for ti in ctx.responses
+        ) for ti in responses
     ]
     TestrunResult(TestrunResultDefinitionError[], testitems, collected_process_outputs)
 end
@@ -269,72 +474,33 @@ function get_runner()
 
         callbacks = TestItemControllers.ControllerCallbacks(
             on_testitem_started = (testrun_id, testitem_id, test_env_id) -> nothing,
+            # These run on the reactor task: emit an event and return immediately.
+            # All state mutation and rendering happens on the run's drain task.
             on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration) -> begin
-                duration = something(duration, missing)
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
-                ctx.count_success += 1
-                testitem = ctx.testitems_by_id[testitem_id]
-                if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
-                    println("✓ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → passed$duration_string")
-                end
-                if ctx.progress_ui == :bar
-                    ctx.progressbar_next()
-                end
-                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:passed, messages=missing, duration=duration)))
+                emit!(ctx, TestItemEvent(:passed, testitem_id, test_env_id, missing, something(duration, missing)))
             end,
             on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
-                duration = something(duration, missing)
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
-                ctx.count_fail += 1
-                testitem = ctx.testitems_by_id[testitem_id]
-                if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
-                    println("✗ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → failed$duration_string")
-                end
-                if ctx.progress_ui == :bar
-                    ctx.progressbar_next()
-                end
-                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:failed, messages=messages, duration=duration)))
+                emit!(ctx, TestItemEvent(:failed, testitem_id, test_env_id, messages, something(duration, missing)))
             end,
             on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
-                duration = something(duration, missing)
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
-                ctx.count_error += 1
-                testitem = ctx.testitems_by_id[testitem_id]
-                if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
-                    println("✗ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → errored$duration_string")
-                end
-                if ctx.progress_ui == :bar
-                    ctx.progressbar_next()
-                end
-                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:errored, messages=messages, duration=duration)))
+                emit!(ctx, TestItemEvent(:errored, testitem_id, test_env_id, messages, something(duration, missing)))
             end,
             on_testitem_skipped = (testrun_id, testitem_id, test_env_id) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
-                ctx.count_skipped += 1
-                testitem = ctx.testitems_by_id[testitem_id]
-                if ctx.progress_ui == :log
-                    println("⊘ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → skipped")
-                end
-                if ctx.progress_ui == :bar
-                    ctx.progressbar_next()
-                end
-                push!(ctx.responses, (testitem=testitem, testenvironment=get(ctx.profiles_by_env_id, test_env_id, ctx.environments[1]), result=(status=:skipped, messages=missing, duration=missing)))
+                emit!(ctx, TestItemEvent(:skipped, testitem_id, test_env_id, missing, missing))
             end,
             on_append_output = (testrun_id, testitem_id, test_env_id, output) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 testitem_id === nothing && return  # process-level output; captured by on_process_output
-                if !haskey(ctx.outputs, testitem_id)
-                    ctx.outputs[testitem_id] = String[]
-                end
-                push!(ctx.outputs[testitem_id], output)
+                emit!(ctx, OutputEvent(testitem_id, output))
             end,
             on_attach_debugger = (testrun_id, debug_pipename) -> nothing,
             on_process_created = (id, test_env_id) -> begin
@@ -359,16 +525,11 @@ function get_runner()
                     end
                 end
                 if status == "Launching"
-                    lock(runner.lock) do
-                        for ctx in values(runner.run_contexts)
-                            if ctx.progress_ui == :bar
-                                if !ctx.launch_header_printed
-                                    ctx.launch_header_printed = true
-                                    printstyled("  Launching test processes"; color=:cyan)
-                                end
-                                printstyled("."; color=:cyan)
-                            end
-                        end
+                    contexts = lock(runner.lock) do
+                        collect(values(runner.run_contexts))
+                    end
+                    for ctx in contexts
+                        emit!(ctx, ProcessLaunchingEvent())
                     end
                 end
             end,
@@ -386,10 +547,17 @@ function get_runner()
         controller = TestItemController(callbacks)
         runner = TestItemRunner(controller)
         _g_runner[] = runner
-        runner.reactor_task = @async try
-            run(runner.controller)
-        catch err
-            Base.display_error(err, catch_backtrace())
+        # `:interactive`, so the reactor keeps waking promptly even while the
+        # user's own parallel code saturates `:default`. Its `@async` children
+        # (the per-process IO tasks) are sticky and follow it onto whichever
+        # thread it runs on, so TestItemControllers keeps its single-threaded,
+        # lock-free invariant with `reactor_channel` as the only entry point.
+        runner.reactor_task = _spawn_reactor() do
+            try
+                run(runner.controller)
+            catch err
+                Base.display_error(err, catch_backtrace())
+            end
         end
 
         return runner
@@ -569,6 +737,8 @@ function run_tests(
                 responses,
                 Dict{String,Vector{String}}(),
                 false,
+                Channel{ProgressEvent}(Inf),
+                ReentrantLock(),
             )
 
             ctx.progressbar_next = () -> begin
@@ -599,6 +769,14 @@ function run_tests(
             lock(runner.lock) do
                 runner.run_contexts[testrun_id] = ctx
             end
+
+            # The single consumer of `ctx.events`, and the only writer to run
+            # state and the terminal while the run is in flight. `run_tests` is
+            # parked inside `execute_testrun` for that whole window, so there is
+            # never a second writer. `@async` on purpose: sticky keeps the drain
+            # on this task's thread, which the callers above already placed on
+            # `:default`, and the reactor stays free to just enqueue events.
+            drain_task = @async _drain_events!(ctx)
 
             ret = try
                 TestItemControllers.execute_testrun(
@@ -634,6 +812,10 @@ function run_tests(
                 @error "TestItemControllers.execute_testrun failed" exception=(err, catch_backtrace())
                 rethrow(err)
             finally
+                # Stop accepting events and let the drain finish applying the
+                # ones already queued, before anything reads the results.
+                close(ctx.events)
+                try; wait(drain_task); catch; end
                 # Safety-net: clear progress bar in case of cancellation/error/zero tests
                 try; ProgressMeter.cancel(p, ""; keep=false); catch; end
                 try
@@ -869,7 +1051,7 @@ function cmd_help()
     println("  @                               Browse failures of the last run (jump to editor)")
     println("  test +lts                       Run using a Juliaup channel")
     println("  test --tags=t1,t2               Filter by tags")
-    println("  test --workers=N                Max parallel workers (default: min(nthreads,8))")
+    println("  test --workers=N                Max parallel workers (default: min(CPU_THREADS,8))")
     println("  test --timeout=S                Timeout in seconds (default: 300)")
     println("  test --coverage                 Enable coverage")
     println("  test& [same options]            Run test items in background")
@@ -901,9 +1083,12 @@ function cmd_list(args)
         return nothing
     end
 
-    jw = JuliaWorkspaces.workspace_from_folders([path])
-    _add_active_project!(jw)
-    all_items = JuliaWorkspaces.get_test_items(jw)
+    # Same reasoning as `test pick`: detection is the slow part, rendering is not.
+    jw, all_items = _await_bg() do
+        w = JuliaWorkspaces.workspace_from_folders([path])
+        _add_active_project!(w)
+        (w, JuliaWorkspaces.get_test_items(w))
+    end
 
     tag_filter = if haskey(kwargs, :tags)
         Set(Symbol.(split(kwargs[:tags], ',')))
@@ -1021,9 +1206,13 @@ function cmd_pick(args)
         end
     end
 
-    jw = JuliaWorkspaces.workspace_from_folders([path])
-    _add_active_project!(jw)
-    candidates = _collect_testitem_candidates(jw)
+    # Detection parses the whole folder; keep it off the REPL's thread so the
+    # prompt stays live and Ctrl-C works while a large package is scanned.
+    candidates = _await_bg() do
+        jw = JuliaWorkspaces.workspace_from_folders([path])
+        _add_active_project!(jw)
+        _collect_testitem_candidates(jw)
+    end
     if isempty(candidates)
         println("No test items found in '$path'.")
         return nothing
@@ -1295,11 +1484,15 @@ function _run_blocking(path, run_kwargs)
 
     printstyled("Starting test run...\n"; color=:cyan)
 
-    # Run tests in a task so we can monitor for ESC key
-    test_task = @async try
-        run_tests(path; run_kwargs...)
-    catch e
-        e
+    # Run tests off the REPL's thread so the run keeps progressing regardless of
+    # what else the session is doing; this task also owns all progress rendering
+    # while the REPL task below does nothing but watch for ESC.
+    test_task = _spawn_bg() do
+        try
+            run_tests(path; run_kwargs...)
+        catch e
+            e
+        end
     end
 
     cancelled = Ref(false)
@@ -1411,18 +1604,20 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     run_kwargs[:print_failed_results] = false
 
     bg = BackgroundRun(
-        @async(try
-            run_tests(path; run_kwargs...)
-        catch e
-            e
-        end),
+        _spawn_bg() do
+            try
+                run_tests(path; run_kwargs...)
+            catch e
+                e
+            end
+        end,
         cts,
         nothing,
         nothing,
         time(),
     )
 
-    @async begin
+    _spawn_bg() do
         raw = try
             fetch(bg.task)
         catch e
@@ -1455,7 +1650,24 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     nothing
 end
 
+"""
+    _print_threading_status()
+
+Report the thread configuration and where the reactor actually landed, so a
+misscheduled reactor is visible rather than merely slow.
+"""
+function _print_threading_status()
+    println("Threads: $(Threads.nthreads(:default)) default, $(Threads.nthreads(:interactive)) interactive")
+    runner = _g_runner[]
+    if runner !== nothing && runner.reactor_task !== nothing
+        t = runner.reactor_task
+        println("Reactor: :$(Threads.threadpool(t)) pool, $(istaskdone(t) ? "stopped" : "running")")
+    end
+    return nothing
+end
+
 function cmd_status()
+    _print_threading_status()
     _check_bg_completion()
     bg = _bg_run[]
     if bg === nothing
@@ -1953,20 +2165,27 @@ function cmd_lint(args)
     printstyled("Analyzing $path...\n"; color=:cyan)
     local jw, all_diagnostics
     try
-        Logging.with_logger(Logging.ConsoleLogger(stderr, Logging.Warn)) do
-            jw = JuliaWorkspaces.workspace_from_folders([path];
-                dynamic=JuliaWorkspaces.DynamicIndexingOnly,
-                symbolcache_download=true)
-            try
-                JuliaWorkspaces.parse_files_blocking(jw)
-                JuliaWorkspaces.wait_until_ready(jw)
-                all_diagnostics = JuliaWorkspaces.get_diagnostics_blocking(jw)
-            finally
-                # Stop the dynamic feature's child processes; a REPL session may
-                # run many lints and must not accumulate reactors.
+        # Off the REPL's thread: parsing and diagnostics are the longest blocking
+        # work in the package, and running them inline froze the prompt outright.
+        # JuliaWorkspaces is `@async`-only internally, and `@async` is sticky, so
+        # the whole dynamic-feature task tree follows the workspace onto this
+        # thread as one unit. Rendering stays on the REPL task below.
+        jw, all_diagnostics = _await_bg() do
+            Logging.with_logger(Logging.ConsoleLogger(stderr, Logging.Warn)) do
+                w = JuliaWorkspaces.workspace_from_folders([path];
+                    dynamic=JuliaWorkspaces.DynamicIndexingOnly,
+                    symbolcache_download=true)
                 try
-                    put!(jw.dynamic_feature.in_channel, JuliaWorkspaces.ShutdownMsg())
-                catch
+                    JuliaWorkspaces.parse_files_blocking(w)
+                    JuliaWorkspaces.wait_until_ready(w)
+                    (w, JuliaWorkspaces.get_diagnostics_blocking(w))
+                finally
+                    # Stop the dynamic feature's child processes; a REPL session may
+                    # run many lints and must not accumulate reactors.
+                    try
+                        put!(w.dynamic_feature.in_channel, JuliaWorkspaces.ShutdownMsg())
+                    catch
+                    end
                 end
             end
         end
@@ -2034,21 +2253,38 @@ function cmd_format(args)
     end
 
     # Formatting is purely syntactic, so no dynamic environment analysis is
-    # needed — same as juliaformat.
-    jw = JuliaWorkspaces.workspace_from_folders([folder])
-    target_uris = collect(JuliaWorkspaces.get_julia_files(jw))
-    if target_file !== nothing
-        # Case-insensitive comparison: on Windows uri2filepath yields a
-        # lowercase drive letter while abspath keeps the typed case.
-        wanted = lowercase(target_file)
-        filter!(uri -> begin
-            p = uri2filepath(uri)
-            p !== nothing && lowercase(normpath(abspath(p))) == wanted
-        end, target_uris)
-    end
-    sort!(target_uris, by=uri -> something(uri2filepath(uri), ""))
+    # needed — same as juliaformat. Parsing the folder and computing the edits is
+    # the slow part, so it runs off the REPL's thread; the loop below only
+    # renders and writes.
+    outcomes = _await_bg() do
+        jw = JuliaWorkspaces.workspace_from_folders([folder])
+        target_uris = collect(JuliaWorkspaces.get_julia_files(jw))
+        if target_file !== nothing
+            # Case-insensitive comparison: on Windows uri2filepath yields a
+            # lowercase drive letter while abspath keeps the typed case.
+            wanted = lowercase(target_file)
+            filter!(uri -> begin
+                p = uri2filepath(uri)
+                p !== nothing && lowercase(normpath(abspath(p))) == wanted
+            end, target_uris)
+        end
+        sort!(target_uris, by=uri -> something(uri2filepath(uri), ""))
 
-    if isempty(target_uris)
+        map(target_uris) do uri
+            fp = uri2filepath(uri)
+            JuliaWorkspaces.is_format_excluded(jw, uri) && return (fp, :skipped, nothing)
+            edit = try
+                JuliaWorkspaces.get_format_edits(jw, uri)
+            catch err
+                return (fp, :error, err)
+            end
+            edit === nothing && return (fp, :skipped, nothing)
+            isempty(edit.edits) && return (fp, :unchanged, nothing)
+            return (fp, :reformat, edit.edits[1].new_text)
+        end
+    end
+
+    if isempty(outcomes)
         printstyled("No Julia files found to format.\n"; color=:yellow)
         return nothing
     end
@@ -2058,29 +2294,16 @@ function cmd_format(args)
     n_errors = 0
     n_skipped = 0
 
-    for uri in target_uris
-        fp = uri2filepath(uri)
-
-        if JuliaWorkspaces.is_format_excluded(jw, uri)
-            n_skipped += 1
-            continue
-        end
-
-        local edit
-        try
-            edit = JuliaWorkspaces.get_format_edits(jw, uri)
-        catch err
+    for (fp, outcome, payload) in outcomes
+        if outcome === :error
             n_errors += 1
             printstyled("  error"; color=:red, bold=true)
-            println(": failed to format $fp: ", sprint(showerror, err))
+            println(": failed to format $fp: ", sprint(showerror, payload))
             continue
-        end
-
-        if edit === nothing
+        elseif outcome === :skipped
             n_skipped += 1
             continue
-        end
-        if isempty(edit.edits)
+        elseif outcome === :unchanged
             n_unchanged += 1
             continue
         end
@@ -2091,7 +2314,7 @@ function cmd_format(args)
         else
             try
                 open(fp, "w") do io
-                    print(io, edit.edits[1].new_text)
+                    print(io, payload)
                 end
             catch err
                 n_reformatted -= 1
