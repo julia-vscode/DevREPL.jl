@@ -566,9 +566,15 @@ end
 
 # ── Main entry point ──────────────────────────────────────────────────
 
+# Renders the caller's description of its filter into the progress line, so a
+# run that selects nothing says *why* rather than just reporting zero.
+_filter_description(::Nothing) = ""
+_filter_description(d::String) = " on $d"
+
 function run_tests(
             path;
             filter=nothing,
+            filter_description::Union{Nothing,String}=nothing,
             max_workers::Int=min(Sys.CPU_THREADS, 8),
             timeout=60*5,
             fail_on_detection_error=true,
@@ -641,18 +647,26 @@ function run_tests(
     responses = []
 
     if length(testerrors) == 0  || fail_on_detection_error==false
+        # Report what detection found *before* filtering. Reporting only the
+        # post-filter count makes a filter that matches nothing look identical to
+        # a package where detection failed outright.
+        n_discovered = length(testitems)
+        n_discovered_files = length(unique(i.uri for i in testitems))
+
+        if progress_ui != :none
+            printstyled("  Discovered $n_discovered test item(s) in $n_discovered_files file(s)\n"; color=:cyan)
+        end
+
         if filter !== nothing
             cd(path) do
                 filter!(i->filter((filename=uri2filepath(i.uri), name=i.detail.name, tags=i.detail.option_tags, package_name=i.env.package_name)), testitems)
             end
+            if progress_ui != :none && length(testitems) != n_discovered
+                printstyled("  Selected $(length(testitems)) of $n_discovered after filtering$(_filter_description(filter_description))\n"; color=:cyan)
+            end
         end
 
         n_total = length(testitems)*length(environments)
-
-        if progress_ui != :none
-            n_files = length(unique(i.uri for i in testitems))
-            printstyled("  Discovered $n_total test item(s) in $n_files file(s)\n"; color=:cyan)
-        end
 
         p = ProgressMeter.Progress(n_total;
             barglyphs=ProgressMeter.BarGlyphs('┣','━','╸',' ','┫'),
@@ -721,8 +735,13 @@ function run_tests(
                 end
             end
 
-            if isempty(testitems_to_run_by_id)
-                @warn "No test items to run" filter_applied=(filter !== nothing)
+            if isempty(testitems_to_run_by_id) && progress_ui != :none
+                if filter !== nothing && n_discovered > 0
+                    printstyled("  No test item matched the filter"; color=:yellow)
+                    println(_filter_description(filter_description), ". Use 'test list' to see what is there.")
+                else
+                    printstyled("  No test items found in $path.\n"; color=:yellow)
+                end
             end
 
             ctx = RunContext(
@@ -940,13 +959,20 @@ function run_tests(
 end
 
 function kill_test_processes()
-    if _g_runner[] !== nothing
+    lock(_g_runner_lock) do
         runner = _g_runner[]
+        runner === nothing && return nothing
         TestItemControllers.shutdown(runner.controller)
         if runner.reactor_task !== nothing
             TestItemControllers.wait_for_shutdown(runner.controller, runner.reactor_task)
             runner.reactor_task = nothing
         end
+        # Drop the singleton: this controller's reactor has exited, so anything
+        # later pushed onto its channel would never be read and the caller would
+        # block forever. `get_runner()` returns the cached runner unconditionally,
+        # so leaving it in place bricks every subsequent run.
+        _g_runner[] = nothing
+        return nothing
     end
 end
 
@@ -1012,7 +1038,7 @@ end
 const _bg_run = Ref{Union{Nothing,BackgroundRun}}(nothing)
 const _last_result = Ref{Union{Nothing,TestrunResult}}(nothing)
 const _last_run_id = Ref{Union{Nothing,String}}(nothing)
-# Last foreground selection: (path=..., run_kwargs=...) for 'test -'
+# Last foreground selection: (path=..., run_kwargs=...) for 'test repeat'
 const _last_selection = Ref{Any}(nothing)
 
 # ── Argument parsing ──────────────────────────────────────────────────
@@ -1039,33 +1065,48 @@ end
 
 # ── Commands ──────────────────────────────────────────────────────────
 
+"""
+    _print_test_commands()
+
+The `test` group on its own, so a bare `test` or an unknown subcommand can show
+exactly the list of words it would have accepted.
+"""
+function _print_test_commands()
+    printstyled("\n  Running ('t' is a shorthand for 'test'):\n"; bold=true)
+    println("  test run [path|name]            Run test items (blocking, ESC to cancel)")
+    println("  test run --bg                   Run test items in the background")
+    println("  test pick [query] [path]        Fuzzy-pick test items to run interactively")
+    println("  test failed                     Rerun only the failing items of the last run")
+    println("  test repeat                     Repeat the last test run")
+    printstyled("\n  Inspecting:\n"; bold=true)
+    println("  test list [path]                List discovered test items (alias: ls)")
+    println("  test results [id]               Show results (last run, or run #id; alias: res)")
+    println("  test failures                   Browse failures of the last run (jump to editor)")
+    println("  test history [--active]         List all test runs")
+    println("  test status                     Show background run status (alias: st)")
+    println("  test cancel [id]                Cancel background run (or run by id)")
+    printstyled("\n  Test processes:\n"; bold=true)
+    println("  test procs                      Show active test processes (alias: ps)")
+    println("  test kill [process-id]          Kill all or a specific test process")
+    println("  test log <process-id>           Show output log for a test process")
+    printstyled("\n  Run flags:\n"; bold=true)
+    println("  --name=<pattern>                Filter by test item name (substring, case-insensitive)")
+    println("  --tags=t1,t2                    Filter by tags")
+    println("  --workers=N                     Max parallel workers (default: min(CPU_THREADS,8))")
+    println("  --timeout=S                     Timeout in seconds (default: 300)")
+    println("  --coverage                      Enable coverage")
+    println("  +channel                        Run using a Juliaup channel, e.g. +lts")
+    printstyled("\n  Results flags:\n"; bold=true)
+    println("  --name=<pattern>                Filter results by test item name")
+    println("  --verbose                       Show full per-profile details")
+    println("  --output                        Show captured output for test items")
+    nothing
+end
+
 function cmd_help()
     printstyled("DevREPL commands:\n\n"; bold=true)
     println("  help                            Show this help message")
-    printstyled("\n  Testing ('t' is a shorthand for 'test'):\n"; bold=true)
-    println("  test [+channel] [path|name]     Run test items (blocking, ESC to cancel)")
-    println("  test pick [query] [path]        Fuzzy-pick test items to run interactively")
-    println("                                  (bare 'test' also opens the picker; 'a' selects all)")
-    println("  test -                          Repeat the last test run")
-    println("  test failed                     Rerun only the failing items of the last run")
-    println("  @                               Browse failures of the last run (jump to editor)")
-    println("  test +lts                       Run using a Juliaup channel")
-    println("  test --tags=t1,t2               Filter by tags")
-    println("  test --workers=N                Max parallel workers (default: min(CPU_THREADS,8))")
-    println("  test --timeout=S                Timeout in seconds (default: 300)")
-    println("  test --coverage                 Enable coverage")
-    println("  test& [same options]            Run test items in background")
-    println("  test list [path] [--tags=...]   List discovered test items")
-    println("  test status                     Show background run status")
-    println("  test cancel [id]                Cancel background run (or run by id)")
-    println("  test results [id]               Show results (last run, or run #id)")
-    println("  test results --name=<pattern>   Filter results by test item name")
-    println("  test results --verbose          Show full per-profile details")
-    println("  test results --output           Show captured output for test items")
-    println("  test runs [--active]            List all test runs (history)")
-    println("  test procs                      Show active test processes")
-    println("  test kill [process-id]          Kill all or a specific test process")
-    println("  test plog <id>                  Show output log for a test process")
+    _print_test_commands()
     printstyled("\n  Linting and formatting:\n"; bold=true)
     println("  lint [path]                     Lint a folder (respects JuliaLint.toml)")
     println("  format [path]                   Format a file or folder in place")
@@ -1243,6 +1284,7 @@ function cmd_pick(args)
     end
     sel_keys = Set((c.filepath, c.name) for c in selected)
     run_kwargs[:filter] = info -> (info.filename, string(info.name)) in sel_keys
+    run_kwargs[:filter_description] = "the picked test item(s)"
 
     printstyled("Running $(length(selected)) selected test item(s)...\n"; color=:cyan)
     return _run_blocking(path, run_kwargs)
@@ -1328,6 +1370,7 @@ function cmd_run_failed()
 
     run_kwargs = _last_selection[] === nothing ? Dict{Symbol,Any}() : copy(_last_selection[].run_kwargs)
     run_kwargs[:filter] = info -> (info.filename, string(info.name)) in failing
+    run_kwargs[:filter_description] = "the previous run's failures"
 
     printstyled("Rerunning $(length(failing)) failing test item(s)...\n"; color=:cyan)
     return _run_blocking(path, run_kwargs)
@@ -1400,12 +1443,20 @@ function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{No
     path = nothing
     name_filter = nothing
 
+    # A positional is a path if it names a directory, otherwise a name filter.
+    # This is only safe because subcommand words never reach here — see
+    # `_dispatch_test`, which rejects unknown words rather than passing them on.
     for p in positional
         if isdir(p)
             path = p
         else
             name_filter = p
         end
+    end
+    # The explicit spelling wins, and is the way to filter for a name that
+    # happens to be a directory or a subcommand word.
+    if haskey(kwargs, :name)
+        name_filter = kwargs[:name]
     end
     if path === nothing
         path = pwd()
@@ -1451,6 +1502,10 @@ function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{No
             end
             return true
         end
+        parts = String[]
+        name_filter !== nothing && push!(parts, "name \"$name_filter\"")
+        tag_filter !== nothing && push!(parts, "tags $(join(sort!(string.(collect(tag_filter))), ", "))")
+        run_kwargs[:filter_description] = join(parts, " and ")
     end
 
     return path, run_kwargs
@@ -1472,7 +1527,7 @@ end
 # Run tests in the foreground with ESC-to-cancel handling. run_kwargs may
 # already contain a filter; cancellation and result bookkeeping are added here.
 function _run_blocking(path, run_kwargs)
-    # Remember the selection so 'test -' can replay it (without the
+    # Remember the selection so 'test repeat' can replay it (without the
     # run-specific cancellation state).
     _last_selection[] = (path=path, run_kwargs=copy(run_kwargs))
 
@@ -2023,14 +2078,14 @@ function _print_testitem_output(ti)
     end
 end
 
-function cmd_process_log(args)
+function cmd_log(args)
     result = _last_result[]
     if result === nothing
         println("No test results available.")
         return nothing
     end
     if isempty(args)
-        println("Usage: process-log <process id>")
+        println("Usage: test log <process id>")
         return nothing
     end
 
@@ -2063,7 +2118,7 @@ end
 
 
 
-function cmd_runs(args)
+function cmd_history(args)
     _, kwargs, flags = parse_args(args)
     history = get_run_history()
 
@@ -2350,9 +2405,10 @@ end
 
 struct DevREPLCompletionProvider <: REPL.LineEdit.CompletionProvider end
 
-const _TOP_COMMANDS = ["test", "test&", "lint", "format", "help"]
-const _TEST_SUBCOMMANDS = ["pick", "failed", "list", "status", "cancel", "results", "runs", "procs", "kill", "plog"]
-const _TEST_RUN_FLAGS = ["--tags=", "--workers=", "--timeout=", "--coverage"]
+const _TOP_COMMANDS = ["test", "lint", "format", "help"]
+const _TEST_SUBCOMMANDS = ["run", "pick", "failed", "repeat", "list", "results",
+    "failures", "history", "status", "cancel", "procs", "kill", "log"]
+const _TEST_RUN_FLAGS = ["--name=", "--tags=", "--workers=", "--timeout=", "--coverage", "--bg"]
 const _RESULTS_FLAGS = ["--name=", "--verbose", "--output"]
 
 function _juliaup_channel_names()
@@ -2397,25 +2453,23 @@ function _devrepl_completions(partial::AbstractString)
     else
         cmd = lowercase(prev[1])
         cmd == "t" && (cmd = "test")
-        cmd in ("t&", "test&") && (cmd = "test")
         if cmd == "test"
             sub = length(prev) >= 2 ? lowercase(prev[2]) : nothing
             if startswith(cur, "+")
                 cands = ["+" * n for n in _juliaup_channel_names()]
             elseif sub === nothing
-                cands = startswith(cur, "--") ? _TEST_RUN_FLAGS :
-                    vcat(_TEST_SUBCOMMANDS, _complete_dirs(cur))
+                # A subcommand is required, so only subcommands complete here.
+                cands = _TEST_SUBCOMMANDS
+            elseif sub == "run"
+                cands = startswith(cur, "--") ? _TEST_RUN_FLAGS : _complete_dirs(cur)
             elseif sub in ("results", "res")
                 cands = _RESULTS_FLAGS
-            elseif sub == "runs"
+            elseif sub == "history"
                 cands = ["--active"]
             elseif sub in ("list", "ls", "pick")
                 cands = startswith(cur, "--") ? ["--tags="] : _complete_dirs(cur)
-            elseif sub in ("status", "st", "cancel", "kill", "plog", "process-log", "procs", "processes", "ps", "failed", "-")
-                cands = String[]
             else
-                # First arg was a path/name query: still completing run args
-                cands = startswith(cur, "--") ? _TEST_RUN_FLAGS : _complete_dirs(cur)
+                cands = String[]
             end
         elseif cmd == "lint"
             cands = _complete_dirs(cur)
@@ -2436,20 +2490,6 @@ end
 
 # ── REPL parser ───────────────────────────────────────────────────────
 
-# The pre-`test`-group command names, mapped to their new spelling so users
-# get a pointer instead of a bare "unknown command".
-const _LEGACY_COMMAND_HINTS = Dict(
-    "run" => "test", "run&" => "test&",
-    "list" => "test list", "ls" => "test list",
-    "status" => "test status", "st" => "test status",
-    "cancel" => "test cancel",
-    "results" => "test results", "res" => "test results",
-    "process-log" => "test plog", "plog" => "test plog",
-    "runs" => "test runs",
-    "processes" => "test procs", "procs" => "test procs", "ps" => "test procs",
-    "kill" => "test kill",
-)
-
 function repl_parser(input::String)
     input = strip(input)
     isempty(input) && return nothing
@@ -2458,27 +2498,14 @@ function repl_parser(input::String)
     cmd = lowercase(parts[1])
     args = parts[2:end]
 
-    # Handle test& syntax: treat "test&" as background run command
-    bg_run = false
-    if cmd in ("test&", "t&")
-        bg_run = true
-        cmd = "test"
-    end
-
     if cmd == "help" || cmd == "?"
         return cmd_help()
-    elseif cmd == "@"
-        return cmd_failures()
     elseif cmd == "test" || cmd == "t"
-        return _dispatch_test(args, bg_run)
+        return _dispatch_test(args)
     elseif cmd == "lint"
         return cmd_lint(args)
     elseif cmd == "format"
         return cmd_format(args)
-    elseif haskey(_LEGACY_COMMAND_HINTS, cmd)
-        printstyled("Unknown command: $cmd\n"; color=:red)
-        println("Test commands now live under 'test' — did you mean '$(_LEGACY_COMMAND_HINTS[cmd])'?")
-        return nothing
     else
         printstyled("Unknown command: $cmd\n"; color=:red)
         println("Type 'help' for available commands.")
@@ -2486,19 +2513,48 @@ function repl_parser(input::String)
     end
 end
 
-function _dispatch_test(args, bg_run::Bool)
+"""
+    _dispatch_run(args)
+
+Shared tail of `test run`. Pulls out `+channel` and `--bg`, then hands the rest
+to the blocking or background runner. `args` here never contains a subcommand
+word — the caller has already consumed it.
+"""
+function _dispatch_run(args)
+    juliaup_channel = nothing
+    background = false
+    remaining_args = SubString{String}[]
+    for a in args
+        if startswith(a, "+")
+            juliaup_channel = String(a[2:end])
+        elseif lowercase(a) == "--bg"
+            background = true
+        else
+            push!(remaining_args, a)
+        end
+    end
+    return background ? cmd_run_bg(remaining_args; juliaup_channel) :
+                        cmd_run(remaining_args; juliaup_channel)
+end
+
+# Every word accepted after `test`. There is deliberately no catch-all: an
+# unrecognized word is an error, never a name filter. Letting unknown words fall
+# through to the runner is what made `test run` silently match zero test items
+# for as long as `run` itself was missing from this list.
+function _dispatch_test(args)
     sub = isempty(args) ? "" : lowercase(args[1])
     rest = isempty(args) ? SubString{String}[] : args[2:end]
 
-    if sub == "" && !bg_run && stdin isa Base.TTY
-        # Bare 'test' in an interactive session: offer the picker ('a' selects all)
-        return cmd_pick(rest)
+    if sub == "run"
+        return _dispatch_run(rest)
     elseif sub == "pick"
         return cmd_pick(rest)
-    elseif sub == "-"
+    elseif sub == "repeat"
         return cmd_rerun()
     elseif sub == "failed"
         return cmd_run_failed()
+    elseif sub == "failures"
+        return cmd_failures()
     elseif sub in ("list", "ls")
         return cmd_list(rest)
     elseif sub in ("status", "st")
@@ -2507,30 +2563,22 @@ function _dispatch_test(args, bg_run::Bool)
         return cmd_cancel(rest)
     elseif sub in ("results", "res")
         return cmd_results(rest)
-    elseif sub in ("plog", "process-log")
-        return cmd_process_log(rest)
-    elseif sub == "runs"
-        return cmd_runs(rest)
-    elseif sub in ("procs", "processes", "ps")
+    elseif sub == "log"
+        return cmd_log(rest)
+    elseif sub == "history"
+        return cmd_history(rest)
+    elseif sub in ("procs", "ps")
         return cmd_processes()
     elseif sub == "kill"
         return cmd_kill(rest)
+    elseif sub == ""
+        println("'test' needs a subcommand.")
+        _print_test_commands()
+        return nothing
     else
-        # Anything else is run arguments: paths, name queries, +channel, --flags
-        juliaup_channel = nothing
-        remaining_args = SubString{String}[]
-        for a in args
-            if startswith(a, "+")
-                juliaup_channel = String(a[2:end])
-            else
-                push!(remaining_args, a)
-            end
-        end
-        if bg_run
-            return cmd_run_bg(remaining_args; juliaup_channel)
-        else
-            return cmd_run(remaining_args; juliaup_channel)
-        end
+        printstyled("Unknown test command: $sub\n"; color=:red)
+        _print_test_commands()
+        return nothing
     end
 end
 
@@ -2559,10 +2607,10 @@ end
 function _register_repl_mode()
     initrepl(
         repl_parser;
-        prompt_text="test> ",
+        prompt_text="dev> ",
         prompt_color=:yellow,
         start_key=')',
-        mode_name="TestItem",
+        mode_name="Dev",
         sticky_mode=true,
         valid_input_checker=s -> true,
         completion_provider=DevREPLCompletionProvider(),

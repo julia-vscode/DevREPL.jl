@@ -4,14 +4,19 @@
     @test cur == ""
 
     m, cur = DevREPL._devrepl_completions("te")
-    @test m == ["test", "test&"]
+    @test m == ["test"]
     @test cur == "te"
 end
 
 @testitem "test subcommand completions" begin
     m, _ = DevREPL._devrepl_completions("test ")
-    for sub in ("pick", "failed", "list", "results", "runs", "procs", "kill", "plog")
+    for sub in ("run", "pick", "failed", "repeat", "list", "results",
+                "failures", "history", "procs", "kill", "log")
         @test sub in m
+    end
+    # Retired spellings must not be offered.
+    for gone in ("runs", "plog", "process-log", "processes", "-")
+        @test !(gone in m)
     end
 
     m, cur = DevREPL._devrepl_completions("test pi")
@@ -20,13 +25,13 @@ end
 end
 
 @testitem "flag completions" begin
-    m, _ = DevREPL._devrepl_completions("test --")
-    @test Set(m) == Set(["--tags=", "--workers=", "--timeout=", "--coverage"])
+    m, _ = DevREPL._devrepl_completions("test run --")
+    @test Set(m) == Set(["--name=", "--tags=", "--workers=", "--timeout=", "--coverage", "--bg"])
 
     m, _ = DevREPL._devrepl_completions("test results --")
     @test Set(m) == Set(["--name=", "--verbose", "--output"])
 
-    m, _ = DevREPL._devrepl_completions("test runs --")
+    m, _ = DevREPL._devrepl_completions("test history --")
     @test m == ["--active"]
 
     m, _ = DevREPL._devrepl_completions("format --")
