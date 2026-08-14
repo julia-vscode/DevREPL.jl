@@ -61,7 +61,8 @@ end
 @testitem "test status and history commands respond" setup=[ReplHelper] begin
     # Test items share a process, so runs from other test items may already be
     # in the history — only the command shape is asserted here.
-    @test occursin("No background test run", ReplHelper.run_command("t st"))
+    ReplHelper.reset_bg_runs!()
+    @test occursin("No test runs in progress", ReplHelper.run_command("t st"))
     out = ReplHelper.run_command("test history")
     @test occursin("No test runs in history", out) || occursin("run(s)", out)
 end

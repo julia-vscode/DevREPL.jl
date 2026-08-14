@@ -34,8 +34,9 @@ Every test command takes a subcommand; `t` is a shorthand for `test`.
 
 | Command | Description |
 | --- | --- |
-| `test run [path\|name]` | Run test items (blocking, Esc cancels) |
-| `test run --bg` | Run test items in the background |
+| `test run [path\|name]` | Run test items (Esc cancels, `b` backgrounds) |
+| `test run --bg` | Run test items in the background (several may run at once) |
+| `test attach [id]` | Watch a background run as if it had been run in the foreground |
 | `test pick [query] [path]` | Fuzzy-pick test items to run interactively |
 | `test failed` | Rerun only the failing items of the last run |
 | `test repeat` | Repeat the last test run |
@@ -43,8 +44,8 @@ Every test command takes a subcommand; `t` is a shorthand for `test`.
 | `test results [id]` | Show results (alias: `res`) |
 | `test failures` | Browse failures of the last run, jumping to your editor |
 | `test history [--active]` | List all test runs |
-| `test status` | Show background run status (alias: `st`) |
-| `test cancel [id]` | Cancel a run |
+| `test status` | Show runs in progress (alias: `st`) |
+| `test cancel [id]` | Cancel a run (id required when several are active) |
 | `test procs` | Show active test processes (alias: `ps`) |
 | `test kill [id]` | Kill all or a specific test process |
 | `test log <id>` | Show the output log for a test process |

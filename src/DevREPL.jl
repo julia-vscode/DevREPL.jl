@@ -145,6 +145,9 @@ struct ProcessInfo
     id::String
     package_name::String
     status::String
+    # When the controller told us the process was being created. The controller
+    # does not track a launch time, but this is close enough to show uptime.
+    started_at::Float64
 end
 
 struct TestrunResultMessage
@@ -208,13 +211,42 @@ struct ProcessLaunchingEvent end
 
 const ProgressEvent = Union{TestItemEvent,OutputEvent,ProcessLaunchingEvent}
 
+"""
+    RunPresentation
+
+Everything a run says to the terminal, in one place and mutable, so it can change
+while the run is in flight. That is what makes detaching a running test run to
+the background — and attaching to one later — possible: both are just a change of
+presentation on a run that keeps going either way.
+
+`mode` is `:bar`, `:log` or `:none`. `render` draws one unit of progress and is
+rebuilt on attach, since a `ProgressMeter.Progress` bakes in `enabled` and the
+terminal width at construction.
+"""
+mutable struct RunPresentation
+    mode::Symbol
+    show_summary::Bool
+    show_failures::Bool
+    render::Function
+end
+
+RunPresentation(mode::Symbol; show_summary::Bool=false, show_failures::Bool=false) =
+    RunPresentation(mode, show_summary, show_failures, () -> nothing)
+
+"Silence a run without stopping it — used when detaching to the background."
+function detach!(pres::RunPresentation)
+    pres.mode = :none
+    pres.show_summary = false
+    pres.show_failures = false
+    return pres
+end
+
 mutable struct RunContext
     testitems_by_id::Dict{String,TestItemControllers.TestItemDetail}
     environments::Vector{RunProfile}
     profiles_by_env_id::Dict{String,RunProfile}
     environment_name::String
-    progress_ui::Symbol
-    progressbar_next::Function
+    pres::RunPresentation
     count_success::Int
     count_fail::Int
     count_error::Int
@@ -226,6 +258,10 @@ mutable struct RunContext
     events::Channel{ProgressEvent}
     lock::ReentrantLock
 end
+
+"Number of test items that have reported a result so far."
+completed_count(ctx::RunContext) =
+    ctx.count_success + ctx.count_fail + ctx.count_error + ctx.count_skipped
 
 """
     emit!(ctx, event)
@@ -381,12 +417,14 @@ function _apply_event!(ctx::RunContext, ev::TestItemEvent)
         ))
     end
 
-    if ctx.progress_ui == :log
+    # Read the mode once: a detach from the REPL task can flip it underneath us.
+    mode = ctx.pres.mode
+    if mode === :log
         glyph = ev.kind === :passed ? "✓" : ev.kind === :skipped ? "⊘" : "✗"
         duration_string = ev.duration !== missing ? " ($(ev.duration)ms)" : ""
         println("$glyph $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → $(ev.kind)$duration_string")
-    elseif ctx.progress_ui == :bar
-        ctx.progressbar_next()
+    elseif mode === :bar
+        ctx.pres.render()
     end
     return nothing
 end
@@ -399,7 +437,7 @@ function _apply_event!(ctx::RunContext, ev::OutputEvent)
 end
 
 function _apply_event!(ctx::RunContext, ::ProcessLaunchingEvent)
-    ctx.progress_ui == :bar || return nothing
+    ctx.pres.mode === :bar || return nothing
     if !ctx.launch_header_printed
         ctx.launch_header_printed = true
         printstyled("  Launching test processes"; color=:cyan)
@@ -450,6 +488,42 @@ function _build_result_from_context(runner::TestItemRunner, testrun_id::String, 
     ]
     TestrunResult(TestrunResultDefinitionError[], testitems, collected_process_outputs)
 end
+
+"""
+    _finish_record!(runner, testrun_id, status)
+
+Stamp a run's terminal state. Every path out of `run_tests` goes through here, so
+`end_time` is always set and `cmd_history` can always show a duration.
+
+`status` is one of `:completed`, `:cancelled` or `:errored`. Before this existed
+`:completed` was written unconditionally, which reported a cancelled run as a
+successful one; and a run that threw never reached the stamp at all, leaving the
+record `:running` forever — which `_prune_history!` then refused to evict.
+"""
+function _finish_record!(runner::TestItemRunner, testrun_id::String, status::Symbol;
+                         result::Union{Nothing,TestrunResult}=nothing)
+    _release_workers!(testrun_id)
+    lock(runner.lock) do
+        idx = findfirst(r -> r.id == testrun_id, runner.run_history)
+        idx === nothing && return nothing
+        rec = runner.run_history[idx]
+        result !== nothing && (rec.result = result)
+        rec.status = status
+        rec.end_time = time()
+        return nothing
+    end
+end
+
+"""
+    _run_outcome(token) -> :completed | :cancelled
+
+Cancellation returns *normally* from `execute_testrun` — the controller puts
+`nothing` on the completion channel, which is indistinguishable from a clean
+finish with no coverage — so the token is the only thing that can tell them
+apart.
+"""
+_run_outcome(token) =
+    token !== nothing && is_cancellation_requested(token) ? :cancelled : :completed
 
 function _prune_history!(runner::TestItemRunner)
     while length(runner.run_history) > runner.max_history
@@ -507,7 +581,7 @@ function get_runner()
                 runner = _g_runner[]
                 lock(runner.lock) do
                     package_name = get(runner.env_package_names, test_env_id, "")
-                    runner.processes[id] = ProcessInfo(id, package_name, "Launching")
+                    runner.processes[id] = ProcessInfo(id, package_name, "Launching", time())
                 end
             end,
             on_process_terminated = (id) -> begin
@@ -521,12 +595,16 @@ function get_runner()
                 lock(runner.lock) do
                     if haskey(runner.processes, id)
                         old = runner.processes[id]
-                        runner.processes[id] = ProcessInfo(old.id, old.package_name, status)
+                        runner.processes[id] = ProcessInfo(old.id, old.package_name, status, old.started_at)
                     end
                 end
                 if status == "Launching"
+                    # Only the run that is rendering should see launch dots. The
+                    # callback carries no run id, so the attached run is the best
+                    # available attribution — and with one renderer at a time it
+                    # is the only context that would draw them anyway.
                     contexts = lock(runner.lock) do
-                        collect(values(runner.run_contexts))
+                        [c for c in values(runner.run_contexts) if c.pres.mode !== :none]
                     end
                     for ctx in contexts
                         emit!(ctx, ProcessLaunchingEvent())
@@ -571,7 +649,93 @@ end
 _filter_description(::Nothing) = ""
 _filter_description(d::String) = " on $d"
 
-function run_tests(
+"""
+    _make_progress_bar(n_total; start=0)
+
+Build the run's progress bar. `start` lets `test attach` pick a run up mid-flight
+at the count it has already reached.
+
+`barlen` is given explicitly because ProgressMeter's default (`nothing`) expands
+the bar to the full terminal width — `displaysize(output)[2] - length(desc) - 29`
+— which is far wider than it needs to be. The cap still shrinks on narrow
+terminals so the line never wraps.
+
+Always constructed enabled: whether anything is drawn is decided per event by
+`RunPresentation.mode`, which can change mid-run, whereas `enabled` is baked in
+here and could not.
+"""
+function _make_progress_bar(n_total::Integer; start::Integer=0)
+    barlen = clamp(displaysize(stderr)[2] - 40, 10, 40)
+    return ProgressMeter.Progress(n_total;
+        start=start,
+        barlen=barlen,
+        barglyphs=ProgressMeter.BarGlyphs('┣','━','╸',' ','┫'),
+        color=:green, enabled=true)
+end
+
+"""
+    _bar_renderer(ctx, p)
+
+The `:bar` renderer: one call per completed test item. Kept separate from the
+context so `test attach` can install a fresh one over a new bar.
+"""
+function _bar_renderer(ctx, p)
+    return () -> begin
+        if ctx.launch_header_printed
+            ctx.launch_header_printed = false
+            println()
+        end
+        done = completed_count(ctx)
+        if done >= ctx.n_total
+            # Final update — erase the progress bar
+            ProgressMeter.cancel(p, ""; keep=false)
+        else
+            parts = String[]
+            ctx.count_success > 0 && push!(parts, "$(ctx.count_success) passed")
+            ctx.count_fail > 0 && push!(parts, "$(ctx.count_fail) failed")
+            ctx.count_error > 0 && push!(parts, "$(ctx.count_error) errored")
+            ctx.count_skipped > 0 && push!(parts, "$(ctx.count_skipped) skipped")
+            detail = isempty(parts) ? "" : " ($(join(parts, ", ")))"
+            ProgressMeter.next!(
+                p,
+                showvalues = [
+                    (Symbol("Progress"), "$done/$(ctx.n_total)$detail"),
+                ]
+            )
+        end
+    end
+end
+
+"""
+    run_tests(path; kwargs...)
+
+Run the test items under `path`. See `_run_tests` for the keyword arguments.
+
+This wrapper exists to guarantee the run's history record reaches a terminal
+state. `_run_tests` stamps `:completed`/`:cancelled` on its way out, but a throw
+skips that entirely and used to strand the record at `:running` with no end time
+— forever, since `_prune_history!` will not evict a running record.
+
+`on_registered` is how the id becomes known before the run finishes: it is minted
+long before any work starts, and both this wrapper and background bookkeeping
+need it up front rather than reverse-engineered from history order afterwards.
+"""
+function run_tests(path; on_registered=nothing, kwargs...)
+    registered_id = Ref{Union{Nothing,String}}(nothing)
+    notify_id = function (id)
+        registered_id[] = id
+        on_registered === nothing || on_registered(id)
+    end
+    try
+        return _run_tests(path; on_registered=notify_id, kwargs...)
+    catch
+        id = registered_id[]
+        id !== nothing && _finish_record!(get_runner(), id, :errored)
+        rethrow()
+    end
+end
+
+function _run_tests(
             path;
             filter=nothing,
             filter_description::Union{Nothing,String}=nothing,
@@ -582,16 +746,26 @@ function run_tests(
             print_failed_results=true,
             print_summary=true,
             progress_ui=:bar,
+            presentation::Union{Nothing,RunPresentation}=nothing,
             environments=[RunProfile("Default", false, Dict{String,Any}())],
             julia_cmd::String="julia",
             julia_args::Vector{String}=String[],
             token=nothing,
+            on_registered=nothing,
             cancellation_source::Union{Nothing,CancellationTokenSource}=nothing
         )
     if progress_ui == :none
         print_summary = false
         print_failed_results = false
     end
+
+    # Declared out here, not inside the `with_logger` block below, so the summary
+    # and failure dump at the end can consult it. When the caller supplies one it
+    # keeps a reference, which is how the REPL task silences a run it is detaching
+    # to the background — the run itself carries on untouched.
+    pres = presentation === nothing ?
+        RunPresentation(progress_ui; show_summary=print_summary, show_failures=print_failed_results) :
+        presentation
 
     # Recording the source (not just a token) in the history lets 'test cancel <id>'
     # cancel this run later.
@@ -609,6 +783,11 @@ function run_tests(
         pushfirst!(runner.run_history, record)
         _prune_history!(runner)
     end
+    # Announce the id now, while it is unambiguous. Callers that reconstruct it
+    # afterwards from "the most recent run" get the wrong answer as soon as two
+    # runs start close together.
+    _note_workers!(testrun_id, max_workers)
+    on_registered === nothing || on_registered(testrun_id)
 
     jw = JuliaWorkspaces.workspace_from_folders(([path]))
     _add_active_project!(jw)
@@ -653,7 +832,10 @@ function run_tests(
         n_discovered = length(testitems)
         n_discovered_files = length(unique(i.uri for i in testitems))
 
-        if progress_ui != :none
+        # `pres`, not the `progress_ui` kwarg — the presentation is the single
+        # source of truth for whether this run talks to the terminal, and a
+        # caller can hand us one that says otherwise.
+        if pres.mode !== :none
             printstyled("  Discovered $n_discovered test item(s) in $n_discovered_files file(s)\n"; color=:cyan)
         end
 
@@ -661,16 +843,20 @@ function run_tests(
             cd(path) do
                 filter!(i->filter((filename=uri2filepath(i.uri), name=i.detail.name, tags=i.detail.option_tags, package_name=i.env.package_name)), testitems)
             end
-            if progress_ui != :none && length(testitems) != n_discovered
+            if pres.mode !== :none && length(testitems) != n_discovered
                 printstyled("  Selected $(length(testitems)) of $n_discovered after filtering$(_filter_description(filter_description))\n"; color=:cyan)
             end
         end
 
         n_total = length(testitems)*length(environments)
 
-        p = ProgressMeter.Progress(n_total;
-            barglyphs=ProgressMeter.BarGlyphs('┣','━','╸',' ','┫'),
-            color=:green, enabled=progress_ui==:bar)
+        # Surface the keys where they are needed — next to the progress bar the
+        # user is about to watch, not buried in `help`.
+        if pres.mode === :bar && n_total > 0
+            _print_run_keys()
+        end
+
+        p = _make_progress_bar(n_total)
 
         debuglogger = Logging.ConsoleLogger(stderr, Logging.Warn)
 
@@ -735,7 +921,7 @@ function run_tests(
                 end
             end
 
-            if isempty(testitems_to_run_by_id) && progress_ui != :none
+            if isempty(testitems_to_run_by_id) && pres.mode !== :none
                 if filter !== nothing && n_discovered > 0
                     printstyled("  No test item matched the filter"; color=:yellow)
                     println(_filter_description(filter_description), ". Use 'test list' to see what is there.")
@@ -749,8 +935,7 @@ function run_tests(
                 environments,
                 profiles_by_env_id,
                 environment_name,
-                progress_ui,
-                () -> nothing,
+                pres,
                 0, 0, 0, 0,
                 n_total,
                 responses,
@@ -760,30 +945,7 @@ function run_tests(
                 ReentrantLock(),
             )
 
-            ctx.progressbar_next = () -> begin
-                if ctx.launch_header_printed
-                    ctx.launch_header_printed = false
-                    println()
-                end
-                done = ctx.count_success + ctx.count_fail + ctx.count_error + ctx.count_skipped
-                if done >= ctx.n_total
-                    # Final update — erase the progress bar
-                    ProgressMeter.cancel(p, ""; keep=false)
-                else
-                    parts = String[]
-                    ctx.count_success > 0 && push!(parts, "$(ctx.count_success) passed")
-                    ctx.count_fail > 0 && push!(parts, "$(ctx.count_fail) failed")
-                    ctx.count_error > 0 && push!(parts, "$(ctx.count_error) errored")
-                    ctx.count_skipped > 0 && push!(parts, "$(ctx.count_skipped) skipped")
-                    detail = isempty(parts) ? "" : " ($(join(parts, ", ")))"
-                    ProgressMeter.next!(
-                        p,
-                        showvalues = [
-                            (Symbol("Progress"), "$done/$(ctx.n_total)$detail"),
-                        ]
-                    )
-                end
-            end
+            pres.render = _bar_renderer(ctx, p)
 
             lock(runner.lock) do
                 runner.run_contexts[testrun_id] = ctx
@@ -874,7 +1036,9 @@ function run_tests(
         testitem_outputs = Dict{String,Vector{String}}()
     end
 
-    if print_summary
+    # `pres`, not the kwargs: a run detached to the background mid-flight has had
+    # these turned off, and must not write over the prompt it just handed back.
+    if pres.show_summary
         println()
         parts = String[]
         length(testerrors) > 0 && push!(parts, "$(length(testerrors)) definition error$(ifelse(length(testerrors)==1,"", "s"))")
@@ -886,7 +1050,7 @@ function run_tests(
         println(join(parts, ", "), ".")
     end
 
-    if print_failed_results
+    if pres.show_failures
         for te in testerrors
             println()
             println("Definition error at $(uri2filepath(URI(te.uri))):$(te.line)")
@@ -946,14 +1110,7 @@ function run_tests(
         collected_process_outputs,
     )
 
-    lock(runner.lock) do
-        idx = findfirst(r -> r.id == testrun_id, runner.run_history)
-        if idx !== nothing
-            runner.run_history[idx].result = typed_results
-            runner.run_history[idx].status = :completed
-            runner.run_history[idx].end_time = time()
-        end
-    end
+    _finish_record!(runner, testrun_id, _run_outcome(token); result=typed_results)
 
     return return_results ? typed_results : testrun_id
 end
@@ -1028,14 +1185,104 @@ end
 # ── Background run state ──────────────────────────────────────────────
 
 mutable struct BackgroundRun
+    # The run this handle belongs to. Learned from `run_tests` at registration
+    # time; deriving it afterwards from "the most recently started run" attaches
+    # the wrong id as soon as two runs start close together.
+    run_id::String
     task::Task
     cts::CancellationTokenSource
     result::Union{Nothing,TestrunResult}
     error::Union{Nothing,Exception}
     start_time::Float64
+    # Whether completion has already been announced. Without this the banner
+    # reprints on every subsequent command for the rest of the session.
+    reported::Bool
 end
 
-const _bg_run = Ref{Union{Nothing,BackgroundRun}}(nothing)
+# Background runs by id. The controller keys everything by testrun_id and runs
+# each one independently, so several can be in flight at once; the only reason
+# this used to be a single slot was DevREPL's own bookkeeping.
+const _bg_runs = Dict{String,BackgroundRun}()
+# Guards `_bg_runs`: the result harvester writes to it from its own task.
+const _bg_runs_lock = ReentrantLock()
+
+"All background runs, newest first."
+function background_runs()
+    lock(_bg_runs_lock) do
+        sort!(collect(values(_bg_runs)); by=b -> b.start_time, rev=true)
+    end
+end
+
+"Background runs that have not finished yet."
+active_background_runs() = filter(b -> !istaskdone(b.task), background_runs())
+
+"The default worker count for a single run."
+default_max_workers() = min(Sys.CPU_THREADS, 8)
+
+"Compact elapsed time: `4.2s`, `1m12s`, `2h03m`."
+function _format_elapsed(seconds::Real)
+    seconds < 0 && return "-"
+    if seconds < 60
+        return "$(round(seconds; digits=1))s"
+    elseif seconds < 3600
+        m, s = divrem(round(Int, seconds), 60)
+        return "$(m)m$(lpad(s, 2, '0'))s"
+    end
+    h, rem = divrem(round(Int, seconds), 3600)
+    return "$(h)h$(lpad(rem ÷ 60, 2, '0'))m"
+end
+
+"""
+    short_id(id, n=8)
+
+The leading chunk of a process or run id. `test kill`, `test log` and
+`test attach` all resolve by prefix, so a shortened id stays actionable — and a
+full UUID per row is mostly noise.
+"""
+short_id(id::AbstractString, n::Int=8) = length(id) <= n ? String(id) : String(first(id, n))
+
+# Workers currently allocated per in-flight run. `max_workers` is per-run and the
+# controller has no global cap, so without this every concurrent run gets the
+# full allowance and the machine ends up with a multiple of it.
+const _run_workers = Dict{String,Int}()
+const _run_workers_lock = ReentrantLock()
+
+allocated_workers() = lock(_run_workers_lock) do
+    sum(values(_run_workers); init=0)
+end
+
+_note_workers!(run_id, n) = lock(_run_workers_lock) do
+    _run_workers[run_id] = n
+end
+
+_release_workers!(run_id) = lock(_run_workers_lock) do
+    delete!(_run_workers, run_id)
+end
+
+"""
+    _worker_budget(requested) -> Int
+
+What a new run may claim: whatever is left of the global allowance, but never
+zero — a run with no worker cannot make progress.
+
+An in-flight run's allocation cannot be renegotiated, so the first run keeps its
+full speed and later ones take what remains. An explicit `--workers=N` is
+honoured as given: that is the user overriding the budget, not asking for a share
+of it.
+"""
+function _worker_budget(requested::Union{Nothing,Int})
+    requested === nothing || return requested
+    return clamp(default_max_workers() - allocated_workers(), 1, default_max_workers())
+end
+
+"Look a background run up by exact id or unique id prefix."
+function find_background_run(id::AbstractString)
+    lock(_bg_runs_lock) do
+        haskey(_bg_runs, id) && return _bg_runs[id]
+        matches = [b for (k, b) in _bg_runs if startswith(k, id)]
+        length(matches) == 1 ? only(matches) : nothing
+    end
+end
 const _last_result = Ref{Union{Nothing,TestrunResult}}(nothing)
 const _last_run_id = Ref{Union{Nothing,String}}(nothing)
 # Last foreground selection: (path=..., run_kwargs=...) for 'test repeat'
@@ -1073,8 +1320,9 @@ exactly the list of words it would have accepted.
 """
 function _print_test_commands()
     printstyled("\n  Running ('t' is a shorthand for 'test'):\n"; bold=true)
-    println("  test run [path|name]            Run test items (blocking, ESC to cancel)")
-    println("  test run --bg                   Run test items in the background")
+    println("  test run [path|name]            Run test items (Esc cancels, b backgrounds)")
+    println("  test run --bg                   Run test items in the background (several may run at once)")
+    println("  test attach [id]                Watch a background run as if it were in the foreground")
     println("  test pick [query] [path]        Fuzzy-pick test items to run interactively")
     println("  test failed                     Rerun only the failing items of the last run")
     println("  test repeat                     Repeat the last test run")
@@ -1083,8 +1331,8 @@ function _print_test_commands()
     println("  test results [id]               Show results (last run, or run #id; alias: res)")
     println("  test failures                   Browse failures of the last run (jump to editor)")
     println("  test history [--active]         List all test runs")
-    println("  test status                     Show background run status (alias: st)")
-    println("  test cancel [id]                Cancel background run (or run by id)")
+    println("  test status                     Show runs in progress (alias: st)")
+    println("  test cancel [id]                Cancel a run (id required when several are active)")
     printstyled("\n  Test processes:\n"; bold=true)
     println("  test procs                      Show active test processes (alias: ps)")
     println("  test kill [process-id]          Kill all or a specific test process")
@@ -1092,7 +1340,7 @@ function _print_test_commands()
     printstyled("\n  Run flags:\n"; bold=true)
     println("  --name=<pattern>                Filter by test item name (substring, case-insensitive)")
     println("  --tags=t1,t2                    Filter by tags")
-    println("  --workers=N                     Max parallel workers (default: min(CPU_THREADS,8))")
+    println("  --workers=N                     Max parallel workers (default: shared across active runs)")
     println("  --timeout=S                     Timeout in seconds (default: 300)")
     println("  --coverage                      Enable coverage")
     println("  +channel                        Run using a Juliaup channel, e.g. +lts")
@@ -1524,111 +1772,167 @@ function cmd_run(args; juliaup_channel::Union{Nothing,String}=nothing)
     return _run_blocking(path, run_kwargs)
 end
 
-# Run tests in the foreground with ESC-to-cancel handling. run_kwargs may
-# already contain a filter; cancellation and result bookkeeping are added here.
+"""
+    _run_key_action(byte) -> :cancel | :detach | :none
+
+Decode one keypress read while a run is on screen. Split out from the terminal
+plumbing so the key map is testable without a pty.
+"""
+function _run_key_action(b::UInt8)
+    b == 0x1b && return :cancel                       # Esc
+    (b == UInt8('b') || b == UInt8('B')) && return :detach
+    return :none
+end
+
+"""
+    _watch_run(test_task, cts, pres) -> :completed | :cancelled | :detached
+
+Watch a running test run from the REPL task, reading single keys in raw mode:
+
+  * **Esc** cancels the run.
+  * **b** detaches it — the run carries on, silently, in the background.
+
+Returns how the watch ended. Shared by `test run` and `test attach`, so both
+behave identically once a run is on screen.
+
+Detaching silences `pres` here rather than in the caller, so the renderer stops
+before this function returns and cannot draw over the prompt the REPL is about
+to print.
+"""
+function _watch_run(test_task::Task, cts::CancellationTokenSource, pres::RunPresentation)
+    term = nothing
+    raw_set = false
+    try
+        if isdefined(Base, :active_repl) && stdin isa Base.TTY
+            term = stdin
+            ccall(:jl_tty_set_mode, Int32, (Ptr{Nothing}, Int32), term.handle, Int32(1))  # raw mode
+            Base.start_reading(stdin)
+            raw_set = true
+        end
+    catch
+        # Fall through — key handling won't work but Ctrl+C still will
+    end
+
+    outcome = :completed
+    try
+        while !istaskdone(test_task)
+            if raw_set && bytesavailable(stdin) > 0
+                action = _run_key_action(read(stdin, UInt8))
+                if action === :cancel
+                    cancel(cts)
+                    outcome = :cancelled
+                    printstyled("\nTest run cancelled (Esc).\n"; color=:yellow)
+                    break
+                elseif action === :detach
+                    detach!(pres)
+                    outcome = :detached
+                    break
+                end
+            end
+            sleep(0.05)
+        end
+    finally
+        if raw_set
+            try
+                Base.stop_reading(stdin)
+                ccall(:jl_tty_set_mode, Int32, (Ptr{Nothing}, Int32), term.handle, Int32(0))  # normal mode
+            catch
+            end
+        end
+    end
+    return outcome
+end
+
+"""
+    _settle(test_task; timeout=10.0) -> Bool
+
+Wait for a run to finish unwinding, returning whether it did within `timeout`.
+
+This is what keeps the REPL prompt last. Cancellation is cooperative, so after
+Esc the run is still inside `execute_testrun` and has yet to erase the progress
+bar and print its summary. Returning to the REPL before that lands means the
+prompt is drawn first and then scrolled away by the run's own output — which
+reads exactly like a missing prompt. The timeout is a backstop so a wedged run
+degrades to messy output rather than a hung REPL.
+"""
+function _settle(test_task::Task; timeout::Float64=10.0)
+    t0 = time()
+    while !istaskdone(test_task) && time() - t0 < timeout
+        sleep(0.02)
+    end
+    return istaskdone(test_task)
+end
+
+"Record the run id and cached result for `test results` / `test failures`."
+function _remember_run(raw=nothing)
+    if raw isa String
+        _last_run_id[] = raw
+    else
+        last_id = get_last_run_id()
+        last_id === nothing && return nothing
+        _last_run_id[] = last_id
+    end
+    result = get_run_result(_last_run_id[])
+    result !== nothing && (_last_result[] = result)
+    return nothing
+end
+
+# Run tests in the foreground with Esc-to-cancel and b-to-background handling.
+# run_kwargs may already contain a filter; cancellation, presentation and result
+# bookkeeping are added here.
 function _run_blocking(path, run_kwargs)
     # Remember the selection so 'test repeat' can replay it (without the
     # run-specific cancellation state).
     _last_selection[] = (path=path, run_kwargs=copy(run_kwargs))
 
     cts = CancellationTokenSource()
+    # Built here, not inside `run_tests`, so this task keeps the handle it needs
+    # to silence the run if the user backgrounds it mid-flight.
+    pres = RunPresentation(:bar; show_summary=true, show_failures=true)
     run_kwargs[:cancellation_source] = cts
+    run_kwargs[:presentation] = pres
     run_kwargs[:return_results] = false
-    run_kwargs[:print_failed_results] = true
-    run_kwargs[:print_summary] = true
+    run_kwargs[:max_workers] = _worker_budget(get(run_kwargs, :max_workers, nothing))
 
-    printstyled("Starting test run...\n"; color=:cyan)
+    # Captured up front so `b` can hand this exact run over to the background.
+    run_id = Ref{Union{Nothing,String}}(nothing)
 
     # Run tests off the REPL's thread so the run keeps progressing regardless of
-    # what else the session is doing; this task also owns all progress rendering
-    # while the REPL task below does nothing but watch for ESC.
+    # what else the session is doing; that task also owns all progress rendering
+    # while the REPL task below does nothing but watch for keys.
     test_task = _spawn_bg() do
         try
-            run_tests(path; run_kwargs...)
+            run_tests(path; on_registered=id -> (run_id[] = id), run_kwargs...)
         catch e
             e
         end
     end
 
-    cancelled = Ref(false)
     try
-        # Try to set terminal to raw mode for ESC detection
-        term = nothing
-        raw_set = false
-        try
-            if isdefined(Base, :active_repl) && stdin isa Base.TTY
-                term = stdin
-                ccall(:jl_tty_set_mode, Int32, (Ptr{Nothing}, Int32), term.handle, Int32(1))  # raw mode
-                Base.start_reading(stdin)
-                raw_set = true
-            end
-        catch
-            # Fall through — ESC detection won't work but Ctrl+C still will
+        outcome = _watch_run(test_task, cts, pres)
+
+        if outcome === :detached
+            _detach_to_background(run_id[], test_task, cts)
+            return nothing
         end
 
-        try
-            while !istaskdone(test_task)
-                if raw_set && bytesavailable(stdin) > 0
-                    b = read(stdin, UInt8)
-                    if b == 0x1b  # ESC
-                        cancel(cts)
-                        cancelled[] = true
-                        printstyled("\nTest run cancelled (ESC).\n"; color=:yellow)
-                        break
-                    end
-                end
-                sleep(0.05)
-            end
-        finally
-            if raw_set
-                try
-                    Base.stop_reading(stdin)
-                    ccall(:jl_tty_set_mode, Int32, (Ptr{Nothing}, Int32), term.handle, Int32(0))  # normal mode
-                catch
-                end
-            end
-        end
+        # Both :completed and :cancelled wait, so every line the run prints lands
+        # before the REPL draws its prompt.
+        _settle(test_task)
 
-        # Retrieve run ID from return value (run_tests returns testrun_id when return_results=false)
-        if !cancelled[]
-            raw = try
-                fetch(test_task)
-            catch e
-                e
-            end
-            if raw isa String
-                _last_run_id[] = raw
-                result = get_run_result(raw)
-                if result !== nothing
-                    _last_result[] = result
-                end
-            elseif raw isa Exception
-                # Store run ID even if errored
-                last_id = get_last_run_id()
-                if last_id !== nothing
-                    _last_run_id[] = last_id
-                    result = get_run_result(last_id)
-                    if result !== nothing
-                        _last_result[] = result
-                    end
-                end
-                throw(raw)
-            end
-        else
-            # Still retrieve the run ID even if cancelled
-            last_id = get_last_run_id()
-            if last_id !== nothing
-                _last_run_id[] = last_id
-                result = get_run_result(last_id)
-                if result !== nothing
-                    _last_result[] = result
-                end
-            end
+        raw = try
+            fetch(test_task)
+        catch e
+            e
         end
+        _remember_run(raw)
+        raw isa Exception && throw(raw)
     catch e
         if e isa InterruptException
             cancel(cts)
             printstyled("\nTest run cancelled.\n"; color=:yellow)
+            _settle(test_task)
+            _remember_run()
         else
             rethrow()
         end
@@ -1638,11 +1942,6 @@ end
 
 function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     _check_bg_completion()
-
-    if _bg_run[] !== nothing && !istaskdone(_bg_run[].task)
-        printstyled("A background run is already active. Use 'test cancel' first.\n"; color=:yellow)
-        return nothing
-    end
 
     local path, run_kwargs
     try
@@ -1657,21 +1956,55 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
     run_kwargs[:progress_ui] = :none
     run_kwargs[:print_summary] = false
     run_kwargs[:print_failed_results] = false
+    run_kwargs[:max_workers] = _worker_budget(get(run_kwargs, :max_workers, nothing))
 
-    bg = BackgroundRun(
-        _spawn_bg() do
-            try
-                run_tests(path; run_kwargs...)
-            catch e
-                e
-            end
-        end,
-        cts,
-        nothing,
-        nothing,
-        time(),
-    )
+    # The id is learned from the run itself rather than guessed afterwards, so
+    # starting several runs in quick succession still labels each handle right.
+    id_slot = Channel{String}(1)
+    task = _spawn_bg() do
+        try
+            run_tests(path; on_registered=id -> put!(id_slot, id), run_kwargs...)
+        catch e
+            e
+        end
+    end
 
+    run_id = _await_run_id(id_slot, task)
+    if run_id === nothing
+        printstyled("The run failed to start.\n"; color=:red)
+        return nothing
+    end
+
+    _register_background_run(BackgroundRun(run_id, task, cts, nothing, nothing, time(), false))
+    printstyled("Test run #$run_id started in background.\n"; color=:green)
+    println("  'test status' to check on it, 'test attach $run_id' to watch it.")
+    nothing
+end
+
+"""
+    _await_run_id(id_slot, task) -> String | nothing
+
+Block until the run announces its id, or until the task dies trying. The id is
+minted before any work starts, so this returns almost immediately in practice.
+"""
+function _await_run_id(id_slot::Channel{String}, task::Task; timeout::Float64=30.0)
+    t0 = time()
+    while time() - t0 < timeout
+        isready(id_slot) && return take!(id_slot)
+        istaskdone(task) && return isready(id_slot) ? take!(id_slot) : nothing
+        sleep(0.01)
+    end
+    return nothing
+end
+
+"""
+    _register_background_run(bg)
+
+Record `bg` as a background run and spawn the task that harvests its result when
+it finishes. Shared by `test run --bg` and by backgrounding a foreground run with
+`b`, so both end up in exactly the same state.
+"""
+function _register_background_run(bg::BackgroundRun)
     _spawn_bg() do
         raw = try
             fetch(bg.task)
@@ -1680,127 +2013,204 @@ function cmd_run_bg(args; juliaup_channel::Union{Nothing,String}=nothing)
         end
         if raw isa Exception
             bg.error = raw
-        elseif raw isa TestrunResult
-            bg.result = raw
-            _last_result[] = raw
-        elseif raw isa String
-            # return_results=true returns TestrunResult, but capture run ID too
-            _last_run_id[] = raw
-            result = get_run_result(raw)
-            if result !== nothing
-                bg.result = result
-                _last_result[] = result
-            end
+        else
+            # Resolve through the id this handle owns, not through whichever run
+            # happens to have finished most recently.
+            result = get_run_result(bg.run_id)
+            result !== nothing && (bg.result = result)
         end
     end
 
-    _bg_run[] = bg
-    # Retrieve the run ID (it was just created by run_tests)
-    last_id = get_last_run_id()
-    if last_id !== nothing
-        _last_run_id[] = last_id
+    lock(_bg_runs_lock) do
+        _bg_runs[bg.run_id] = bg
     end
-    id_str = _last_run_id[] !== nothing ? " #$(_last_run_id[])" : ""
-    printstyled("Test run$(id_str) started in background.\n"; color=:green)
-    nothing
+    _last_run_id[] = bg.run_id
+    return bg
 end
 
 """
-    _print_threading_status()
+    _detach_to_background(run_id, test_task, cts)
 
-Report the thread configuration and where the reactor actually landed, so a
-misscheduled reactor is visible rather than merely slow.
+Hand an in-flight foreground run over to the background. The run is already
+silent by the time this is called — `_watch_run` detached its presentation on the
+keypress — so this only has to make it discoverable to `test status`,
+`test results` and `test attach`.
 """
-function _print_threading_status()
-    println("Threads: $(Threads.nthreads(:default)) default, $(Threads.nthreads(:interactive)) interactive")
-    runner = _g_runner[]
-    if runner !== nothing && runner.reactor_task !== nothing
-        t = runner.reactor_task
-        println("Reactor: :$(Threads.threadpool(t)) pool, $(istaskdone(t) ? "stopped" : "running")")
+function _detach_to_background(run_id::Union{Nothing,String}, test_task::Task, cts::CancellationTokenSource)
+    if run_id === nothing
+        printstyled("\nCannot background a run that has not registered yet.\n"; color=:yellow)
+        return nothing
     end
+    _register_background_run(BackgroundRun(run_id, test_task, cts, nothing, nothing, time(), false))
+    printstyled("\nTest run #$run_id moved to the background.\n"; color=:cyan)
+    println("  'test status' to check on it, 'test attach $run_id' to come back to it.")
     return nothing
 end
 
-function cmd_status()
-    _print_threading_status()
-    _check_bg_completion()
-    bg = _bg_run[]
-    if bg === nothing
-        println("No background test run.")
+"""
+    cmd_attach(args)
+
+Put the terminal back into the state a background run would have been in had it
+been started in the foreground: progress on screen, Esc to cancel, `b` to detach
+again.
+
+The run is unaffected either way — attaching only swaps its presentation back on.
+"""
+function cmd_attach(args=String[])
+    bg = _resolve_active_run(args, "attach")
+    bg === nothing && return nothing
+    run_id = bg.run_id
+
+    if istaskdone(bg.task)
+        bg.reported = true
+        printstyled("Run #$run_id has already finished.\n"; color=:yellow)
+        return cmd_results([run_id])
+    end
+
+    ctx = get_run_context(run_id)
+    if ctx === nothing
+        # Registered in the history but not yet dispatching, or already torn
+        # down between the checks above and here.
+        println("Run #$run_id is not reporting progress yet; try 'test status'.")
         return nothing
     end
 
-    elapsed = round(time() - bg.start_time; digits=1)
-    if istaskdone(bg.task)
-        if bg.error !== nothing
-            printstyled("Background run errored"; color=:red, bold=true)
-            println(" after $(elapsed)s: $(bg.error)")
+    # Exactly one run may render at a time: the drain task is the only writer to
+    # the terminal while a run is in flight, and that invariant is per-context.
+    for other in active_background_runs()
+        other.run_id == run_id && continue
+        octx = get_run_context(other.run_id)
+        octx === nothing || detach!(octx.pres)
+    end
+
+    # A fresh bar, picking up at the count already reached. The old one belonged
+    # to a terminal state that is long gone.
+    p = _make_progress_bar(ctx.n_total; start=completed_count(ctx))
+    ctx.pres.render = _bar_renderer(ctx, p)
+    ctx.pres.show_summary = true
+    ctx.pres.show_failures = true
+    ctx.pres.mode = :bar
+    _last_run_id[] = run_id
+
+    printstyled("Attached to test run #$run_id"; color=:cyan)
+    println(" ($(completed_count(ctx))/$(ctx.n_total) done)")
+    _print_run_keys()
+
+    outcome = _watch_run(bg.task, bg.cts, ctx.pres)
+    if outcome === :detached
+        printstyled("\nLeft running in the background.\n"; color=:cyan)
+        return nothing
+    end
+    _settle(bg.task)
+    _remember_run()
+    return nothing
+end
+
+"Print the keys accepted while a run is on screen."
+function _print_run_keys()
+    printstyled("  Esc"; color=:cyan, bold=true)
+    printstyled(" cancel"; color=:light_black)
+    printstyled("   b"; color=:cyan, bold=true)
+    printstyled(" background\n"; color=:light_black)
+    return nothing
+end
+
+"""
+    _run_progress(bg) -> (done, total, parts)
+
+Progress for one background run, resolved through *its own* context. Looking this
+up via the global "most recent run" pointer reports another run's numbers as soon
+as more than one is in flight.
+"""
+function _run_progress(bg::BackgroundRun)
+    ctx = get_run_context(bg.run_id)
+    if ctx === nothing
+        # Finished or not yet dispatching: fall back to the recorded result.
+        result = get_run_result(bg.run_id)
+        result === nothing && return (0, 0, String[])
+        done = sum(length(ti.profiles) for ti in result.testitems; init=0)
+        return (done, done, String[])
+    end
+    lock(ctx.lock) do
+        parts = String[]
+        ctx.count_success > 0 && push!(parts, "\e[32m$(ctx.count_success) passed\e[0m")
+        ctx.count_fail > 0 && push!(parts, "\e[31m$(ctx.count_fail) failed\e[0m")
+        ctx.count_error > 0 && push!(parts, "\e[31m$(ctx.count_error) errored\e[0m")
+        ctx.count_skipped > 0 && push!(parts, "$(ctx.count_skipped) skipped")
+        return (completed_count(ctx), ctx.n_total, parts)
+    end
+end
+
+function cmd_status()
+    _check_bg_completion()
+    active = active_background_runs()
+    if isempty(active)
+        println("No test runs in progress.")
+        println("  'test history' for past runs, 'test run --bg' to start one.")
+        return nothing
+    end
+
+    printstyled("Active runs:\n\n"; bold=true)
+    printstyled("  $(rpad("#", 6))$(rpad("Elapsed", 10))$(rpad("Progress", 12))Detail\n"; bold=true)
+    printstyled("  $(repeat("─", 60))\n"; color=:light_black)
+    for bg in active
+        done, total, parts = _run_progress(bg)
+        elapsed = _format_elapsed(time() - bg.start_time)
+        progress = total > 0 ? "$done/$total" : "$done"
+        # All items reported but the task is still unwinding — saying "in
+        # progress" next to a full count reads as a contradiction.
+        detail = if total > 0 && done >= total
+            isempty(parts) ? "finishing…" : "finishing… — $(join(parts, ", "))"
         else
-            printstyled("Background run completed"; color=:green, bold=true)
-            println(" in $(elapsed)s. Use 'test results' to see details.")
+            isempty(parts) ? "" : join(parts, ", ")
         end
+        print("  $(rpad(bg.run_id, 6))$(rpad(elapsed, 10))$(rpad(progress, 12))")
+        println(detail)
+    end
+    println()
+    n = length(active)
+    if n == 1
+        println("1 run active. 'test attach' to watch it, 'test cancel' to stop it.")
     else
-        printstyled("Background run in progress"; color=:yellow, bold=true)
-        println(" ($(elapsed)s elapsed)")
-
-        # Show progress details from live snapshot
-        run_id = _last_run_id[]
-        if run_id !== nothing
-            result = get_run_result(run_id)
-            if result !== nothing
-                n_passed = 0; n_failed = 0; n_errored = 0; n_skipped = 0
-                for ti in result.testitems
-                    for prof in ti.profiles
-                        if prof.status == :passed;  n_passed += 1
-                        elseif prof.status == :failed;  n_failed += 1
-                        elseif prof.status == :errored; n_errored += 1
-                        elseif prof.status == :skipped; n_skipped += 1
-                        end
-                    end
-                end
-                done = n_passed + n_failed + n_errored + n_skipped
-                # Try to get total from run history
-                history = get_run_history()
-                rec = nothing
-                for r in history
-                    if r.id == run_id
-                        rec = r
-                        break
-                    end
-                end
-
-                parts = String[]
-                n_passed > 0 && push!(parts, "\e[32m$(n_passed) passed\e[0m")
-                n_failed > 0 && push!(parts, "\e[31m$(n_failed) failed\e[0m")
-                n_errored > 0 && push!(parts, "\e[31m$(n_errored) errored\e[0m")
-                n_skipped > 0 && push!(parts, "$(n_skipped) skipped")
-                detail = isempty(parts) ? "" : " — $(join(parts, ", "))"
-                println("  Progress: $done completed$detail")
-            end
-        end
+        println("$n runs active. 'test attach <id>' to watch one, 'test cancel <id>' to stop one.")
     end
     nothing
 end
 
-function cmd_cancel(args=String[])
+"""
+    _resolve_active_run(args, verb) -> BackgroundRun | nothing
+
+Pick the run a command should act on: the named one, or the only active one when
+no id is given. With several in flight an id is required rather than guessed —
+picking "the most recent" would silently act on the wrong run.
+"""
+function _resolve_active_run(args, verb::AbstractString)
     if !isempty(args)
-        # Cancel by run ID
-        id = args[1]
-        if cancel_run(id)
-            printstyled("Cancel requested for run $id.\n"; color=:yellow)
-        else
-            println("No active run found with id '$id'.")
-        end
+        bg = find_background_run(String(args[1]))
+        bg === nothing && println("No background run matching '$(args[1])'.")
+        return bg
+    end
+    active = active_background_runs()
+    if isempty(active)
+        println("No background test run to $verb.")
+        return nothing
+    elseif length(active) > 1
+        ids = join(("#" * b.run_id for b in active), ", ")
+        println("$(length(active)) runs are active ($ids). Say which: 'test $verb <id>'.")
         return nothing
     end
+    return only(active)
+end
 
-    bg = _bg_run[]
-    if bg === nothing || istaskdone(bg.task)
-        println("No active background run to cancel.")
+function cmd_cancel(args=String[])
+    bg = _resolve_active_run(args, "cancel")
+    bg === nothing && return nothing
+    if istaskdone(bg.task)
+        println("Run #$(bg.run_id) has already finished.")
         return nothing
     end
     cancel(bg.cts)
-    printstyled("Background run cancel requested.\n"; color=:yellow)
+    printstyled("Cancel requested for run #$(bg.run_id).\n"; color=:yellow)
     nothing
 end
 
@@ -1998,9 +2408,9 @@ function cmd_processes()
     end
 
     printstyled("Active test processes:\n\n"; bold=true)
-    printstyled("  $(rpad("ID", 38))$(rpad("Package", 30))Status\n"; bold=true)
-    printstyled("  $(repeat("─", 78))\n"; color=:light_black)
-    for p in procs
+    printstyled("  $(rpad("ID", 10))$(rpad("Package", 24))$(rpad("Status", 12))Uptime\n"; bold=true)
+    printstyled("  $(repeat("─", 56))\n"; color=:light_black)
+    for p in sort(procs; by=x -> x.started_at)
         status_color = if p.status == "Running"
             :green
         elseif p.status == "Idle"
@@ -2010,11 +2420,12 @@ function cmd_processes()
         else
             :default
         end
-        print("  $(rpad(p.id, 38))$(rpad(p.package_name, 30))")
-        printstyled("$(p.status)\n"; color=status_color)
+        print("  $(rpad(short_id(p.id), 10))$(rpad(p.package_name, 24))")
+        printstyled("$(rpad(p.status, 12))"; color=status_color)
+        println(_format_elapsed(time() - p.started_at))
     end
     println()
-    println("$(length(procs)) process(es) active.")
+    println("$(length(procs)) process(es) active. Ids are shortened; prefixes work in 'test kill' and 'test log'.")
     nothing
 end
 # ── Display helpers ──────────────────────────────────────────────────────
@@ -2183,16 +2594,29 @@ function cmd_history(args)
 end
 # ── Helpers ───────────────────────────────────────────────────────────
 
+"""
+    _check_bg_completion()
+
+Announce any background run that has finished since the last command, once each.
+Called at the top of the interactive commands, so completion surfaces without the
+user having to poll.
+"""
 function _check_bg_completion()
-    bg = _bg_run[]
-    if bg !== nothing && istaskdone(bg.task)
-        if bg.result !== nothing && bg.error === nothing
-            elapsed = round(time() - bg.start_time; digits=1)
-            printstyled("Background run completed in $(elapsed)s. Use 'test results' to see details.\n"; color=:green)
-        elseif bg.error !== nothing
-            printstyled("Background run errored: $(bg.error)\n"; color=:red)
+    for bg in background_runs()
+        (bg.reported || !istaskdone(bg.task)) && continue
+        if bg.error !== nothing
+            bg.reported = true
+            printstyled("Test run #$(bg.run_id) errored: $(bg.error)\n"; color=:red)
+        elseif bg.result !== nothing
+            bg.reported = true
+            elapsed = _format_elapsed(time() - bg.start_time)
+            printstyled("Test run #$(bg.run_id) finished in $elapsed."; color=:green)
+            println(" 'test results $(bg.run_id)' for details.")
         end
+        # Neither set yet: the task is done but the harvester has not stored the
+        # result. Stay unreported so the next command announces it.
     end
+    return nothing
 end
 
 # ── Lint ──────────────────────────────────────────────────────────────
@@ -2407,7 +2831,7 @@ struct DevREPLCompletionProvider <: REPL.LineEdit.CompletionProvider end
 
 const _TOP_COMMANDS = ["test", "lint", "format", "help"]
 const _TEST_SUBCOMMANDS = ["run", "pick", "failed", "repeat", "list", "results",
-    "failures", "history", "status", "cancel", "procs", "kill", "log"]
+    "failures", "history", "status", "attach", "cancel", "procs", "kill", "log"]
 const _TEST_RUN_FLAGS = ["--name=", "--tags=", "--workers=", "--timeout=", "--coverage", "--bg"]
 const _RESULTS_FLAGS = ["--name=", "--verbose", "--output"]
 
@@ -2553,6 +2977,8 @@ function _dispatch_test(args)
         return cmd_rerun()
     elseif sub == "failed"
         return cmd_run_failed()
+    elseif sub == "attach"
+        return cmd_attach(rest)
     elseif sub == "failures"
         return cmd_failures()
     elseif sub in ("list", "ls")
@@ -2588,17 +3014,36 @@ end
     precompiledata_path = joinpath(@__DIR__, "..", "precompiledata")
 
     @compile_workload begin
-        run_tests(
-            precompiledata_path;
-            return_results=true,
-            print_summary=false,
-            print_failed_results=false,
-            progress_ui=:log,
-            max_workers=1,
-            timeout=60,
-            fail_on_detection_error=false,
-        )
-        kill_test_processes()
+        # Pkg shows precompilation output live, so the workload must stay silent.
+        # Two separate channels have to be closed:
+        #
+        #  * Logging — `ModuleFilterLogger` is installed in `__init__`, which
+        #    does not run during precompilation, and the `ConsoleLogger` inside
+        #    `run_tests` is task-local and created *after* the reactor task, so
+        #    it never covers the reactor's own `@info` calls. A null logger
+        #    installed here does, because `get_runner()` runs underneath it and
+        #    the reactor task inherits its logger at creation.
+        #  * stdout/stderr — the progress renderer prints directly, and the
+        #    default logger holds the original stderr handle rather than looking
+        #    the binding up each time.
+        #
+        # `progress_ui=:log` stays on purpose: redirecting keeps the renderer in
+        # the workload, where `:none` would buy silence by not compiling it.
+        Logging.with_logger(Logging.NullLogger()) do
+            redirect_stdio(; stdout=devnull, stderr=devnull) do
+                run_tests(
+                    precompiledata_path;
+                    return_results=true,
+                    print_summary=false,
+                    print_failed_results=false,
+                    progress_ui=:log,
+                    max_workers=1,
+                    timeout=60,
+                    fail_on_detection_error=false,
+                )
+                kill_test_processes()
+            end
+        end
     end
 end
 
