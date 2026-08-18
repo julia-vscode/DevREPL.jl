@@ -5,14 +5,18 @@ module DevREPL
 # support the packagedef format).
 using ReplMaker
 import ProgressMeter
-import TestItemControllers
-using TestItemControllers: TestItemController, ControllerCallbacks
-using TestItemControllers.CancellationTokens: CancellationTokenSource, CancellationToken,
+import TestItemRuns
+using TestItemRuns: TestSession, TestRun, RunProfile, ProcessInfo, discover_testitems, select,
+    run_async!, cancel!, snapshot, run_progress, list_runs, get_run, list_processes,
+    terminate_process!, terminate_all_processes!, process_output, subscribe!, unsubscribe!,
+    RunEvent, RunStarted, TestItemFinished, OutputAppended, ProcessStatusChanged, RunFinished,
+    TestrunResult, TestrunResultTestitem, TestrunResultTestitemProfile, TestrunResultMessage,
+    TestrunResultDefinitionError
+using TestItemRuns.CancellationTokens: CancellationTokenSource, CancellationToken,
     cancel, get_token, is_cancellation_requested
-using AutoHashEquals: @auto_hash_equals
 using JuliaWorkspaces
 using JuliaWorkspaces.URIs2: URI, filepath2uri, uri2filepath
-using TestItemControllers.JSON
+import JSON
 using PrecompileTools: @compile_workload, @setup_workload
 using Logging
 using Dates
@@ -21,6 +25,8 @@ import REPL.TerminalMenus
 import InteractiveUtils
 
 # ── Logging filter (suppress TestItemControllers below Warn) ──────────
+
+const TestItemControllers = TestItemRuns.TestItemControllers
 
 struct ModuleFilterLogger <: AbstractLogger
     wrapped::AbstractLogger
@@ -73,7 +79,8 @@ end
 #     `:default` was starved to a median 288-447ms wakeup (max ~1.2s) while user
 #     work ran, against 0ms median / ≤1ms max in `:interactive`.
 #
-# Hence: CPU-bound work to `:default`, the I/O-bound reactor to `:interactive`.
+# Hence: CPU-bound work to `:default`, the I/O-bound reactor to `:interactive`
+# (which is where `TestSession(; reactor_pool=:interactive)` puts it).
 # Both hold with a stock `julia` — no `-t` flag is needed, because the reactor
 # is always parked on a channel and so never occupies the thread it sits on.
 #
@@ -81,22 +88,8 @@ end
 # that occupies thread 1 by definition and stalls the event loop process-wide.
 # No threadpool choice reaches it.
 
-"""
-    _spawn_reactor(f)
-
-Run `f()` on the `:interactive` threadpool: for tasks that spend their life
-blocked on a channel or socket and must wake promptly even while the user's own
-parallel code saturates `:default`.
-
-Only for work that is genuinely I/O-bound. Interactive tasks may be scheduled
-onto thread 1, so CPU-bound work here would stall the process-wide event loop —
-use [`_spawn_bg`](@ref) for that.
-"""
-function _spawn_reactor(f)
-    t = Threads.@spawn :interactive f()
-    Base.errormonitor(t)
-    return t
-end
+# The I/O-bound TestItemControllers reactor is placed on `:interactive` by
+# `TestSession(; reactor_pool=:interactive)`.
 
 """
     _spawn_bg(f)
@@ -133,83 +126,15 @@ function _await_bg(f)
     end
 end
 
-# ── Public types (inlined from TestItemRunnerCore) ────────────────────
-
-@auto_hash_equals struct RunProfile
-    name::String
-    coverage::Bool
-    env::Dict{String,Any}
-end
-
-struct ProcessInfo
-    id::String
-    package_name::String
-    status::String
-    # When the controller told us the process was being created. The controller
-    # does not track a launch time, but this is close enough to show uptime.
-    started_at::Float64
-end
-
-struct TestrunResultMessage
-    message::String
-    uri::URI
-    line::Int
-    column::Int
-end
-
-struct TestrunResultTestitemProfile
-    profile_name::String
-    status::Symbol
-    duration::Union{Float64,Missing}
-    messages::Union{Vector{TestrunResultMessage},Missing}
-    output::Union{String,Missing}
-end
-
-struct TestrunResultTestitem
-    name::String
-    uri::URI
-    profiles::Vector{TestrunResultTestitemProfile}
-end
-
-struct TestrunResultDefinitionError
-    message::String
-    uri::URI
-    line::Int
-    column::Int
-end
-
-struct TestrunResult
-    definition_errors::Vector{TestrunResultDefinitionError}
-    testitems::Vector{TestrunResultTestitem}
-    process_outputs::Dict{String,String}
-end
-
-# ── Per-run context (keyed by testrun_id) ─────────────────────────────
-
-# ── Progress events ───────────────────────────────────────────────────
+# ── Types ─────────────────────────────────────────────────────────────
 #
-# Controller callbacks run inline on the TestItemControllers reactor task, which
-# now lives on a different thread than the REPL. They must therefore neither
-# touch shared run state nor write to the terminal. Instead they push one of
-# these events, and a single drain task per test run applies them and owns all
-# rendering — keeping exactly one writer to both `RunContext` and stdout.
+# Test discovery, execution, run history, process management and results all
+# come from TestItemRuns; DevREPL adds the REPL presentation on top. `RunProfile`,
+# `ProcessInfo`, `TestRun` and the `TestrunResult*` types are TestItemRuns' own.
 
-struct TestItemEvent
-    kind::Symbol            # :passed, :failed, :errored or :skipped
-    testitem_id::String
-    test_env_id::String
-    messages::Any
-    duration::Any
-end
-
-struct OutputEvent
-    testitem_id::String
-    output::String
-end
-
-struct ProcessLaunchingEvent end
-
-const ProgressEvent = Union{TestItemEvent,OutputEvent,ProcessLaunchingEvent}
+# `uri2filepath` on the string uris carried by TestItemRuns' results.
+_fp(uri::AbstractString) = something(uri2filepath(URI(uri)), String(uri))
+_fp(uri::URI) = something(uri2filepath(uri), string(uri))
 
 """
     RunPresentation
@@ -228,10 +153,11 @@ mutable struct RunPresentation
     show_summary::Bool
     show_failures::Bool
     render::Function
+    launch_header_printed::Bool
 end
 
 RunPresentation(mode::Symbol; show_summary::Bool=false, show_failures::Bool=false) =
-    RunPresentation(mode, show_summary, show_failures, () -> nothing)
+    RunPresentation(mode, show_summary, show_failures, () -> nothing, false)
 
 "Silence a run without stopping it — used when detaching to the background."
 function detach!(pres::RunPresentation)
@@ -241,406 +167,112 @@ function detach!(pres::RunPresentation)
     return pres
 end
 
-mutable struct RunContext
-    testitems_by_id::Dict{String,TestItemControllers.TestItemDetail}
-    environments::Vector{RunProfile}
-    profiles_by_env_id::Dict{String,RunProfile}
-    environment_name::String
+_seconds_between(a::DateTime, b::DateTime) = Dates.value(b - a) / 1000
+
+# The presentation of a run, stored on the run itself so `test attach` can find it.
+_presentation(run::TestRun) = get(run.metadata, "pres", nothing)::Union{Nothing,RunPresentation}
+_run_path(run::TestRun) = get(run.metadata, "path", "")::String
+
+"""
+    RunRenderer
+
+The event sink of one run. It reads the run's `RunPresentation` on every event, so
+a detach from the REPL task (or an attach with a fresh progress bar) takes effect
+on the next event without touching the run.
+"""
+struct RunRenderer
+    run::TestRun
     pres::RunPresentation
-    count_success::Int
-    count_fail::Int
-    count_error::Int
-    count_skipped::Int
-    n_total::Int
-    responses::Vector{Any}
-    outputs::Dict{String,Vector{String}}
-    launch_header_printed::Bool
-    events::Channel{ProgressEvent}
-    lock::ReentrantLock
 end
 
-"Number of test items that have reported a result so far."
-completed_count(ctx::RunContext) =
-    ctx.count_success + ctx.count_fail + ctx.count_error + ctx.count_skipped
+(r::RunRenderer)(::RunEvent) = nothing
 
-"""
-    emit!(ctx, event)
-
-Push a progress event from the reactor task. Never blocks (the channel is
-unbounded) and never throws: a run whose channel has already been closed can
-still have late events in flight, and dropping those is correct.
-"""
-function emit!(ctx::RunContext, event::ProgressEvent)
-    try
-        put!(ctx.events, event)
-    catch
-        # Channel closed — the run is already being torn down.
-    end
-    return nothing
-end
-
-# ── Run history ───────────────────────────────────────────────────────
-
-mutable struct TestrunRecord
-    id::String
-    start_time::Float64
-    end_time::Union{Nothing,Float64}
-    status::Symbol  # :running, :completed, :cancelled, :errored
-    result::Union{Nothing,TestrunResult}
-    path::String
-    cts::Union{Nothing,CancellationTokenSource}
-end
-
-# ── Runner state singleton ────────────────────────────────────────────
-
-mutable struct TestItemRunner
-    controller::TestItemController
-    lock::ReentrantLock
-    run_contexts::Dict{String,RunContext}
-    processes::Dict{String,ProcessInfo}
-    process_outputs::Dict{String,Vector{String}}
-    env_package_names::Dict{String,String}  # test_env_id => package_name
-    run_history::Vector{TestrunRecord}
-    run_counter::Ref{Int}
-    max_history::Int
-    reactor_task::Union{Nothing,Task}
-end
-
-function TestItemRunner(controller::TestItemController; max_history::Int=20)
-    TestItemRunner(
-        controller,
-        ReentrantLock(),
-        Dict{String,RunContext}(),
-        Dict{String,ProcessInfo}(),
-        Dict{String,Vector{String}}(),
-        Dict{String,String}(),
-        Vector{TestrunRecord}(),
-        Ref(0),
-        max_history,
-        nothing,
-    )
-end
-
-const _g_runner = Ref{Union{Nothing,TestItemRunner}}(nothing)
-const _g_runner_lock = ReentrantLock()
-
-function get_run_context(testrun_id::String)
-    runner = get_runner()
-    lock(runner.lock) do
-        get(runner.run_contexts, testrun_id, nothing)
-    end
-end
-
-function get_active_processes()
-    runner = get_runner()
-    lock(runner.lock) do
-        collect(values(runner.processes))
-    end
-end
-
-function get_run_history()
-    runner = get_runner()
-    lock(runner.lock) do
-        copy(runner.run_history)
-    end
-end
-
-function get_active_runs()
-    runner = get_runner()
-    lock(runner.lock) do
-        filter(r -> r.status == :running, runner.run_history)
-    end
-end
-
-function cancel_run(id::String)
-    runner = get_runner()
-    lock(runner.lock) do
-        idx = findfirst(r -> r.id == id || startswith(r.id, id), runner.run_history)
-        if idx !== nothing
-            rec = runner.run_history[idx]
-            if rec.status == :running && rec.cts !== nothing
-                cancel(rec.cts)
-                return true
-            end
-        end
-        return false
-    end
-end
-
-function get_last_run_id()
-    runner = get_runner()
-    lock(runner.lock) do
-        isempty(runner.run_history) ? nothing : runner.run_history[1].id
-    end
-end
-
-function get_run_result(id::String)
-    runner = get_runner()
-    cached = lock(runner.lock) do
-        idx = findfirst(r -> r.id == id, runner.run_history)
-        idx === nothing && return nothing
-        runner.run_history[idx].result
-    end
-    cached !== nothing && return cached
-    # If still running, build a snapshot from the live RunContext
-    ctx = lock(runner.lock) do
-        get(runner.run_contexts, id, nothing)
-    end
-    ctx === nothing && return nothing
-    _build_result_from_context(runner, id, ctx)
-end
-
-# ── Progress event drain ──────────────────────────────────────────────
-
-"""
-    _apply_event!(ctx, event)
-
-Apply one progress event: update run state under `ctx.lock`, then render. Only
-ever called from the run's drain task, so it is the single writer to both.
-"""
-function _apply_event!(ctx::RunContext, ev::TestItemEvent)
-    testitem = ctx.testitems_by_id[ev.testitem_id]
-    lock(ctx.lock) do
-        if ev.kind === :passed
-            ctx.count_success += 1
-        elseif ev.kind === :failed
-            ctx.count_fail += 1
-        elseif ev.kind === :errored
-            ctx.count_error += 1
-        else
-            ctx.count_skipped += 1
-        end
-        push!(ctx.responses, (
-            testitem = testitem,
-            testenvironment = get(ctx.profiles_by_env_id, ev.test_env_id, ctx.environments[1]),
-            result = (status=ev.kind, messages=ev.messages, duration=ev.duration),
-        ))
-    end
-
+function (r::RunRenderer)(ev::TestItemFinished)
     # Read the mode once: a detach from the REPL task can flip it underneath us.
-    mode = ctx.pres.mode
+    mode = r.pres.mode
     if mode === :log
-        glyph = ev.kind === :passed ? "✓" : ev.kind === :skipped ? "⊘" : "✗"
-        duration_string = ev.duration !== missing ? " ($(ev.duration)ms)" : ""
-        println("$glyph $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → $(ev.kind)$duration_string")
+        glyph = ev.status === :passed ? "✓" : ev.status === :skipped ? "⊘" : "✗"
+        duration_string = ev.duration !== nothing ? " ($(ev.duration)ms)" : ""
+        println("$glyph $(ev.profile) $(ev.item.filename):$(ev.item.name) → $(ev.status)$duration_string")
     elseif mode === :bar
-        ctx.pres.render()
+        r.pres.render()
     end
     return nothing
 end
 
-function _apply_event!(ctx::RunContext, ev::OutputEvent)
-    lock(ctx.lock) do
-        push!(get!(() -> String[], ctx.outputs, ev.testitem_id), ev.output)
-    end
-    return nothing
-end
-
-function _apply_event!(ctx::RunContext, ::ProcessLaunchingEvent)
-    ctx.pres.mode === :bar || return nothing
-    if !ctx.launch_header_printed
-        ctx.launch_header_printed = true
+function (r::RunRenderer)(ev::ProcessStatusChanged)
+    ev.status == "Launching" || return nothing
+    r.pres.mode === :bar || return nothing
+    if !r.pres.launch_header_printed
+        r.pres.launch_header_printed = true
         printstyled("  Launching test processes"; color=:cyan)
     end
     printstyled("."; color=:cyan)
     return nothing
 end
 
-"""
-    _drain_events!(ctx)
+# ── Session singleton ─────────────────────────────────────────────────
 
-Consume `ctx.events` until it is closed. Runs as its own task for the lifetime
-of a test run; `run_tests` closes the channel and waits for this to return
-before reading the accumulated results.
-"""
-function _drain_events!(ctx::RunContext)
-    for ev in ctx.events
-        try
-            _apply_event!(ctx, ev)
-        catch err
-            err isa InterruptException && rethrow()
-            @debug "Failed to apply progress event" exception=(err, catch_backtrace())
-        end
-    end
-    return nothing
-end
-
-function _build_result_from_context(runner::TestItemRunner, testrun_id::String, ctx::RunContext)
-    # Snapshot under ctx.lock: the drain task may still be appending.
-    testitem_outputs, responses = lock(ctx.lock) do
-        (Dict(k => copy(v) for (k, v) in ctx.outputs), copy(ctx.responses))
-    end
-    collected_process_outputs = lock(runner.lock) do
-        Dict{String,String}(pid => join(chunks) for (pid, chunks) in runner.process_outputs)
-    end
-    testitems = TestrunResultTestitem[
-        TestrunResultTestitem(
-            ti.testitem.label,
-            URI(ti.testitem.uri),
-            [TestrunResultTestitemProfile(
-                ti.testenvironment.name,
-                ti.result.status,
-                ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
-                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
-            )]
-        ) for ti in responses
-    ]
-    TestrunResult(TestrunResultDefinitionError[], testitems, collected_process_outputs)
-end
+const _g_session = Ref{Union{Nothing,TestSession}}(nothing)
+const _g_session_lock = ReentrantLock()
+const _run_counter = Ref(0)
 
 """
-    _finish_record!(runner, testrun_id, status)
+    get_session() -> TestSession
 
-Stamp a run's terminal state. Every path out of `run_tests` goes through here, so
-`end_time` is always set and `cmd_history` can always show a duration.
-
-`status` is one of `:completed`, `:cancelled` or `:errored`. Before this existed
-`:completed` was written unconditionally, which reported a cancelled run as a
-successful one; and a run that threw never reached the stamp at all, leaving the
-record `:running` forever — which `_prune_history!` then refused to evict.
+The process-wide test session: one controller and one pool of test processes,
+reused across `test run` invocations. Created lazily; `kill_test_processes` empties
+the pool but keeps the session.
 """
-function _finish_record!(runner::TestItemRunner, testrun_id::String, status::Symbol;
-                         result::Union{Nothing,TestrunResult}=nothing)
-    _release_workers!(testrun_id)
-    lock(runner.lock) do
-        idx = findfirst(r -> r.id == testrun_id, runner.run_history)
-        idx === nothing && return nothing
-        rec = runner.run_history[idx]
-        result !== nothing && (rec.result = result)
-        rec.status = status
-        rec.end_time = time()
-        return nothing
-    end
-end
-
-"""
-    _run_outcome(token) -> :completed | :cancelled
-
-Cancellation returns *normally* from `execute_testrun` — the controller puts
-`nothing` on the completion channel, which is indistinguishable from a clean
-finish with no coverage — so the token is the only thing that can tell them
-apart.
-"""
-_run_outcome(token) =
-    token !== nothing && is_cancellation_requested(token) ? :cancelled : :completed
-
-function _prune_history!(runner::TestItemRunner)
-    while length(runner.run_history) > runner.max_history
-        idx = findlast(r -> r.status != :running, runner.run_history)
-        idx === nothing && break
-        deleteat!(runner.run_history, idx)
-    end
-end
-
-function terminate_process(id::String)
-    if _g_runner[] !== nothing
-        TestItemControllers.terminate_test_process(_g_runner[].controller, id)
-    end
-end
-
-# ── Runner initialization ─────────────────────────────────────────────
-
-function get_runner()
-    _g_runner[] !== nothing && return _g_runner[]
-    lock(_g_runner_lock) do
-        _g_runner[] !== nothing && return _g_runner[]
-
-        callbacks = TestItemControllers.ControllerCallbacks(
-            on_testitem_started = (testrun_id, testitem_id, test_env_id) -> nothing,
-            # These run on the reactor task: emit an event and return immediately.
-            # All state mutation and rendering happens on the run's drain task.
-            on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration) -> begin
-                ctx = get_run_context(testrun_id)
-                ctx === nothing && return
-                emit!(ctx, TestItemEvent(:passed, testitem_id, test_env_id, missing, something(duration, missing)))
-            end,
-            on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
-                ctx = get_run_context(testrun_id)
-                ctx === nothing && return
-                emit!(ctx, TestItemEvent(:failed, testitem_id, test_env_id, messages, something(duration, missing)))
-            end,
-            on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
-                ctx = get_run_context(testrun_id)
-                ctx === nothing && return
-                emit!(ctx, TestItemEvent(:errored, testitem_id, test_env_id, messages, something(duration, missing)))
-            end,
-            on_testitem_skipped = (testrun_id, testitem_id, test_env_id) -> begin
-                ctx = get_run_context(testrun_id)
-                ctx === nothing && return
-                emit!(ctx, TestItemEvent(:skipped, testitem_id, test_env_id, missing, missing))
-            end,
-            on_append_output = (testrun_id, testitem_id, test_env_id, output) -> begin
-                ctx = get_run_context(testrun_id)
-                ctx === nothing && return
-                testitem_id === nothing && return  # process-level output; captured by on_process_output
-                emit!(ctx, OutputEvent(testitem_id, output))
-            end,
-            on_attach_debugger = (testrun_id, debug_pipename) -> nothing,
-            on_process_created = (id, test_env_id) -> begin
-                runner = _g_runner[]
-                lock(runner.lock) do
-                    package_name = get(runner.env_package_names, test_env_id, "")
-                    runner.processes[id] = ProcessInfo(id, package_name, "Launching", time())
-                end
-            end,
-            on_process_terminated = (id) -> begin
-                runner = _g_runner[]
-                lock(runner.lock) do
-                    delete!(runner.processes, id)
-                end
-            end,
-            on_process_status_changed = (id, status) -> begin
-                runner = _g_runner[]
-                lock(runner.lock) do
-                    if haskey(runner.processes, id)
-                        old = runner.processes[id]
-                        runner.processes[id] = ProcessInfo(old.id, old.package_name, status, old.started_at)
-                    end
-                end
-                if status == "Launching"
-                    # Only the run that is rendering should see launch dots. The
-                    # callback carries no run id, so the attached run is the best
-                    # available attribution — and with one renderer at a time it
-                    # is the only context that would draw them anyway.
-                    contexts = lock(runner.lock) do
-                        [c for c in values(runner.run_contexts) if c.pres.mode !== :none]
-                    end
-                    for ctx in contexts
-                        emit!(ctx, ProcessLaunchingEvent())
-                    end
-                end
-            end,
-            on_process_output = (id, output) -> begin
-                runner = _g_runner[]
-                lock(runner.lock) do
-                    if !haskey(runner.process_outputs, id)
-                        runner.process_outputs[id] = String[]
-                    end
-                    push!(runner.process_outputs[id], output)
-                end
-            end,
-        )
-
-        controller = TestItemController(callbacks)
-        runner = TestItemRunner(controller)
-        _g_runner[] = runner
+function get_session()
+    s = _g_session[]
+    s !== nothing && isopen(s) && return s
+    lock(_g_session_lock) do
+        s = _g_session[]
+        s !== nothing && isopen(s) && return s
         # `:interactive`, so the reactor keeps waking promptly even while the
-        # user's own parallel code saturates `:default`. Its `@async` children
-        # (the per-process IO tasks) are sticky and follow it onto whichever
-        # thread it runs on, so TestItemControllers keeps its single-threaded,
-        # lock-free invariant with `reactor_channel` as the only entry point.
-        runner.reactor_task = _spawn_reactor() do
-            try
-                run(runner.controller)
-            catch err
-                Base.display_error(err, catch_backtrace())
-            end
-        end
-
-        return runner
+        # user's own parallel code saturates `:default`.
+        s = TestSession(; reactor_pool=:interactive, max_history=20)
+        _g_session[] = s
+        return s
     end
 end
+
+get_active_processes() = list_processes(get_session())
+
+get_run_history() = list_runs(get_session())
+
+get_active_runs() = TestRun[r for r in list_runs(get_session()) if r.status == :running]
+
+function _find_run(id::AbstractString)
+    try
+        return get_run(get_session(), id)
+    catch err
+        err isa ArgumentError && return nothing   # ambiguous prefix
+        rethrow()
+    end
+end
+
+function cancel_run(id::String)
+    run = _find_run(id)
+    (run === nothing || run.status != :running) && return false
+    cancel!(run)
+    return true
+end
+
+function get_last_run_id()
+    history = get_run_history()
+    isempty(history) ? nothing : history[1].id
+end
+
+"The result of a run: final once it finished, a live snapshot while it is running."
+function get_run_result(id::String)
+    run = _find_run(id)
+    run === nothing && return nothing
+    return snapshot(run)
+end
+
+terminate_process(id::String) = terminate_process!(get_session(), id)
 
 # ── Main entry point ──────────────────────────────────────────────────
 
@@ -674,32 +306,32 @@ function _make_progress_bar(n_total::Integer; start::Integer=0)
 end
 
 """
-    _bar_renderer(ctx, p)
+    _bar_renderer(run, pres, p)
 
 The `:bar` renderer: one call per completed test item. Kept separate from the
-context so `test attach` can install a fresh one over a new bar.
+presentation so `test attach` can install a fresh one over a new bar.
 """
-function _bar_renderer(ctx, p)
+function _bar_renderer(run::TestRun, pres::RunPresentation, p)
     return () -> begin
-        if ctx.launch_header_printed
-            ctx.launch_header_printed = false
+        if pres.launch_header_printed
+            pres.launch_header_printed = false
             println()
         end
-        done = completed_count(ctx)
-        if done >= ctx.n_total
+        prog = run_progress(run)
+        if prog.done >= prog.total
             # Final update — erase the progress bar
             ProgressMeter.cancel(p, ""; keep=false)
         else
             parts = String[]
-            ctx.count_success > 0 && push!(parts, "$(ctx.count_success) passed")
-            ctx.count_fail > 0 && push!(parts, "$(ctx.count_fail) failed")
-            ctx.count_error > 0 && push!(parts, "$(ctx.count_error) errored")
-            ctx.count_skipped > 0 && push!(parts, "$(ctx.count_skipped) skipped")
+            prog.passed > 0 && push!(parts, "$(prog.passed) passed")
+            prog.failed > 0 && push!(parts, "$(prog.failed) failed")
+            prog.errored > 0 && push!(parts, "$(prog.errored) errored")
+            prog.skipped > 0 && push!(parts, "$(prog.skipped) skipped")
             detail = isempty(parts) ? "" : " ($(join(parts, ", ")))"
             ProgressMeter.next!(
                 p,
                 showvalues = [
-                    (Symbol("Progress"), "$done/$(ctx.n_total)$detail"),
+                    (Symbol("Progress"), "$(prog.done)/$(prog.total)$detail"),
                 ]
             )
         end
@@ -709,33 +341,14 @@ end
 """
     run_tests(path; kwargs...)
 
-Run the test items under `path`. See `_run_tests` for the keyword arguments.
-
-This wrapper exists to guarantee the run's history record reaches a terminal
-state. `_run_tests` stamps `:completed`/`:cancelled` on its way out, but a throw
-skips that entirely and used to strand the record at `:running` with no end time
-— forever, since `_prune_history!` will not evict a running record.
+Run the test items under `path` on the shared session and return the run id (or
+the `TestrunResult` with `return_results=true`).
 
 `on_registered` is how the id becomes known before the run finishes: it is minted
-long before any work starts, and both this wrapper and background bookkeeping
-need it up front rather than reverse-engineered from history order afterwards.
+before any work starts, and background bookkeeping needs it up front rather than
+reverse-engineered from history order afterwards.
 """
-function run_tests(path; on_registered=nothing, kwargs...)
-    registered_id = Ref{Union{Nothing,String}}(nothing)
-    notify_id = function (id)
-        registered_id[] = id
-        on_registered === nothing || on_registered(id)
-    end
-    try
-        return _run_tests(path; on_registered=notify_id, kwargs...)
-    catch
-        id = registered_id[]
-        id !== nothing && _finish_record!(get_runner(), id, :errored)
-        rethrow()
-    end
-end
-
-function _run_tests(
+function run_tests(
             path;
             filter=nothing,
             filter_description::Union{Nothing,String}=nothing,
@@ -759,395 +372,156 @@ function _run_tests(
         print_failed_results = false
     end
 
-    # Declared out here, not inside the `with_logger` block below, so the summary
-    # and failure dump at the end can consult it. When the caller supplies one it
-    # keeps a reference, which is how the REPL task silences a run it is detaching
-    # to the background — the run itself carries on untouched.
+    # When the caller supplies a presentation it keeps a reference, which is how
+    # the REPL task silences a run it is detaching to the background — the run
+    # itself carries on untouched.
     pres = presentation === nothing ?
         RunPresentation(progress_ui; show_summary=print_summary, show_failures=print_failed_results) :
         presentation
 
-    # Recording the source (not just a token) in the history lets 'test cancel <id>'
-    # cancel this run later.
     if token === nothing && cancellation_source !== nothing
         token = get_token(cancellation_source)
     end
 
-    runner = get_runner()
-    tic = runner.controller
-    runner.run_counter[] += 1
-    testrun_id = string(runner.run_counter[])
+    session = get_session()
+    path = string(path)
 
-    record = TestrunRecord(testrun_id, time(), nothing, :running, nothing, string(path), cancellation_source)
-    lock(runner.lock) do
-        pushfirst!(runner.run_history, record)
-        _prune_history!(runner)
-    end
-    # Announce the id now, while it is unambiguous. Callers that reconstruct it
-    # afterwards from "the most recent run" get the wrong answer as soon as two
-    # runs start close together.
-    _note_workers!(testrun_id, max_workers)
-    on_registered === nothing || on_registered(testrun_id)
+    # ── Discovery ──
+    d = _discover(path)
 
-    jw = JuliaWorkspaces.workspace_from_folders(([path]))
-    _add_active_project!(jw)
-
-    testitems = []
-    testerrors = []
-    for (uri, items) in pairs(JuliaWorkspaces.get_test_items(jw))
-        project_details = JuliaWorkspaces.get_test_env(jw, uri)
-        textfile = JuliaWorkspaces.get_text_file(jw, uri)
-
-        for item in items.testitems
-            (; line, column) = JuliaWorkspaces.position_at(textfile.content, item.code_range.start)
-            push!(testitems, (
-                uri=uri,
-                line=line,
-                column=column,
-                code=textfile.content.content[item.code_range],
-                env=project_details,
-                detail=item),
-            )
-        end
-
-        for item in items.testerrors
-            (; line, column) = JuliaWorkspaces.position_at(textfile.content, item.range.start)
-            push!(testerrors,
-                (
-                    uri=string(uri),
-                    line=line,
-                    column=column,
-                    message=item.message
-                )
-            )
-        end
-    end
-
-    responses = []
-
-    if length(testerrors) == 0  || fail_on_detection_error==false
+    if isempty(d.definition_errors) || !fail_on_detection_error
         # Report what detection found *before* filtering. Reporting only the
         # post-filter count makes a filter that matches nothing look identical to
         # a package where detection failed outright.
-        n_discovered = length(testitems)
-        n_discovered_files = length(unique(i.uri for i in testitems))
-
-        # `pres`, not the `progress_ui` kwarg — the presentation is the single
-        # source of truth for whether this run talks to the terminal, and a
-        # caller can hand us one that says otherwise.
+        n_discovered = length(d)
+        n_discovered_files = length(unique(i.uri for i in d))
         if pres.mode !== :none
             printstyled("  Discovered $n_discovered test item(s) in $n_discovered_files file(s)\n"; color=:cyan)
         end
 
         if filter !== nothing
-            cd(path) do
-                filter!(i->filter((filename=uri2filepath(i.uri), name=i.detail.name, tags=i.detail.option_tags, package_name=i.env.package_name)), testitems)
+            d = cd(path) do
+                select(d; predicate = i -> filter((filename=i.filename, name=i.name, tags=i.tags, package_name=i.package_name)))
             end
-            if pres.mode !== :none && length(testitems) != n_discovered
-                printstyled("  Selected $(length(testitems)) of $n_discovered after filtering$(_filter_description(filter_description))\n"; color=:cyan)
-            end
-        end
-
-        n_total = length(testitems)*length(environments)
-
-        # Surface the keys where they are needed — next to the progress bar the
-        # user is about to watch, not buried in `help`.
-        if pres.mode === :bar && n_total > 0
-            _print_run_keys()
-        end
-
-        p = _make_progress_bar(n_total)
-
-        debuglogger = Logging.ConsoleLogger(stderr, Logging.Warn)
-
-        environment_name = environments[1].name
-
-        Logging.with_logger(debuglogger) do
-
-            # Build test environments (one per run profile × package test env),
-            # test item details, and the work units pairing them up.
-            testitems_to_run_by_id = Dict{String, TestItemControllers.TestItemDetail}()
-            test_environments = TestItemControllers.TestEnvironment[]
-            profiles_by_env_id = Dict{String,RunProfile}()
-            env_id_by_key = Dict{Any,String}()
-            work_units = TestItemControllers.TestRunItem[]
-
-            for i in testitems
-                textfile = JuliaWorkspaces.get_text_file(jw, i.uri)
-                item = i.detail
-                pos = JuliaWorkspaces.position_at(textfile.content, item.range.start)
-                code_pos = JuliaWorkspaces.position_at(textfile.content, item.code_range.start)
-                testitems_to_run_by_id[item.id] = TestItemControllers.TestItemDetail(
-                    item.id,
-                    string(item.uri),
-                    item.name,
-                    i.env.package_name,
-                    string(i.env.package_uri),
-                    item.option_default_imports,
-                    string.(item.option_setup),
-                    pos.line,
-                    pos.column,
-                    textfile.content.content[item.code_range],
-                    code_pos.line,
-                    code_pos.column,
-                )
-
-                for profile in environments
-                    env_key = (profile.name, i.env.package_uri, i.env.project_uri)
-                    env_id = get!(env_id_by_key, env_key) do
-                        new_id = "$(testrun_id)-env-$(length(env_id_by_key) + 1)"
-                        push!(test_environments, TestItemControllers.TestEnvironment(
-                            new_id,
-                            julia_cmd,
-                            julia_args,
-                            nothing,
-                            Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k, v) in profile.env),
-                            profile.coverage ? "Coverage" : "Normal",
-                            i.env.package_name,
-                            string(i.env.package_uri),
-                            i.env.project_uri === nothing ? nothing : string(i.env.project_uri),
-                            i.env.env_content_hash === nothing ? nothing : string(i.env.env_content_hash),
-                        ))
-                        profiles_by_env_id[new_id] = profile
-                        new_id
-                    end
-                    push!(work_units, TestItemControllers.TestRunItem(item.id, env_id, Float64(timeout), :Info))
-                end
-            end
-
-            lock(runner.lock) do
-                for env in test_environments
-                    runner.env_package_names[env.id] = env.package_name
-                end
-            end
-
-            if isempty(testitems_to_run_by_id) && pres.mode !== :none
-                if filter !== nothing && n_discovered > 0
-                    printstyled("  No test item matched the filter"; color=:yellow)
-                    println(_filter_description(filter_description), ". Use 'test list' to see what is there.")
-                else
-                    printstyled("  No test items found in $path.\n"; color=:yellow)
-                end
-            end
-
-            ctx = RunContext(
-                testitems_to_run_by_id,
-                environments,
-                profiles_by_env_id,
-                environment_name,
-                pres,
-                0, 0, 0, 0,
-                n_total,
-                responses,
-                Dict{String,Vector{String}}(),
-                false,
-                Channel{ProgressEvent}(Inf),
-                ReentrantLock(),
-            )
-
-            pres.render = _bar_renderer(ctx, p)
-
-            lock(runner.lock) do
-                runner.run_contexts[testrun_id] = ctx
-            end
-
-            # The single consumer of `ctx.events`, and the only writer to run
-            # state and the terminal while the run is in flight. `run_tests` is
-            # parked inside `execute_testrun` for that whole window, so there is
-            # never a second writer. `@async` on purpose: sticky keeps the drain
-            # on this task's thread, which the callers above already placed on
-            # `:default`, and the reactor stays free to just enqueue events.
-            drain_task = @async _drain_events!(ctx)
-
-            ret = try
-                TestItemControllers.execute_testrun(
-                    tic,
-                    testrun_id,
-                    test_environments,
-                    collect(TestItemControllers.TestItemDetail, values(testitems_to_run_by_id)),
-                    work_units,
-                    let
-                        setups = TestItemControllers.TestSetupDetail[]
-                        for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
-                            project_details = JuliaWorkspaces.get_test_env(jw, uri)
-                            project_details.package_uri === nothing && continue
-                            textfile = JuliaWorkspaces.get_text_file(jw, uri)
-                            for setup in file_info.testsetups
-                                push!(setups, TestItemControllers.TestSetupDetail(
-                                    string(project_details.package_uri),
-                                    string(setup.name),
-                                    string(setup.kind),
-                                    string(uri),
-                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start).line,
-                                    JuliaWorkspaces.position_at(textfile.content, setup.code_range.start).column,
-                                    textfile.content.content[setup.code_range]
-                                ))
-                            end
-                        end
-                        setups
-                    end,
-                    max_workers,
-                    token,
-                )
-            catch err
-                @error "TestItemControllers.execute_testrun failed" exception=(err, catch_backtrace())
-                rethrow(err)
-            finally
-                # Stop accepting events and let the drain finish applying the
-                # ones already queued, before anything reads the results.
-                close(ctx.events)
-                try; wait(drain_task); catch; end
-                # Safety-net: clear progress bar in case of cancellation/error/zero tests
-                try; ProgressMeter.cancel(p, ""; keep=false); catch; end
-                try
-                    partial = _build_result_from_context(runner, testrun_id, ctx)
-                    lock(runner.lock) do
-                        idx = findfirst(r -> r.id == testrun_id, runner.run_history)
-                        if idx !== nothing && runner.run_history[idx].result === nothing
-                            runner.run_history[idx].result = partial
-                        end
-                    end
-                catch
-                end
-                lock(runner.lock) do
-                    delete!(runner.run_contexts, testrun_id)
-                end
-            end
-
-            if any(env -> env.coverage, environments) && ret !== missing && ret !== nothing
-                @info "Coverage data collected but not yet processed"
-            end
-
-            count_success = ctx.count_success
-            count_fail = ctx.count_fail
-            count_error = ctx.count_error
-            count_skipped = ctx.count_skipped
-            testitem_outputs = ctx.outputs
-
-            if ctx.launch_header_printed
-                println()
+            if pres.mode !== :none && length(d) != n_discovered
+                printstyled("  Selected $(length(d)) of $n_discovered after filtering$(_filter_description(filter_description))\n"; color=:cyan)
             end
         end
-    else
-        count_success = 0
-        count_fail = 0
-        count_error = 0
-        count_skipped = 0
-        testitem_outputs = Dict{String,Vector{String}}()
+
+        if isempty(d) && pres.mode !== :none
+            if filter !== nothing && n_discovered > 0
+                printstyled("  No test item matched the filter"; color=:yellow)
+                println(_filter_description(filter_description), ". Use 'test list' to see what is there.")
+            else
+                printstyled("  No test items found in $path.\n"; color=:yellow)
+            end
+        end
     end
 
+    n_total = length(d) * length(environments)
+
+    # Surface the keys where they are needed — next to the progress bar the
+    # user is about to watch, not buried in `help`.
+    if pres.mode === :bar && n_total > 0
+        _print_run_keys()
+    end
+
+    p = _make_progress_bar(n_total)
+
+    # ── Execution ──
+    _run_counter[] += 1
+    run_id = string(_run_counter[])
+    _note_workers!(run_id, max_workers)
+
+    run = run_async!(session, d;
+        profiles = environments,
+        max_workers = max_workers,
+        timeout = timeout,
+        julia_cmd = julia_cmd,
+        julia_args = julia_args,
+        fail_on_definition_error = fail_on_detection_error,
+        token = token,
+        id = run_id,
+        metadata = Dict{String,Any}("path" => path, "pres" => pres))
+    pres.render = _bar_renderer(run, pres, p)
+    subscribe!(run, RunRenderer(run, pres))
+    # Announce the id now, while it is unambiguous. Callers that reconstruct it
+    # afterwards from "the most recent run" get the wrong answer as soon as two
+    # runs start close together.
+    on_registered === nothing || on_registered(run_id)
+
+    result = try
+        fetch(run)
+    finally
+        _release_workers!(run_id)
+        # Safety-net: clear progress bar in case of cancellation/error/zero tests
+        try; ProgressMeter.cancel(p, ""; keep=false); catch; end
+        if pres.launch_header_printed
+            pres.launch_header_printed = false
+            println()
+        end
+    end
+
+    # ── Reporting ──
     # `pres`, not the kwargs: a run detached to the background mid-flight has had
     # these turned off, and must not write over the prompt it just handed back.
+    prog = run_progress(run)
     if pres.show_summary
         println()
         parts = String[]
-        length(testerrors) > 0 && push!(parts, "$(length(testerrors)) definition error$(ifelse(length(testerrors)==1,"", "s"))")
-        push!(parts, "$(length(responses)) tests ran")
-        count_success > 0 && push!(parts, "\e[32m$(count_success) passed\e[0m")
-        count_fail > 0 && push!(parts, "\e[31m$(count_fail) failed\e[0m")
-        count_error > 0 && push!(parts, "\e[31m$(count_error) errored\e[0m")
-        count_skipped > 0 && push!(parts, "$(count_skipped) skipped")
+        n_errors = length(result.definition_errors)
+        n_errors > 0 && push!(parts, "$n_errors definition error$(ifelse(n_errors == 1, "", "s"))")
+        push!(parts, "$(prog.done) tests ran")
+        prog.passed > 0 && push!(parts, "\e[32m$(prog.passed) passed\e[0m")
+        prog.failed > 0 && push!(parts, "\e[31m$(prog.failed) failed\e[0m")
+        prog.errored > 0 && push!(parts, "\e[31m$(prog.errored) errored\e[0m")
+        prog.skipped > 0 && push!(parts, "$(prog.skipped) skipped")
         println(join(parts, ", "), ".")
     end
 
     if pres.show_failures
-        for te in testerrors
+        for te in result.definition_errors
             println()
-            println("Definition error at $(uri2filepath(URI(te.uri))):$(te.line)")
+            println("Definition error at $(_fp(te.uri)):$(te.line)")
             println("  $(te.message)")
         end
-    
-        for i in responses
-            if i.result.status in (:failed, :errored) 
-                println()
-                label = i.result.status == :failed ? "FAIL" : "ERROR"
-                printstyled("  [$label] $(i.testitem.label)"; color=:red, bold=true)
-                if i.result.duration !== missing
-                    print(" ($(i.result.duration)ms)")
-                end
-                println()
-                if i.result.messages!==missing                
-                    for j in i.result.messages
-                        println("    ", replace(j.message, "\n"=>"\n    "))
-                    end
+
+        for ti in result.testitems, prof in ti.profiles
+            prof.status in (:failed, :errored) || continue
+            println()
+            label = prof.status == :failed ? "FAIL" : "ERROR"
+            printstyled("  [$label] $(ti.name)"; color=:red, bold=true)
+            if prof.duration !== nothing
+                print(" ($(prof.duration)ms)")
+            end
+            println()
+            if prof.messages !== nothing
+                for m in prof.messages
+                    println("    ", replace(m.message, "\n"=>"\n    "))
                 end
             end
         end
     end
 
-    collected_process_outputs = lock(runner.lock) do
-        Dict{String,String}(id => join(chunks) for (id, chunks) in runner.process_outputs)
-    end
-
-    duplicated_testitems = TestrunResultTestitem[
-        TestrunResultTestitem(
-            ti.testitem.label,
-            URI(ti.testitem.uri),
-            [TestrunResultTestitemProfile(
-                ti.testenvironment.name,
-                ti.result.status,
-                ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === nothing ? URI("") : URI(msg.uri), something(msg.line, 0), something(msg.column, 0)) for msg in ti.result.messages],
-                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
-            )]
-        ) for ti in responses
-    ]
-
-    dedup_dict = Dict{Tuple{String, URI}, TestrunResultTestitem}()
-    for ti in duplicated_testitems
-        k = (ti.name, ti.uri)
-        if haskey(dedup_dict, k)
-            append!(dedup_dict[k].profiles, ti.profiles)
-        else
-            dedup_dict[k] = TestrunResultTestitem(ti.name, ti.uri, copy(ti.profiles))
-        end
-    end
-    deduplicated_testitems = collect(values(dedup_dict))
-
-    typed_results = TestrunResult(
-        TestrunResultDefinitionError[TestrunResultDefinitionError(i.message, URI(i.uri), i.line, i.column) for i in testerrors],
-        deduplicated_testitems,
-        collected_process_outputs,
-    )
-
-    _finish_record!(runner, testrun_id, _run_outcome(token); result=typed_results)
-
-    return return_results ? typed_results : testrun_id
+    return return_results ? result : run_id
 end
 
-function kill_test_processes()
-    lock(_g_runner_lock) do
-        runner = _g_runner[]
-        runner === nothing && return nothing
-        TestItemControllers.shutdown(runner.controller)
-        if runner.reactor_task !== nothing
-            TestItemControllers.wait_for_shutdown(runner.controller, runner.reactor_task)
-            runner.reactor_task = nothing
-        end
-        # Drop the singleton: this controller's reactor has exited, so anything
-        # later pushed onto its channel would never be read and the caller would
-        # block forever. `get_runner()` returns the cached runner unconditionally,
-        # so leaving it in place bricks every subsequent run.
-        _g_runner[] = nothing
-        return nothing
-    end
+"""
+    _discover(path) -> Discovery
+
+Discover the test items under `path`. The active project serves as fallback env and
+fallback test project for files outside any project; out-of-workspace Project/Manifest
+files are loaded lazily by JuliaWorkspaces itself.
+"""
+function _discover(path)
+    active = Base.active_project()
+    return discover_testitems(string(path); active_project = active === nothing ? nothing : dirname(active))
 end
 
-function kill_test_process(id::String)
-    if _g_runner[] !== nothing
-        TestItemControllers.terminate_test_process(_g_runner[].controller, id)
-    end
-end
+"Kill every test process; the session stays usable and relaunches on the next run."
+kill_test_processes() = (s = _g_session[]; s === nothing || terminate_all_processes!(s); nothing)
 
-# ── Active project helper ─────────────────────────────────────────────
-
-function _add_active_project!(jw)
-    proj = Base.active_project()
-    proj === nothing && return
-    # Serves as fallback env and fallback test project; out-of-workspace
-    # Project/Manifest files are loaded lazily by JuliaWorkspaces itself.
-    JuliaWorkspaces.set_active_project!(jw, filepath2uri(dirname(proj)))
-end
+kill_test_process(id::String) = terminate_process!(get_session(), id)
 
 # ── Juliaup channel resolution ────────────────────────────────────────
 
@@ -1373,10 +747,8 @@ function cmd_list(args)
     end
 
     # Same reasoning as `test pick`: detection is the slow part, rendering is not.
-    jw, all_items = _await_bg() do
-        w = JuliaWorkspaces.workspace_from_folders([path])
-        _add_active_project!(w)
-        (w, JuliaWorkspaces.get_test_items(w))
+    d = _await_bg() do
+        _discover(path)
     end
 
     tag_filter = if haskey(kwargs, :tags)
@@ -1386,23 +758,18 @@ function cmd_list(args)
     end
 
     count = 0
-    for (uri, items) in pairs(all_items)
-        textfile = JuliaWorkspaces.get_text_file(jw, uri)
-        filepath = uri2filepath(uri)
-        for item in items.testitems
-            if tag_filter !== nothing && isempty(intersect(Set(item.option_tags), tag_filter))
-                continue
-            end
-            line = JuliaWorkspaces.position_at(textfile.content, item.code_range.start).line
-            tags_str = isempty(item.option_tags) ? "" : " [$(join(item.option_tags, ", "))]"
-            printstyled("  $(item.name)"; bold=true)
-            print("  $filepath:$line")
-            if !isempty(tags_str)
-                printstyled(tags_str; color=:cyan)
-            end
-            println()
-            count += 1
+    for item in d
+        if tag_filter !== nothing && isempty(intersect(Set(item.tags), tag_filter))
+            continue
         end
+        tags_str = isempty(item.tags) ? "" : " [$(join(item.tags, ", "))]"
+        printstyled("  $(item.name)"; bold=true)
+        print("  $(item.filename):$(item.line)")
+        if !isempty(tags_str)
+            printstyled(tags_str; color=:cyan)
+        end
+        println()
+        count += 1
     end
 
     if count == 0
@@ -1416,17 +783,10 @@ end
 
 # ── Fuzzy test-item picker ────────────────────────────────────────────
 
-function _collect_testitem_candidates(jw)
-    candidates = NamedTuple{(:name, :tags, :filepath, :line),Tuple{String,Vector{Symbol},String,Int}}[]
-    for (uri, items) in pairs(JuliaWorkspaces.get_test_items(jw))
-        textfile = JuliaWorkspaces.get_text_file(jw, uri)
-        filepath = uri2filepath(uri)
-        for item in items.testitems
-            line = JuliaWorkspaces.position_at(textfile.content, item.range.start).line
-            push!(candidates, (name=item.name, tags=item.option_tags, filepath=filepath, line=line))
-        end
-    end
-    return candidates
+function _collect_testitem_candidates(d::TestItemRuns.Discovery)
+    return NamedTuple{(:name, :tags, :filepath, :line),Tuple{String,Vector{Symbol},String,Int}}[
+        (name=item.name, tags=item.tags, filepath=item.filename, line=item.line) for item in d
+    ]
 end
 
 # fzf-style match: all query characters appear in order (case-insensitive).
@@ -1498,9 +858,7 @@ function cmd_pick(args)
     # Detection parses the whole folder; keep it off the REPL's thread so the
     # prompt stays live and Ctrl-C works while a large package is scanned.
     candidates = _await_bg() do
-        jw = JuliaWorkspaces.workspace_from_folders([path])
-        _add_active_project!(jw)
-        _collect_testitem_candidates(jw)
+        _collect_testitem_candidates(_discover(path))
     end
     if isempty(candidates)
         println("No test items found in '$path'.")
@@ -1560,7 +918,7 @@ function _last_result_and_path()
     if run_id !== nothing
         for r in get_run_history()
             if r.id == run_id
-                path = r.path
+                path = _run_path(r)
                 break
             end
         end
@@ -1575,13 +933,13 @@ function _failure_entries(result)
     entries = []
     for ti in result.testitems, prof in ti.profiles
         prof.status in (:failed, :errored) || continue
-        filepath = uri2filepath(ti.uri)
+        filepath = _fp(ti.uri)
         line = 1
-        if prof.messages !== missing && !isempty(prof.messages)
+        if prof.messages !== nothing && !isempty(prof.messages)
             m1 = prof.messages[1]
             mpath = try
-                p = uri2filepath(m1.uri)
-                isempty(p) ? nothing : p
+                p = isempty(m1.uri) ? "" : uri2filepath(URI(m1.uri))
+                p === nothing || isempty(p) ? nothing : p
             catch
                 nothing
             end
@@ -1605,7 +963,7 @@ function cmd_run_failed()
     failing = Set{Tuple{String,String}}()
     for ti in result.testitems
         if any(p -> p.status in (:failed, :errored), ti.profiles)
-            push!(failing, (uri2filepath(ti.uri), ti.name))
+            push!(failing, (_fp(ti.uri), ti.name))
         end
     end
     if isempty(failing)
@@ -1628,16 +986,16 @@ function _print_failure(e)
     println()
     label = e.prof.status == :failed ? "FAIL" : "ERROR"
     printstyled("  [$label] $(e.ti.name)"; color=:red, bold=true)
-    e.prof.duration !== missing && print(" ($(e.prof.duration)ms)")
+    e.prof.duration !== nothing && print(" ($(e.prof.duration)ms)")
     println()
     println("  at $(e.filepath):$(e.line)")
-    if e.prof.messages !== missing
+    if e.prof.messages !== nothing
         for m in e.prof.messages
             println()
             println("    ", replace(m.message, "\n" => "\n    "))
         end
     end
-    if e.prof.output !== missing && !isempty(strip(e.prof.output))
+    if e.prof.output !== nothing && !isempty(strip(e.prof.output))
         println()
         printstyled("  Output:\n"; bold=true)
         println("    ", replace(rstrip(e.prof.output), "\n" => "\n    "))
@@ -2067,36 +1425,39 @@ function cmd_attach(args=String[])
         return cmd_results([run_id])
     end
 
-    ctx = get_run_context(run_id)
-    if ctx === nothing
+    run = _find_run(run_id)
+    pres = run === nothing ? nothing : _presentation(run)
+    if run === nothing || pres === nothing || run.status != :running
         # Registered in the history but not yet dispatching, or already torn
         # down between the checks above and here.
         println("Run #$run_id is not reporting progress yet; try 'test status'.")
         return nothing
     end
 
-    # Exactly one run may render at a time: the drain task is the only writer to
-    # the terminal while a run is in flight, and that invariant is per-context.
+    # Exactly one run may render at a time: a run's event sink is the only writer
+    # to the terminal while it is in flight, and that invariant is per-run.
     for other in active_background_runs()
         other.run_id == run_id && continue
-        octx = get_run_context(other.run_id)
-        octx === nothing || detach!(octx.pres)
+        orun = _find_run(other.run_id)
+        opres = orun === nothing ? nothing : _presentation(orun)
+        opres === nothing || detach!(opres)
     end
 
     # A fresh bar, picking up at the count already reached. The old one belonged
     # to a terminal state that is long gone.
-    p = _make_progress_bar(ctx.n_total; start=completed_count(ctx))
-    ctx.pres.render = _bar_renderer(ctx, p)
-    ctx.pres.show_summary = true
-    ctx.pres.show_failures = true
-    ctx.pres.mode = :bar
+    prog = run_progress(run)
+    p = _make_progress_bar(prog.total; start=prog.done)
+    pres.render = _bar_renderer(run, pres, p)
+    pres.show_summary = true
+    pres.show_failures = true
+    pres.mode = :bar
     _last_run_id[] = run_id
 
     printstyled("Attached to test run #$run_id"; color=:cyan)
-    println(" ($(completed_count(ctx))/$(ctx.n_total) done)")
+    println(" ($(prog.done)/$(prog.total) done)")
     _print_run_keys()
 
-    outcome = _watch_run(bg.task, bg.cts, ctx.pres)
+    outcome = _watch_run(bg.task, bg.cts, pres)
     if outcome === :detached
         printstyled("\nLeft running in the background.\n"; color=:cyan)
         return nothing
@@ -2123,22 +1484,15 @@ up via the global "most recent run" pointer reports another run's numbers as soo
 as more than one is in flight.
 """
 function _run_progress(bg::BackgroundRun)
-    ctx = get_run_context(bg.run_id)
-    if ctx === nothing
-        # Finished or not yet dispatching: fall back to the recorded result.
-        result = get_run_result(bg.run_id)
-        result === nothing && return (0, 0, String[])
-        done = sum(length(ti.profiles) for ti in result.testitems; init=0)
-        return (done, done, String[])
-    end
-    lock(ctx.lock) do
-        parts = String[]
-        ctx.count_success > 0 && push!(parts, "\e[32m$(ctx.count_success) passed\e[0m")
-        ctx.count_fail > 0 && push!(parts, "\e[31m$(ctx.count_fail) failed\e[0m")
-        ctx.count_error > 0 && push!(parts, "\e[31m$(ctx.count_error) errored\e[0m")
-        ctx.count_skipped > 0 && push!(parts, "$(ctx.count_skipped) skipped")
-        return (completed_count(ctx), ctx.n_total, parts)
-    end
+    run = _find_run(bg.run_id)
+    run === nothing && return (0, 0, String[])
+    prog = run_progress(run)
+    parts = String[]
+    prog.passed > 0 && push!(parts, "\e[32m$(prog.passed) passed\e[0m")
+    prog.failed > 0 && push!(parts, "\e[31m$(prog.failed) failed\e[0m")
+    prog.errored > 0 && push!(parts, "\e[31m$(prog.errored) errored\e[0m")
+    prog.skipped > 0 && push!(parts, "$(prog.skipped) skipped")
+    return (prog.done, prog.total, parts)
 end
 
 function cmd_status()
@@ -2307,11 +1661,11 @@ function cmd_results(args=String[])
     id_str = run_id !== nothing ? "Run #$run_id: " : ""
     is_active = run_record !== nothing && run_record.status == :running
     duration_str = ""
-    if run_record !== nothing && run_record.end_time !== nothing
-        dur = round(run_record.end_time - run_record.start_time; digits=1)
+    if run_record !== nothing && run_record.finished_at !== nothing
+        dur = round(_seconds_between(run_record.started_at, run_record.finished_at); digits=1)
         duration_str = " ($dur s)"
     elseif is_active
-        dur = round(time() - run_record.start_time; digits=1)
+        dur = round(_seconds_between(run_record.started_at, Dates.now()); digits=1)
         duration_str = " ($dur s, in progress)"
     end
     filter_str = name_filter !== nothing ? " (filtered: '$(name_filter)')" : ""
@@ -2332,7 +1686,7 @@ function cmd_results(args=String[])
     if name_filter === nothing && !isempty(result.definition_errors)
         printstyled("\nDefinition errors:\n"; color=:red, bold=true)
         for de in result.definition_errors
-            println("  $(uri2filepath(de.uri)):$(de.line) — $(de.message)")
+            println("  $(_fp(de.uri)):$(de.line) — $(de.message)")
         end
     end
 
@@ -2343,11 +1697,11 @@ function cmd_results(args=String[])
                 println()
                 label = prof.status == :failed ? "FAIL" : "ERROR"
                 printstyled("  [$label] $(ti.name)"; color=:red, bold=true)
-                if prof.duration !== missing
+                if prof.duration !== nothing
                     print(" ($(prof.duration)ms)")
                 end
                 println()
-                if prof.messages !== missing
+                if prof.messages !== nothing
                     for msg in prof.messages
                         println("    ", replace(msg.message, "\n" => "\n    "))
                     end
@@ -2361,7 +1715,7 @@ function cmd_results(args=String[])
         timed = Tuple{String,Float64}[]
         for ti in testitems
             for prof in ti.profiles
-                if prof.duration !== missing
+                if prof.duration !== nothing
                     push!(timed, (ti.name, prof.duration))
                 end
             end
@@ -2410,7 +1764,7 @@ function cmd_processes()
     printstyled("Active test processes:\n\n"; bold=true)
     printstyled("  $(rpad("ID", 10))$(rpad("Package", 24))$(rpad("Status", 12))Uptime\n"; bold=true)
     printstyled("  $(repeat("─", 56))\n"; color=:light_black)
-    for p in sort(procs; by=x -> x.started_at)
+    for p in sort(procs; by=x -> x.created_at)
         status_color = if p.status == "Running"
             :green
         elseif p.status == "Idle"
@@ -2422,7 +1776,7 @@ function cmd_processes()
         end
         print("  $(rpad(short_id(p.id), 10))$(rpad(p.package_name, 24))")
         printstyled("$(rpad(p.status, 12))"; color=status_color)
-        println(_format_elapsed(time() - p.started_at))
+        println(_format_elapsed(_seconds_between(p.created_at, Dates.now())))
     end
     println()
     println("$(length(procs)) process(es) active. Ids are shortened; prefixes work in 'test kill' and 'test log'.")
@@ -2437,7 +1791,7 @@ end
 
 function _print_testitem_details(ti)
     printstyled("\n$(ti.name)"; bold=true)
-    println("  $(uri2filepath(ti.uri))")
+    println("  $(_fp(ti.uri))")
 
     for prof in ti.profiles
         println()
@@ -2451,19 +1805,19 @@ function _print_testitem_details(ti)
             :default
         end
         printstyled("  [$(prof.profile_name)] $(prof.status)"; color=status_color, bold=true)
-        if prof.duration !== missing
+        if prof.duration !== nothing
             print(" ($(prof.duration)ms)")
         end
         println()
 
-        if prof.messages !== missing
+        if prof.messages !== nothing
             for msg in prof.messages
-                println("    $(uri2filepath(msg.uri)):$(msg.line)")
+                isempty(msg.uri) || println("    $(_fp(msg.uri)):$(msg.line)")
                 println("    ", replace(msg.message, "\n" => "\n    "))
             end
         end
 
-        if prof.output !== missing && !isempty(prof.output)
+        if prof.output !== nothing && !isempty(prof.output)
             printstyled("    Output:\n"; color=:cyan)
             for line in split(prof.output, '\n')
                 println("      ", line)
@@ -2476,7 +1830,7 @@ function _print_testitem_output(ti)
     printstyled("Output for $(ti.name):\n"; bold=true)
     has_output = false
     for prof in ti.profiles
-        if prof.output !== missing && !isempty(prof.output)
+        if prof.output !== nothing && !isempty(prof.output)
             if length(ti.profiles) > 1
                 printstyled("  [$(prof.profile_name)]\n"; color=:cyan)
             end
@@ -2551,12 +1905,12 @@ function cmd_history(args)
     printstyled("  $(repeat("─", 76))\n"; color=:light_black)
 
     for r in history
-        started = Dates.format(Dates.unix2datetime(r.start_time), "HH:MM:SS")
-        duration = if r.end_time !== nothing
-            elapsed = r.end_time - r.start_time
+        started = Dates.format(r.started_at, "HH:MM:SS")
+        duration = if r.finished_at !== nothing
+            elapsed = _seconds_between(r.started_at, r.finished_at)
             "$(round(elapsed; digits=1))s"
         elseif r.status == :running
-            elapsed = time() - r.start_time
+            elapsed = _seconds_between(r.started_at, Dates.now())
             "$(round(elapsed; digits=1))s…"
         else
             "-"
@@ -2586,7 +1940,7 @@ function cmd_history(args)
         print("  $(rpad(r.id, 6))$(rpad(started, 12))$(rpad(duration, 12))")
         printstyled("$(rpad(r.status, 12))"; color=status_color)
         print("$(rpad(tests_str, 10))")
-        println(r.path)
+        println(_run_path(r))
     end
     println()
     println("$(length(history)) run(s). Use 'test results <id>' to inspect a run.")
@@ -3021,7 +2375,7 @@ end
         #    does not run during precompilation, and the `ConsoleLogger` inside
         #    `run_tests` is task-local and created *after* the reactor task, so
         #    it never covers the reactor's own `@info` calls. A null logger
-        #    installed here does, because `get_runner()` runs underneath it and
+        #    installed here does, because `get_session()` runs underneath it and
         #    the reactor task inherits its logger at creation.
         #  * stdout/stderr — the progress renderer prints directly, and the
         #    default logger holds the original stderr handle rather than looking
@@ -3041,7 +2395,11 @@ end
                     timeout=60,
                     fail_on_detection_error=false,
                 )
-                kill_test_processes()
+                # Close and drop the session: it holds tasks, which cannot be
+                # serialized into the precompile image.
+                s = _g_session[]
+                s === nothing || close(s)
+                _g_session[] = nothing
             end
         end
     end
@@ -3063,8 +2421,8 @@ function _register_repl_mode()
 end
 
 function __init__()
-    # Precompilation leaves a stale runner with dead reactor/shutdown controller; reset it
-    _g_runner[] = nothing
+    # Precompilation leaves a stale session with a dead reactor; reset it
+    _g_session[] = nothing
 
     global_logger(ModuleFilterLogger(global_logger()))
 
