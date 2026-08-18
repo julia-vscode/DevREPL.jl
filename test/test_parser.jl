@@ -96,13 +96,12 @@ end
     @test occursin("1 tests ran", out)
 end
 
-# `kill_test_processes` shuts the controller's reactor down. If the runner
-# singleton survives that, every later run pushes onto a channel nobody reads
-# and blocks forever — i.e. `test kill` bricks the session.
+# `kill_test_processes` empties the process pool but keeps the session, so the
+# next run simply relaunches what it needs — `test kill` must not brick the session.
 @testitem "a run still works after killing the test processes" setup=[ReplHelper] begin
     ReplHelper.run_command("test run $(ReplHelper.PRECOMPILEDATA) --name=pass")
     DevREPL.kill_test_processes()
-    @test DevREPL._g_runner[] === nothing
+    @test isopen(DevREPL.get_session())
     out = ReplHelper.run_command("test run $(ReplHelper.PRECOMPILEDATA) --name=pass")
     @test occursin("1 tests ran", out)
 end

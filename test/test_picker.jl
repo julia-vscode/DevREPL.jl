@@ -1,7 +1,5 @@
 @testitem "candidate collection" setup=[ReplHelper] begin
-    using JuliaWorkspaces
-    jw = JuliaWorkspaces.workspace_from_folders([ReplHelper.PRECOMPILEDATA])
-    cands = DevREPL._collect_testitem_candidates(jw)
+    cands = DevREPL._collect_testitem_candidates(DevREPL._discover(ReplHelper.PRECOMPILEDATA))
     @test length(cands) == 3
     @test Set(c.name for c in cands) ==
         Set(["precompile pass", "precompile fail", "precompile error"])

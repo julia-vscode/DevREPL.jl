@@ -14,7 +14,7 @@
 
     const PRECOMPILEDATA = normpath(joinpath(dirname(pathof(DevREPL)), "..", "precompiledata"))
 
-    using TestItemControllers.CancellationTokens: CancellationTokenSource
+    using TestItemRuns.CancellationTokens: CancellationTokenSource
 
     "Forget every background run — test items share a process, so state leaks between them."
     function reset_bg_runs!()
