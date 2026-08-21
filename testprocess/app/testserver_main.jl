@@ -29,7 +29,10 @@ let
         TestItemServer.serve(
             ARGS[1],
             ARGS[2],
-            has_error_handler ? (err, bt) -> Base.invokelatest(global_err_handler, err, bt, Base.ARGS[4], "Test Process") : nothing)
+            has_error_handler ? (err, bt) -> Base.invokelatest(global_err_handler, err, bt, Base.ARGS[4], "Test Process") : nothing,
+            # The same reporter, minus the `exit(1)`, for failures this process can carry on
+            # past. Without the distinction every reported hiccup would kill the test process.
+            has_error_handler ? (err, bt) -> Base.invokelatest(global_err_handler, err, bt, Base.ARGS[4], "Test Process", should_exit=false) : nothing)
     catch err
         if has_error_handler
             Base.invokelatest(global_err_handler, err, catch_backtrace(), Base.ARGS[4], "Test Process")

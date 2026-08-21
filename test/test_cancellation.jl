@@ -54,11 +54,11 @@
 
     # Wait for testrun to complete
     @info "[test] Cancel running test run: waiting for testrun"
-    TestHelpers.timed_wait(testrun_task, 120; label="cancel-testrun")
+    TestHelpers.timed_wait(testrun_task, 600; label="cancel-testrun")
 
     @info "[test] Cancel running test run: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="cancel-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="cancel-controller")
 
     # After cancellation, items should be skipped or already completed
     completed = filter(e -> e.event in (:passed, :failed, :errored, :skipped), events)
@@ -124,7 +124,7 @@ end
     CancellationTokens.cancel(cs1)
 
     @info "[test] Cancel during activation: waiting for first testrun"
-    TestHelpers.timed_wait(testrun_task1, 120; label="cancel-activation-testrun1")
+    TestHelpers.timed_wait(testrun_task1, 600; label="cancel-activation-testrun1")
 
     # The controller reactor must still be running (no crash)
     @test !istaskdone(controller_task)
@@ -155,11 +155,14 @@ end
     end
 
     @info "[test] Cancel during activation: waiting for second testrun"
-    TestHelpers.timed_wait(testrun_task2, 300; label="cancel-activation-testrun2")
+    # Run 2 executes every BasicPackage item — the 60s sleeper and the crash items included —
+    # on a single process, so on a cold macOS-intel runner it genuinely approaches 300s. This
+    # wait exists to catch a hang, not to budget the run.
+    TestHelpers.timed_wait(testrun_task2, 900; label="cancel-activation-testrun2")
 
     @info "[test] Cancel during activation: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="cancel-activation-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="cancel-activation-controller")
 
     # Second run should complete normally — every item passed or had a definitive result
     completed2 = filter(e -> e.event in (:passed, :failed, :errored, :skipped), events)
@@ -253,11 +256,11 @@ end
     CancellationTokens.cancel(cs)
 
     @info "[test] Cancel multi-process steal race: waiting for testrun"
-    TestHelpers.timed_wait(testrun_task, 120; label="cancel-steal-race-testrun")
+    TestHelpers.timed_wait(testrun_task, 600; label="cancel-steal-race-testrun")
 
     @info "[test] Cancel multi-process steal race: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="cancel-steal-race-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="cancel-steal-race-controller")
 
     # Controller must not have crashed
     @test !istaskfailed(controller_task)

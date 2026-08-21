@@ -176,7 +176,8 @@ each environment configuration to a list of idle process IDs. When
 ### Process launch
 
 Each child process is a Julia instance started with:
-- `--check-bounds=yes`, `--startup-file=no`, `--history-file=no`, `--depwarn=no`
+- `--check-bounds=yes` when `TestEnvironment.check_bounds == "yes"`; by default (`"auto"`) the flag is omitted so the test process runs with Julia's default bounds-checking and can reuse the precompile caches of normal dev sessions (the flag is also rejected as `=auto` by Julia < 1.8)
+- `--startup-file=no`, `--history-file=no`, `--depwarn=no`
 - `--code-coverage=user` (when `mode == "Coverage"`) or `--code-coverage=none`
 - Custom environment variables from `TestEnvironment.julia_env`
 

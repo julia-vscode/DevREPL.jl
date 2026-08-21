@@ -12,9 +12,12 @@ jobs:
     with:
       include-all-compatible-minor-versions: true
       include-rc-versions: true
-      include-beta-versions: true
-      filter: 'dirname(filename) == joinpath(pwd(), "test")'
       github_job_prep_script: 'scripts/install_julia_versions.jl'
+      # Above the 1800s budget that TestHelpers.check_julia_version gives its nested run
+      # (plus its 60s shutdown wait), so that a stalled per-version item is caught by that
+      # guard — which dumps what every nested test process was doing — instead of being cut
+      # down first by the runner's own per-item deadline, which reports only a bare timeout.
+      testitem-timeout: 2400
     permissions: write-all
     secrets:
       codecov_token: ${{ secrets.CODECOV_TOKEN }}

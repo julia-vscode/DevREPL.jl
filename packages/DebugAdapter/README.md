@@ -34,3 +34,12 @@ filepath = joinpath(homedir(), "something.jl") # This is the filepath that shoul
 
  DebugAdapter.debug_code(session, mod, code, filepath)
  ```
+
+`debug_code` sends a `terminated` event once the code has finished, and a client takes
+that as "the debuggee has ended" and disconnects. To debug more than one piece of code in
+one session, pass `notify_termination=false` on every call but the last:
+
+```julia
+DebugAdapter.debug_code(session, mod, setup_code, setup_path; notify_termination=false)
+DebugAdapter.debug_code(session, mod, code, filepath)
+```

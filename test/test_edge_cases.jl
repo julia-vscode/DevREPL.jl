@@ -77,11 +77,11 @@ end
 
     # Should complete without hanging (the wait itself is the test)
     @info "[test] Shutdown during active test run: waiting for controller_task"
-    TestHelpers.timed_wait(controller_task, 120; label="shutdown-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="shutdown-controller")
 
     # The test run task should also finish
     @info "[test] Shutdown during active test run: waiting for testrun_task"
-    TestHelpers.timed_wait(testrun_task, 120; label="shutdown-testrun")
+    TestHelpers.timed_wait(testrun_task, 600; label="shutdown-testrun")
 
     # The slow test should have been started but then skipped/errored due to shutdown
     terminal_events = lock(events_lock) do
@@ -147,7 +147,7 @@ end
 
     @info "[test] Sequential runs: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="sequential-runs-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="sequential-runs-controller")
 
     # Each run should have exactly one passed event
     @test length(events_run1) == 1

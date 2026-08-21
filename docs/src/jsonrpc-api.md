@@ -60,6 +60,19 @@ Kill a specific child process.
 
 **Response**: `null`
 
+## Notifications (client → server)
+
+### `shutdown`
+
+Ask the controller to shut down: every active test run is cancelled, every child
+process is terminated (a process that does not exit within the grace period is
+force-killed), and the controller exits once they are gone. No parameters.
+
+The controller also shuts itself down in exactly the same way when the client's
+connection closes without a `shutdown` — the client exiting or crashing — so test
+processes never outlive their client. Sending `shutdown` first is still preferable:
+it lets the client observe the `testProcessTerminated` notifications.
+
 ## Notifications (server → client)
 
 The controller sends the following notifications as test execution progresses.
@@ -67,12 +80,23 @@ All are fire-and-forget (no response expected).
 
 ### Test item lifecycle
 
+Each test item produces exactly one terminal notification (`testItemPassed`,
+`testItemFailed`, `testItemErrored` or `testItemSkipped`) per run, preceded by at
+most one `testItemStarted`.
+
+Identify an item by the pair `(testItemId, testEnvId)`, not by `testItemId` alone.
+A test item id is scoped to its package, so the same package checked out into two
+folders — two worktrees, or a vendored copy beside a dev checkout — mints the same
+id from both. A client keying on the id alone collapses the two: one item's results
+arrive twice while the other never resolves.
+
 #### `testItemStarted`
 
 | Field | Type | Description |
 |:------|:-----|:------------|
 | `testRunId` | `String` | Run that owns this item. |
 | `testItemId` | `String` | The test item that started. |
+| `testEnvId` | `String` | Environment the item is running under. |
 
 #### `testItemPassed`
 
@@ -80,7 +104,9 @@ All are fire-and-forget (no response expected).
 |:------|:-----|:------------|
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
+| `testEnvId` | `String` | |
 | `duration` | `Float \| null` | Wall-clock milliseconds. |
+| `perf` | `PerfStats \| null` | Execution statistics, when the test process measured them. |
 
 #### `testItemFailed`
 
@@ -88,8 +114,10 @@ All are fire-and-forget (no response expected).
 |:------|:-----|:------------|
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
+| `testEnvId` | `String` | |
 | `messages` | `Array<TestMessage>` | Failure details (see below). |
 | `duration` | `Float \| null` | Wall-clock milliseconds. |
+| `perf` | `PerfStats \| null` | Execution statistics, when the test process measured them. |
 
 #### `testItemErrored`
 
@@ -97,8 +125,10 @@ All are fire-and-forget (no response expected).
 |:------|:-----|:------------|
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
+| `testEnvId` | `String` | |
 | `messages` | `Array<TestMessage>` | Error details. |
-| `duration` | `Float \| null` | Wall-clock milliseconds. |
+| `duration` | `Float \| null` | Wall-clock milliseconds, or `null` when the controller synthesised the result (timeout, crash, activation failure). |
+| `perf` | `PerfStats \| null` | Execution statistics, when the test process measured them. |
 
 #### `testItemSkipped`
 
@@ -106,6 +136,8 @@ All are fire-and-forget (no response expected).
 |:------|:-----|:------------|
 | `testRunId` | `String` | |
 | `testItemId` | `String` | |
+| `testEnvId` | `String` | |
+| `reason` | `String \| null` | Source text of the `skip` expression that evaluated to `true`. `null` when the item was skipped for another reason, such as cancellation. |
 
 ### Output
 
@@ -115,6 +147,7 @@ All are fire-and-forget (no response expected).
 |:------|:-----|:------------|
 | `testRunId` | `String` | |
 | `testItemId` | `String \| null` | `null` for process-level output. |
+| `testEnvId` | `String` | Always present, including for process-level output. |
 | `output` | `String` | Captured `stdout`/`stderr` text. |
 
 ### Debug
@@ -180,6 +213,7 @@ the [Julia API](@ref) section.
 | `packageUri` | `String` | |
 | `projectUri` | `String \| null` | |
 | `envContentHash` | `String \| null` | |
+| `checkBounds` | `String \| null` | Value for the `--check-bounds` flag. |
 
 ### `TestRunItem`
 
@@ -206,6 +240,7 @@ the [Julia API](@ref) section.
 | `code` | `String` | |
 | `codeLine` | `Integer` | |
 | `codeColumn` | `Integer` | |
+| `optionSkip` | `Boolean \| String \| null` | The `skip` kwarg: `true`/`false` for a literal, or the source text of an expression the test process evaluates immediately before the item would run. Absent means `false`. |
 
 ### `TestSetupDetail`
 
@@ -239,6 +274,22 @@ the [Julia API](@ref) section.
 | `uri` | `String \| null` | |
 | `line` | `Integer \| null` | |
 | `column` | `Integer \| null` | |
+
+### `PerfStats`
+
+Execution statistics for one test item, as measured by the test process. Every
+field is optional: `elapsed`, `bytes`, `allocs` and `gctime` are always available,
+while the compile timings depend on Julia internals that not every version the
+test process supports provides.
+
+| Field | Type | Description |
+|:------|:-----|:------------|
+| `elapsed` | `Float \| null` | Wall-clock milliseconds. |
+| `bytes` | `Integer \| null` | Bytes allocated. |
+| `allocs` | `Integer \| null` | Number of allocations. |
+| `gctime` | `Float \| null` | Milliseconds spent in GC. |
+| `compileTime` | `Float \| null` | Milliseconds spent compiling. |
+| `recompileTime` | `Float \| null` | Milliseconds spent recompiling. |
 
 ### `FileCoverage`
 

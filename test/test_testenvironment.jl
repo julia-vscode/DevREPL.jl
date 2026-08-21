@@ -182,3 +182,52 @@ end
     @test env1 != env2
     @test env1 != env_nothing
 end
+
+@testitem "ProcessEnv with different check_bounds" begin
+    using TestItemControllers: ProcessEnv, TestEnvironment
+
+    env_auto = ProcessEnv(
+        nothing, "file:///pkg", "Pkg", "julia", String[],
+        nothing, "Run", Dict{String,Union{String,Nothing}}(), "auto"
+    )
+    env_yes = ProcessEnv(
+        nothing, "file:///pkg", "Pkg", "julia", String[],
+        nothing, "Run", Dict{String,Union{String,Nothing}}(), "yes"
+    )
+    env_default = ProcessEnv(
+        nothing, "file:///pkg", "Pkg", "julia", String[],
+        nothing, "Run", Dict{String,Union{String,Nothing}}()
+    )
+
+    # Different check_bounds must never pool together
+    @test env_auto != env_yes
+    @test !isequal(env_auto, env_yes)
+    @test hash(env_auto) != hash(env_yes)
+
+    # The 8-arg convenience constructor defaults to "auto"
+    @test env_default == env_auto
+    @test hash(env_default) == hash(env_auto)
+
+    # TestEnvironment normalization: nothing and "auto" produce the same ProcessEnv
+    te_nothing = TestEnvironment("id", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Normal", "Pkg", "file:///pkg", nothing, nothing)
+    te_auto = TestEnvironment("id", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Normal", "Pkg", "file:///pkg", nothing, nothing, "auto")
+    te_yes = TestEnvironment("id", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Normal", "Pkg", "file:///pkg", nothing, nothing, "yes")
+    @test ProcessEnv(te_nothing) == ProcessEnv(te_auto)
+    @test ProcessEnv(te_nothing) != ProcessEnv(te_yes)
+end
+
+@testitem "TestEnvironment check_bounds validation" begin
+    using TestItemControllers: TestEnvironment
+
+    make(cb) = TestEnvironment("id", "julia", String[], nothing,
+        Dict{String,Union{String,Nothing}}(), "Normal", "Pkg", "file:///pkg", nothing, nothing, cb)
+
+    @test make("yes").check_bounds == "yes"
+    @test make("auto").check_bounds == "auto"
+    @test make(nothing).check_bounds === nothing
+    @test_throws ArgumentError make("no")
+    @test_throws ArgumentError make("maybe")
+end

@@ -37,3 +37,16 @@ end
     @test_throws ErrorException makechunks([1, 2, 3], 0)
     @test_throws ErrorException makechunks([1, 2, 3], -1)
 end
+
+@testitem "exit info string" begin
+    using TestItemControllers: _exit_info_string
+
+    # A process that exited with a code has `termsignal == 0`; that is not a signal.
+    @test _exit_info_string(1, 0) == "exit code 1"
+    @test _exit_info_string(66, nothing) == "exit code 66"
+    @test _exit_info_string(-1073741819, 0) == "exit code -1073741819 (0xC0000005)"
+    @test _exit_info_string(nothing, 11) == "SIGSEGV (signal 11)"
+    @test _exit_info_string(nothing, 40) == "signal 40 (signal 40)"
+    @test _exit_info_string(nothing, 0) === nothing
+    @test _exit_info_string(nothing, nothing) === nothing
+end

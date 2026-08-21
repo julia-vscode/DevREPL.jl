@@ -2,6 +2,7 @@
     noDebug::Union{Missing,Bool}
     __restart::Union{Missing,Any}
     program::String
+    code::Union{Missing,String}
     stopOnEntry::Union{Missing,Bool}
     cwd::Union{Missing,String}
     env::Union{Missing,Dict{String,String}}
@@ -13,6 +14,8 @@ end
 
 @dict_readable struct JuliaAttachArguments <: Outbound
     __restart::Union{Missing,Any}
+    program::Union{Missing,String}
+    code::Union{Missing,String}
     stopOnEntry::Bool
     compiledModulesOrFunctions::Union{Missing,Vector{String}}
     compiledMode::Union{Missing,Bool}
@@ -49,6 +52,7 @@ const terminated_notification_type = DAPRPC.EventType("terminated", TerminatedEv
 @dict_readable struct DebugArguments <: Outbound
     stopOnEntry::Bool
     program::String
+    code::Union{Missing,String}
     compiledModulesOrFunctions::Union{Missing,Vector{String}}
     compiledMode::Union{Missing,Bool}
 end

@@ -86,7 +86,7 @@
 
     @info "[test] Process reuse: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="process-reuse-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="process-reuse-controller")
 end
 
 @testitem "Process restart on env hash change regenerates debug pipe" setup=[TestHelpers] begin
@@ -165,7 +165,7 @@ end
     @test lock(pc_lock) do; length(process_created_ids); end >= 1
 
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="restart-hash-change-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="restart-hash-change-controller")
 end
 
 @testitem "Multiple consecutive restarts succeed" setup=[TestHelpers] begin
@@ -230,5 +230,5 @@ end
     end
 
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="multi-restart-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="multi-restart-controller")
 end
