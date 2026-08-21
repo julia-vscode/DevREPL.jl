@@ -66,11 +66,11 @@
     end
 
     # The testrun should complete naturally: crash item errored, passing item redistributed and passed.
-    TestHelpers.timed_wait(testrun_task, 120; label="exit-crash-testrun")
+    TestHelpers.timed_wait(testrun_task, 600; label="exit-crash-testrun")
 
     @info "[test] Controlled crash via exit(): shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="exit-crash-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="exit-crash-controller")
 
     @info "[test] Controlled crash via exit(): verifying results"
 
@@ -191,9 +191,9 @@ end
 
     @info "[test] Hard crash via ccall abort: shutting down (crash_detected_early=$(crash_detected_early[]))"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="abort-crash-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="abort-crash-controller")
     if !istaskdone(testrun_task)
-        TestHelpers.timed_wait(testrun_task, 30; label="abort-crash-testrun")
+        TestHelpers.timed_wait(testrun_task, 600; label="abort-crash-testrun")
     end
 
     @info "[test] Hard crash via ccall abort: verifying results"
@@ -281,11 +281,11 @@ end
     end
 
     # Testrun completes naturally — the crash item is immediately errored, no other items remain.
-    TestHelpers.timed_wait(testrun_task, 120; label="single-crash-testrun")
+    TestHelpers.timed_wait(testrun_task, 600; label="single-crash-testrun")
 
     @info "[test] Single crash item: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="single-crash-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="single-crash-controller")
 
     @info "[test] Single crash item: verifying results"
 

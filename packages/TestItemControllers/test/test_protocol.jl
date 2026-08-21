@@ -183,6 +183,7 @@ end
         packageUri = "file:///mypkg",
         projectUri = "file:///proj",
         envContentHash = "abc123",
+        checkBounds = "yes",
     )
 
     json_str = JSON.json(env)
@@ -200,6 +201,7 @@ end
     @test env2.packageUri == "file:///mypkg"
     @test env2.projectUri == "file:///proj"
     @test env2.envContentHash == "abc123"
+    @test env2.checkBounds == "yes"
 end
 
 @testitem "TestEnvironment round-trip with missing optional fields" begin
@@ -226,6 +228,7 @@ end
     @test ismissing(env2.juliaNumThreads)
     @test ismissing(env2.projectUri)
     @test ismissing(env2.envContentHash)
+    @test ismissing(env2.checkBounds)
     @test env2.juliaArgs == String[]
     @test isempty(env2.juliaEnv)
 end

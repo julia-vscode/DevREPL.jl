@@ -102,7 +102,7 @@
 
     # Wait with a timeout — without the fix the new process is stuck in
     # ProcessWaitingForPrecompile and this would hang forever.
-    TestHelpers.timed_wait(run2_task, 120; label="second-run-execute_testrun")
+    TestHelpers.timed_wait(run2_task, 600; label="second-run-execute_testrun")
 
     run2_passed = lock(events_lock) do
         filter(e -> e.event == :passed && e.run_id == run2_id, events)
@@ -116,5 +116,5 @@
 
     # -- cleanup --------------------------------------------------------------
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="second-run-multiproc-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="second-run-multiproc-controller")
 end

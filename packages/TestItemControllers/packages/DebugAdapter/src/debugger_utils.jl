@@ -27,7 +27,7 @@ function calls_on_line(frame::JuliaInterpreter.Frame, line=nothing)
     src = frame.framecode.src
 
     exprs = []
-    for pc in frame.pc:length(src.codelocs)
+    for pc in frame.pc:length(src.code)
         loc = JuliaInterpreter.whereis(frame, pc)
 
         if loc === nothing || loc[2] > line
@@ -85,7 +85,7 @@ calls_in_frame(state) = calls_in_frame(state.debug_engine.frame)
 calls_in_frame(::Nothing) = []
 function calls_in_frame(frame::JuliaInterpreter.Frame)
     exprs = []
-    for pc in frame.pc:length(frame.framecode.src.codelocs)
+    for pc in frame.pc:length(frame.framecode.src.code)
         expr = JuliaInterpreter.pc_expr(frame, pc)
         if Meta.isexpr(expr, :call)
             push!(exprs, (pc = pc, expr = expr))

@@ -1,23 +1,104 @@
+# Executed workload: run the hottest per-item path (run_testitem with a passing
+# and a failing test) for real during package-image generation, so the compiled
+# code — including everything inference reaches transitively — is cached. A
+# signature list cannot capture that. Every worker launch pays for whatever is
+# missing here.
+function _precompile_workload_()
+    old_pwd = pwd()  # run_testitem cds into the test file's directory
+    try
+        mktempdir() do dir
+            test_file = joinpath(dir, "test_file.jl")
+            write(test_file, "# precompile workload\n")
+            uri = filepath2uri(test_file)
+
+            # In-memory endpoint: BufferStreams are unbounded, so the
+            # notifications run_testitem sends need no reader.
+            stream_a = Base.BufferStream()
+            stream_b = Base.BufferStream()
+            endpoint = JSONRPC.JSONRPCEndpoint(stream_a, stream_b)
+            JSONRPC.start(endpoint)
+            state = TestProcessState(endpoint)
+
+            make_item(id, name, code) = TestItemServerProtocol.RunTestItem(
+                id = id,
+                uri = uri,
+                name = name,
+                packageName = "",
+                packageUri = "file:///nonexistent",
+                useDefaultUsings = true,
+                testSetups = String[],
+                line = 1,
+                column = 1,
+                code = code,
+            )
+
+            Logging.with_logger(Logging.NullLogger()) do
+                redirect_stdout(devnull) do
+                    redirect_stderr(devnull) do
+                        for (item, expected_type) in (
+                            (make_item("wl-1", "passing", "@test 1 == 1"), TestItemServerProtocol.PassedParams),
+                            (make_item("wl-2", "failing", "@test 1 == 2"), TestItemServerProtocol.FailedParams),
+                            (make_item("wl-3", "erroring", "error(\"boom\")"), TestItemServerProtocol.ErroredParams),
+                        )
+                            notification_type, notification_params =
+                                run_testitem(endpoint, item, "Normal", nothing, state;
+                                    testcode_module_parent=@__MODULE__)
+                            # Send the result the same way runner_loop does.
+                            JSONRPC.send(endpoint, notification_type, notification_params)
+                            @assert notification_params isa expected_type
+                        end
+                    end
+                end
+            end
+
+            # BufferStream reads are not cancellation-aware: close the streams
+            # before the endpoint so its read task unblocks.
+            JSONRPC.flush(endpoint)
+            close(stream_a)
+            close(stream_b)
+            try close(endpoint) catch end
+
+            # Leave the temp dir before mktempdir removes it: run_testitem cd'd
+            # into it, and Windows cannot delete the current directory.
+            cd(old_pwd)
+        end
+
+        # Leaf helpers with real inputs.
+        withpath(() -> nothing, old_pwd)
+        is_infrastructure_frame(@__FILE__)
+        process_coverage_data(CoverageTools.FileCoverage[])
+        parse_log_level(:info)
+        try
+            error("workload")
+        catch err
+            bt = catch_backtrace()
+            format_error_message(err, bt)
+            find_error_location(stacktrace(bt))
+            backtrace_to_stackframes(bt)
+        end
+    catch err
+        # A failed workload must never break the test server itself — fall back
+        # to whatever the signature list below provides.
+        @warn "TestItemServer precompile workload failed" exception = err
+    finally
+        cd(old_pwd)
+    end
+    return nothing
+end
+
 function _precompile_()
     ccall(:jl_generating_output, Cint, ()) == 1 || return nothing
 
-    # URI helpers (called on every test run)
-    precompile(Tuple{typeof(uri2filepath), String})
-    precompile(Tuple{typeof(filepath2uri), String})
-    precompile(Tuple{typeof(withpath), Function, String})
-    precompile(Tuple{typeof(is_infrastructure_frame), String})
+    _precompile_workload_()
+
+    # Signature-only directives for paths the workload cannot execute
+    # (request handlers need a live protocol session; coverage needs
+    # --code-coverage; the debug backend needs a debuggee).
 
     # Error formatting
-    precompile(Tuple{typeof(format_error_message), Any, Any})
-    precompile(Tuple{typeof(find_error_location), Vector{Base.StackTraces.StackFrame}})
     precompile(Tuple{typeof(parse_backtrace_string), String})
-    precompile(Tuple{typeof(parse_log_level), Symbol})
-
-    # Test result formatting
-    precompile(Tuple{typeof(extract_expected_and_actual), Test.Fail})
 
     # Coverage
-    precompile(Tuple{typeof(process_coverage_data), Vector{CoverageTools.FileCoverage}})
     @static if VERSION >= v"1.11.0-rc2"
         precompile(Tuple{typeof(clear_coverage_data)})
         precompile(Tuple{typeof(collect_coverage_data!), Vector{CoverageTools.FileCoverage}, Vector{String}})

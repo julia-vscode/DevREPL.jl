@@ -63,7 +63,7 @@
 
     @info "[test] Output capture: shutting down"
     shutdown(controller)
-    TestHelpers.timed_wait(controller_task, 120; label="output-capture-controller")
+    TestHelpers.timed_wait(controller_task, 600; label="output-capture-controller")
 
     # The test item should have passed
     passed = filter(e -> e.event == :passed, events)

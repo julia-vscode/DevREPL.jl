@@ -1,3 +1,13 @@
+# Shutdown normally completes as soon as every process has reported its termination — a
+# few hundred milliseconds. This is the backstop for the case where one never does.
+const DEFAULT_SHUTDOWN_GRACE_SECONDS = 30.0
+
+# Activating an environment normally takes seconds. When it takes minutes it is because the
+# test process is precompiling, or fetching, or wedged — and until it answers, the controller
+# has nothing to say beyond the "Activating" status it posted at the start. This is how often
+# it says so anyway.
+const DEFAULT_ACTIVATION_PROGRESS_SECONDS = 120.0
+
 """
     TestItemController(callbacks; error_handler_file=nothing, crash_reporting_pipename=nothing, log_level=:Info)
 
@@ -14,6 +24,19 @@ the reactor event loop, then use [`execute_testrun`](@ref) to submit work.
 - `error_handler_file` — optional path to a Julia file loaded in child processes for custom error handling.
 - `crash_reporting_pipename` — optional named-pipe path for crash diagnostics.
 - `log_level::Symbol` — minimum log level (default `:Info`).
+- `schedule::Symbol` — how test items are distributed over processes (default `:duration`).
+  `:duration` uses the failures-first, duration- and setup-aware model in
+  [`schedule_testitems`](@ref), falling back to contiguous chunking on the first run of a
+  session, when there is no history to work from. `:contiguous` always chunks, which is
+  the behaviour of releases before this option existed.
+- `shutdown_grace_seconds::Real` — how long [`shutdown`](@ref) waits for every test process
+  to report its termination before force-killing whatever is left and stopping anyway
+  (default 30). Shutdown normally completes well within a second; this only bounds the
+  failure case.
+- `activation_progress_seconds::Real` — how often a still-unfinished environment activation
+  is reported with a warning (default 120). Activation covers the test process's own
+  precompilation, so a slow one is normal and is not interrupted; this only makes it visible
+  while it is happening instead of only in the post-mortem of whatever kills the run.
 
 # Lifecycle
 
@@ -39,11 +62,14 @@ mutable struct TestItemController{CB<:ControllerCallbacks}
             julia_cmd::String,
             julia_args::Vector{String},
             env::Dict{String,Union{String,Nothing}},
-            coverage::Bool
+            coverage::Bool,
+            check_bounds::String
         }
     }
 
     precompiled_envs::Set{ProcessEnv}
+
+    julia_version_cache::Dict{Tuple{String,Vector{String}},VersionNumber}
 
     error_handler_file::Union{Nothing,String}
     crash_reporting_pipename::Union{Nothing,String}
@@ -51,11 +77,37 @@ mutable struct TestItemController{CB<:ControllerCallbacks}
     log_level::Symbol
     controller_fsm::FSM{ControllerPhase}
 
+    # How long a shutdown waits for every process to report its termination before it
+    # force-kills whatever is left and stops anyway. See `handle!(::ShutdownDeadlineMsg)`.
+    shutdown_grace_seconds::Float64
+    shutdown_timer::Union{Nothing,Timer}
+
+    # How often `_activate_env!` warns that an activation it is still waiting on has not
+    # finished.
+    activation_progress_seconds::Float64
+
+    # Scheduling history, in memory and keyed by the (stable) test item id. It survives
+    # across the test runs of one session; nothing is persisted to disk.
+    schedule::Symbol
+    last_status::Dict{String,Symbol}
+    last_duration::Dict{String,Float64}                 # milliseconds
+    setup_cost::Dict{Tuple{String,String},Float64}      # (package_uri, setup name) → milliseconds
+
     function TestItemController(
         callbacks::CB;
         error_handler_file=nothing,
         crash_reporting_pipename=nothing,
-        log_level::Symbol=:Info) where {CB<:ControllerCallbacks}
+        log_level::Symbol=:Info,
+        schedule::Symbol=:duration,
+        shutdown_grace_seconds::Real=DEFAULT_SHUTDOWN_GRACE_SECONDS,
+        activation_progress_seconds::Real=DEFAULT_ACTIVATION_PROGRESS_SECONDS) where {CB<:ControllerCallbacks}
+
+        schedule in (:duration, :contiguous) ||
+            throw(ArgumentError("schedule must be :duration or :contiguous, got $(repr(schedule))"))
+        shutdown_grace_seconds > 0 ||
+            throw(ArgumentError("shutdown_grace_seconds must be positive, got $(shutdown_grace_seconds)"))
+        activation_progress_seconds > 0 ||
+            throw(ArgumentError("activation_progress_seconds must be positive, got $(activation_progress_seconds)"))
 
         return new{CB}(
             callbacks,
@@ -63,12 +115,20 @@ mutable struct TestItemController{CB<:ControllerCallbacks}
             Dict{String,TestProcessState}(),
             Dict{ProcessEnv,Vector{String}}(),
             Dict{String,TestRunState}(),
-            Set{@NamedTuple{julia_cmd::String,julia_args::Vector{String},env::Dict{String,Union{String,Nothing}},coverage::Bool}}(),
+            Set{@NamedTuple{julia_cmd::String,julia_args::Vector{String},env::Dict{String,Union{String,Nothing}},coverage::Bool,check_bounds::String}}(),
             Set{ProcessEnv}(),
+            Dict{Tuple{String,Vector{String}},VersionNumber}(),
             error_handler_file,
             crash_reporting_pipename,
             log_level,
-            controller_fsm("controller")
+            controller_fsm("controller"),
+            Float64(shutdown_grace_seconds),
+            nothing,
+            Float64(activation_progress_seconds),
+            schedule,
+            Dict{String,Symbol}(),
+            Dict{String,Float64}(),
+            Dict{Tuple{String,String},Float64}(),
         )
     end
 end
@@ -81,6 +141,11 @@ all child processes are terminated, and the reactor loop exits.
 
 This function returns immediately. Use [`wait_for_shutdown`](@ref) to block
 until all resources are fully released.
+
+The reactor stops as soon as every child process has reported its termination. Should
+one fail to within `shutdown_grace_seconds` (a [`TestItemController`](@ref) keyword,
+default 30 s), whatever is left is force-killed and dropped, so the reactor loop is
+guaranteed to exit.
 """
 function shutdown(controller::TestItemController)
     @info "Queueing controller shutdown"
@@ -139,6 +204,16 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════
 
 function handle!(c::TestItemController, ::ShutdownMsg)
+    # Idempotent. A second shutdown request must be a no-op, not an FSM error: this runs on
+    # the reactor, and an exception here does not fail anything visibly — it kills the
+    # reactor loop, and every run in flight then hangs until its caller times out. That is
+    # precisely how a test-harness timeout that called `shutdown` twice turned a slow run
+    # into a wedged controller.
+    if state(c.controller_fsm) != ControllerRunning
+        @debug "Ignoring shutdown request; controller already $(state(c.controller_fsm))"
+        return state(c.controller_fsm) == ControllerStopped
+    end
+
     @info "Shutting down controller, terminating $(length(c.test_processes)) test process(es)"
     transition!(c.controller_fsm, ControllerShuttingDown; reason="shutdown requested")
 
@@ -148,10 +223,10 @@ function handle!(c::TestItemController, ::ShutdownMsg)
             CancellationTokens.cancel(tr.cancellation_source)
             for ((testitem_id, test_env_id), _) in tr.remaining_work
                 push!(tr.reported_items, testitem_id)
-                c.callbacks.on_testitem_skipped(trid, testitem_id, test_env_id)
+                _notify_testitem_skipped(c.callbacks, trid, testitem_id, test_env_id)
             end
             transition!(tr.fsm, TestRunCancelled; reason="shutdown")
-            try put!(tr.completion_channel, nothing) catch end
+            _signal_testrun_completion!(tr, nothing)
         end
     end
 
@@ -163,10 +238,94 @@ function handle!(c::TestItemController, ::ShutdownMsg)
     end
 
     if isempty(c.test_processes)
-        transition!(c.controller_fsm, ControllerStopped; reason="no processes to drain")
+        _controller_stopped!(c; reason="no processes to drain")
         return true  # break reactor loop
     end
+
+    # From here the reactor only stops once every remaining process has posted a
+    # `TestProcessTerminatedMsg`. Bound that wait: if any process never reports — its IO task
+    # wedged, its child ignores SIGTERM, whatever — the deadline handler force-kills and
+    # drops what is left. Without this a single stuck worker keeps `run(controller)` from
+    # ever returning, and every caller waiting on it hangs with it.
+    grace = c.shutdown_grace_seconds
+    reactor_channel = c.reactor_channel
+    c.shutdown_timer = Timer(grace) do _
+        put!(reactor_channel, ShutdownDeadlineMsg())
+    end
     return false
+end
+
+function _controller_stopped!(c::TestItemController; reason::String)
+    if c.shutdown_timer !== nothing
+        try close(c.shutdown_timer) catch end
+        c.shutdown_timer = nothing
+    end
+    transition!(c.controller_fsm, ControllerStopped; reason=reason)
+    return nothing
+end
+
+function handle!(c::TestItemController, ::ShutdownDeadlineMsg)
+    c.shutdown_timer = nothing
+    if state(c.controller_fsm) != ControllerShuttingDown
+        # Already stopped normally (the timer raced the last termination), or never shutting
+        # down at all; either way there is nothing to force.
+        return state(c.controller_fsm) == ControllerStopped
+    end
+
+    remaining = collect(values(c.test_processes))
+    @warn "Shutdown did not complete within $(c.shutdown_grace_seconds)s; force-terminating $(length(remaining)) test process(es)" processes=[(id=ps.id, state=string(state(ps.fsm))) for ps in remaining]
+
+    for ps in remaining
+        _force_terminate_process!(c, ps; reason="shutdown deadline")
+    end
+
+    _controller_stopped!(c; reason="shutdown deadline")
+    return true  # break reactor loop
+end
+
+# The unconditional counterpart of the normal termination path: no waiting for the process
+# IO task, no message round-trip. Kills the child outright (SIGKILL where that exists —
+# plain `kill` already SIGTERMed it on the normal path and it evidently did not go), drops
+# every registration and forgets the process. Only for when the cooperative path has failed.
+function _force_terminate_process!(c::TestItemController, ps::TestProcessState; reason::String)
+    jl_process = ps.jl_process
+    if jl_process !== nothing && process_running(jl_process)
+        try
+            @static if Sys.iswindows()
+                kill(jl_process)
+            else
+                kill(jl_process, Base.SIGKILL)
+            end
+        catch
+        end
+    end
+
+    for reg in (ps.termination_reg, ps.testrun_watcher_registration, ps.timeout_reg)
+        reg === nothing || (try close(reg) catch end)
+    end
+    ps.termination_reg = nothing
+    ps.testrun_watcher_registration = nothing
+    ps.timeout_reg = nothing
+    if ps.timeout_cs !== nothing
+        try CancellationTokens.cancel(ps.timeout_cs) catch end
+        ps.timeout_cs = nothing
+    end
+    ps.jl_process = nothing
+    ps.endpoint = nothing
+
+    if state(ps.fsm) != ProcessDead
+        transition!(ps.fsm, ProcessDead; reason=reason)
+    end
+
+    pool_ids = get(c.process_pool, ps.env, String[])
+    idx = findfirst(isequal(ps.id), pool_ids)
+    idx === nothing || deleteat!(pool_ids, idx)
+    delete!(c.test_processes, ps.id)
+
+    if c.callbacks.on_process_terminated !== nothing
+        c.callbacks.on_process_terminated(ps.id)
+    end
+    return nothing
 end
 
 function handle!(c::TestItemController, msg::TestProcessStatusChangedMsg)
@@ -210,6 +369,20 @@ end
 function handle!(c::TestItemController, msg::TestProcessTerminatedMsg)
     @info "Test process '$(msg.testprocess_id)' terminated"
 
+    # Make sure the exit code is known before anything below classifies this termination.
+    # The process watcher records it asynchronously and normally wins, but this message can
+    # be posted from the pipe reader the instant it hits EOF — and telling a memory-recycle
+    # `exit(66)` from a crash depends on the code being here. Read it straight off the
+    # process object as the fallback; the OS has reaped the child by the time its pipe has
+    # closed, so it is available without waiting.
+    if haskey(c.test_processes, msg.testprocess_id)
+        ps = c.test_processes[msg.testprocess_id]
+        if ps.last_exit_code === nothing && ps.jl_process !== nothing && !process_running(ps.jl_process)
+            ps.last_exit_code = ps.jl_process.exitcode
+            ps.last_term_signal = ps.jl_process.termsignal
+        end
+    end
+
     # Run-level redistribution must happen BEFORE pool cleanup below, because
     # the redistribution logic still needs ps state (current_testitem_id,
     # has_started_items, fsm state, last_exit_code, ...) which lives in
@@ -249,7 +422,7 @@ function handle!(c::TestItemController, msg::TestProcessTerminatedMsg)
 
     # If shutting down and all processes gone, transition to stopped
     if state(c.controller_fsm) == ControllerShuttingDown && isempty(c.test_processes)
-        transition!(c.controller_fsm, ControllerStopped; reason="all processes terminated")
+        _controller_stopped!(c; reason="all processes terminated")
         return true  # break reactor loop
     end
     return false
@@ -263,6 +436,20 @@ function handle!(c::TestItemController, msg::ReturnToPoolMsg)
     ps = c.test_processes[msg.testprocess_id]
     if state(ps.fsm) == ProcessIdle
         @debug "Ignoring duplicate return_to_pool" id=msg.testprocess_id
+        return false
+    end
+
+    # Coverage results must not depend on how warm the process is. On a reused process the
+    # compiler already holds inference results for the code under test, so pure calls with
+    # constant arguments are folded away instead of executed and their line counters never
+    # move again: julia-vscode#3707 reported the same unchanged test item at 100% on the
+    # first run and 27.27% on every later run against the same process. A coverage process
+    # is therefore retired at the end of its test run instead of being pooled, which is also
+    # what `Pkg.test(coverage=true)` effectively does.
+    if ps.env.mode == "Coverage"
+        @info "Test process '$(msg.testprocess_id)' finished its coverage test run, terminating it instead of pooling"
+        _clear_testrun_on_process!(ps)
+        _shutdown_test_process!(c, ps)
         return false
     end
 
@@ -296,6 +483,15 @@ function handle!(c::TestItemController, msg::GetProcsForTestRunMsg)
             tr = c.test_runs[msg.testrun_id]
             CancellationTokens.cancel(tr.cancellation_source)
         end
+        return false
+    end
+
+    # A run can be cancelled (and, once its completion is signalled, deleted) before this
+    # message is handled: a token that is already cancelled when `execute_testrun` registers
+    # its bridge posts `TestRunCancelledMsg` ahead of this request. Launching processes for
+    # it would leak them and index a run that is gone.
+    if !haskey(c.test_runs, msg.testrun_id) || state(c.test_runs[msg.testrun_id].fsm) == TestRunCancelled
+        @debug "Ignoring GetProcsForTestRunMsg for cancelled or unknown test run" testrun_id=msg.testrun_id
         return false
     end
 
@@ -367,36 +563,24 @@ function handle!(c::TestItemController, msg::GetProcsForTestRunMsg)
                 julia_cmd=k.juliaCmd,
                 julia_args=k.juliaArgs,
                 env=k.env,
-                coverage=k.mode == "Coverage"
+                coverage=k.mode == "Coverage",
+                check_bounds=k.check_bounds
             ) in c.testprocess_precompile_not_required)
 
             @debug "Checking whether test environment precompilation is needed"
             coverage_arg = k.mode == "Coverage" ? "--code-coverage=user" : "--code-coverage=none"
 
-            jlEnv = copy(ENV)
+            jlEnv = _subprocess_env(k)
 
-            # During precompilation, Julia restricts JULIA_LOAD_PATH to dependency paths only
-            # (no "@" entry), which prevents child processes from using their own active project.
-            if ccall(:jl_generating_output, Cint, ()) == 1
-                delete!(jlEnv, "JULIA_LOAD_PATH")
-            end
+            julia_version = _resolve_julia_version(c, k)
 
-            for (ek, ev) in pairs(k.env)
-                if ev !== nothing
-                    jlEnv[ek] = ev
-                elseif haskey(jlEnv, ek)
-                    delete!(jlEnv, ek)
-                end
-            end
-
-            julia_version_as_string = read(Cmd(`$(k.juliaCmd) $(k.juliaArgs) --version`, detach=false, env=jlEnv), String)
-            julia_version_as_string = julia_version_as_string[length("julia version")+2:end]
-            julia_version = VersionNumber(julia_version_as_string)
-
-            if julia_version <= v"1.10.0"
+            if julia_version !== nothing && julia_version <= v"1.10.0"
                 testserver_precompile_script = joinpath(@__DIR__, "../testprocess/app/testserver_precompile.jl")
 
-                precompile_success = success(Cmd(`$(k.juliaCmd) $(k.juliaArgs) --check-bounds=yes --startup-file=no --history-file=no --depwarn=no $coverage_arg $testserver_precompile_script`, detach=false, env=jlEnv))
+                # "auto" is Julia's default and rejected as a flag value before 1.8 — only
+                # pass --check-bounds when overriding (matches the test process launch).
+                check_bounds_args = k.check_bounds == "auto" ? String[] : ["--check-bounds=$(k.check_bounds)"]
+                precompile_success = success(Cmd(`$(k.juliaCmd) $(k.juliaArgs) $(check_bounds_args) --startup-file=no --history-file=no --depwarn=no $coverage_arg $testserver_precompile_script`, detach=false, env=jlEnv))
 
                 @debug "Precompile of test server" precompile_success
             end
@@ -405,7 +589,8 @@ function handle!(c::TestItemController, msg::GetProcsForTestRunMsg)
                 julia_cmd=k.juliaCmd,
                 julia_args=k.juliaArgs,
                 env=k.env,
-                coverage=k.mode == "Coverage"
+                coverage=k.mode == "Coverage",
+                check_bounds=k.check_bounds
             ))
         end
 
@@ -483,31 +668,16 @@ function handle!(c::TestItemController, msg::ProcsAcquiredMsg)
 
     @info "Acquired $(sum(length, values(msg.procs), init=0)) test process(es) for test run"
 
-    # Distribute test items over test processes
+    # Distribute test items over test processes — see src/scheduling.jl
     for (env, proc_ids) in pairs(msg.procs)
-        assigned_for_env = 0
-        n_procs_for_env = length(proc_ids)
-        for pid in proc_ids
-            tr.stolen_ids_by_proc[pid] = String[]
-
-            if !haskey(tr.testitem_ids_by_proc, pid)
-                # Divvy up items: take a chunk for this process
-                all_env_items = _get_unchunked_items(tr, env)
-                procs_remaining = n_procs_for_env - assigned_for_env
-                chunk_size = max(1, div(length(all_env_items), procs_remaining, RoundUp))
-                chunk = splice!(all_env_items, 1:min(chunk_size, length(all_env_items)))
-                tr.testitem_ids_by_proc[pid] = chunk
-                assigned_for_env += 1
-                @info "Assigned $(length(chunk)) test item(s) to process '$(pid)'"
-            end
-        end
+        _assign_items_to_procs!(c, tr, env, proc_ids)
     end
 
     # Dispatch buffered ready notifications
     for pid in tr.processes_ready_before_acquired
         if haskey(tr.testitem_ids_by_proc, pid) && haskey(c.test_processes, pid)
             ps = c.test_processes[pid]
-            items_for_proc = [tr.test_items[id] for id in tr.testitem_ids_by_proc[pid] if haskey(tr.test_items, id)]
+            items_for_proc = _items_for(tr, _resolve_test_env_id(tr, ps.env), tr.testitem_ids_by_proc[pid])
             @debug "Dispatching buffered test items to ready process" testrun_id=msg.testrun_id process_id=pid assigned=length(items_for_proc)
             if state(ps.fsm) == ProcessReadyToRun
                 transition!(ps.fsm, ProcessRunning; reason="dispatching buffered items")
@@ -545,7 +715,7 @@ function handle!(c::TestItemController, msg::TestRunCancelledMsg)
     # Report all remaining test items as skipped
     for ((testitem_id, test_env_id), _) in tr.remaining_work
         push!(tr.reported_items, testitem_id)
-        c.callbacks.on_testitem_skipped(msg.testrun_id, testitem_id, test_env_id)
+        _notify_testitem_skipped(c.callbacks, msg.testrun_id, testitem_id, test_env_id)
     end
     empty!(tr.remaining_work)
 
@@ -560,7 +730,7 @@ function handle!(c::TestItemController, msg::TestRunCancelledMsg)
     end
 
     # Signal completion
-    try put!(tr.completion_channel, nothing) catch end
+    _signal_testrun_completion!(tr, nothing)
     return false
 end
 
@@ -577,7 +747,10 @@ function handle!(c::TestItemController, msg::ReadyToRunTestItemsMsg)
 
     if state(tr.fsm) == TestRunProcsAcquired || state(tr.fsm) == TestRunRunning
         @info "Test process '$(msg.testprocess_id)' is ready, dispatching test items"
-        items_for_proc = [tr.test_items[id] for id in get(tr.testitem_ids_by_proc, msg.testprocess_id, String[]) if haskey(tr.test_items, id)]
+        assigned_ids = get(tr.testitem_ids_by_proc, msg.testprocess_id, String[])
+        env_id = _resolve_test_env_id(tr, ps.env)
+        items_for_proc = _items_for(tr, env_id, assigned_ids)
+        @debug "Dispatch lookup" testprocess_id=msg.testprocess_id env_id assigned=length(assigned_ids) found=length(items_for_proc)
         if state(ps.fsm) == ProcessReadyToRun
             transition!(ps.fsm, ProcessRunning; reason="dispatching items")
         end
@@ -658,6 +831,7 @@ function handle!(c::TestItemController, msg::TestItemStartedMsg)
     end
 
     c.callbacks.on_testitem_started(msg.testrun_id, msg.testitem_id, test_env_id)
+    _record_testitem_started!(c, msg.testitem_id)
 
     # Start timeout if work unit has one
     if haskey(c.test_processes, msg.testprocess_id)
@@ -671,7 +845,10 @@ function handle!(c::TestItemController, msg::TestItemStartedMsg)
         timeout = wu !== nothing ? wu.timeout : nothing
 
         if timeout !== nothing
-            ps.timeout_cs = CancellationTokens.CancellationTokenSource(timeout)
+            # The test process's watchdog fires at the item's real deadline; we wait a grace
+            # period beyond it so its diagnostic dump is on disk before we kill the process.
+            # The item is still reported as having timed out after `timeout` seconds.
+            ps.timeout_cs = CancellationTokens.CancellationTokenSource(timeout + WATCHDOG_KILL_GRACE_SECONDS)
             ps.timeout_reg = CancellationTokens.register(CancellationTokens.get_token(ps.timeout_cs)) do
                 try
                     put!(c.reactor_channel, TestItemTimeoutMsg(msg.testrun_id, msg.testprocess_id, msg.testitem_id))
@@ -739,7 +916,8 @@ function handle!(c::TestItemController, msg::TestItemPassedMsg)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
         push!(tr.reported_items, msg.testitem_id)
-        c.callbacks.on_testitem_passed(msg.testrun_id, msg.testitem_id, test_env_id, msg.duration)
+        _notify_testitem_passed(c.callbacks, msg.testrun_id, msg.testitem_id, test_env_id, msg.duration, msg.perf)
+        _record_testitem_result!(c, msg.testitem_id, :passed, msg.duration)
 
         if msg.coverage !== nothing
             append!(tr.coverage, map(i -> CoverageTools.FileCoverage(uri2filepath(i.uri), "", i.coverage), msg.coverage))
@@ -805,7 +983,7 @@ function handle!(c::TestItemController, msg::TestItemFailedMsg)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
         push!(tr.reported_items, msg.testitem_id)
-        c.callbacks.on_testitem_failed(
+        _notify_testitem_failed(c.callbacks,
             msg.testrun_id,
             msg.testitem_id,
             test_env_id,
@@ -820,8 +998,10 @@ function handle!(c::TestItemController, msg::TestItemFailedMsg)
                     _convert_stack_trace(i.stackTrace),
                 ) for i in msg.messages
             ],
-            msg.duration
+            msg.duration,
+            msg.perf
         )
+        _record_testitem_result!(c, msg.testitem_id, :failed, msg.duration)
     else
         _log_unexpected_missing_work(tr, msg.testitem_id, msg.testprocess_id, test_env_id, "failed")
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
@@ -871,7 +1051,7 @@ function handle!(c::TestItemController, msg::TestItemErroredMsg)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
         push!(tr.reported_items, msg.testitem_id)
-        c.callbacks.on_testitem_errored(
+        _notify_testitem_errored(c.callbacks,
             msg.testrun_id,
             msg.testitem_id,
             test_env_id,
@@ -886,8 +1066,10 @@ function handle!(c::TestItemController, msg::TestItemErroredMsg)
                     _convert_stack_trace(i.stackTrace),
                 ) for i in msg.messages
             ],
-            msg.duration
+            msg.duration,
+            msg.perf
         )
+        _record_testitem_result!(c, msg.testitem_id, :errored, msg.duration)
     else
         _log_unexpected_missing_work(tr, msg.testitem_id, msg.testprocess_id, test_env_id, "errored")
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
@@ -922,6 +1104,82 @@ function handle!(c::TestItemController, msg::TestItemSkippedStolenMsg)
 
     _check_stealing!(c, tr, msg.testprocess_id)
     _check_testrun_complete!(c, tr)
+    return false
+end
+
+function handle!(c::TestItemController, msg::TestItemSkippedMsg)
+    if !haskey(c.test_runs, msg.testrun_id)
+        return false
+    end
+    tr = c.test_runs[msg.testrun_id]
+    if state(tr.fsm) in (TestRunCancelled, TestRunCompleted)
+        return false
+    end
+
+    # Cancel timeout
+    if haskey(c.test_processes, msg.testprocess_id)
+        _cancel_timeout!(c.test_processes[msg.testprocess_id])
+    end
+
+    # Handle stolen tracking
+    stolen_idx = findfirst(isequal(msg.testitem_id), get(tr.stolen_ids_by_proc, msg.testprocess_id, String[]))
+    if stolen_idx !== nothing
+        deleteat!(tr.stolen_ids_by_proc[msg.testprocess_id], stolen_idx)
+    end
+
+    # Discard the result if another process owns this item — see `_owns_testitem`.
+    if !_owns_testitem(tr, msg.testprocess_id, msg.testitem_id)
+        _log_discarded_result(msg.testitem_id, msg.testprocess_id, "skipped")
+        _check_stealing!(c, tr, msg.testprocess_id)
+        _check_testrun_complete!(c, tr)
+        return false
+    end
+
+    # Resolve test_env_id
+    test_env_id = if haskey(c.test_processes, msg.testprocess_id)
+        _resolve_test_env_id(tr, c.test_processes[msg.testprocess_id].env)
+    else
+        first(tr.test_environments).id
+    end
+
+    work_key = (msg.testitem_id, test_env_id)
+    if haskey(tr.remaining_work, work_key)
+        delete!(tr.remaining_work, work_key)
+        _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
+
+        push!(tr.reported_items, msg.testitem_id)
+        _notify_testitem_skipped(c.callbacks, msg.testrun_id, msg.testitem_id, test_env_id, msg.reason)
+    else
+        _log_unexpected_missing_work(tr, msg.testitem_id, msg.testprocess_id, test_env_id, "skipped")
+        _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
+    end
+
+    _check_stealing!(c, tr, msg.testprocess_id)
+    _check_testrun_complete!(c, tr)
+    return false
+end
+
+# Records what a setup cost and printed on this process. The test process replays the output
+# onto every item that declares the setup itself; what the controller keeps this for is the
+# cost model, and it therefore survives for as long as the process caches the setup.
+function handle!(c::TestItemController, msg::TestSetupEvaluatedMsg)
+    key = (msg.package_uri, msg.name)
+
+    # Per-process, and only while the process is still around to have the setup cached.
+    ps = get(c.test_processes, msg.testprocess_id, nothing)
+    if ps !== nothing
+        ps.loaded_setups[key] = (output=msg.output, duration=msg.duration)
+    end
+
+    # Controller-wide, and deliberately outside the branch above: what a setup costs is a
+    # property of the setup, not of whichever process happened to report it, so it is worth
+    # keeping even when that process has already been recycled or terminated. It feeds the
+    # scheduler's affinity model, which prices duplicating a setup across processes against
+    # the imbalance that relieves.
+    if msg.duration !== nothing
+        c.setup_cost[key] = msg.duration
+    end
+
     return false
 end
 
@@ -1002,12 +1260,12 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
     if msg.skip_remaining
         @info "Test process '$(terminated_proc_id)' terminated by user, erroring $(length(items_to_redistribute)) remaining item(s)"
         for testitem_id in items_to_redistribute
-            item = get(tr.test_items, testitem_id, nothing)
+            item = _item_for_env(tr, test_env_id, testitem_id)
             work_key = (testitem_id, test_env_id)
             if haskey(tr.remaining_work, work_key) && item !== nothing
                 delete!(tr.remaining_work, work_key)
                 push!(tr.reported_items, testitem_id)
-                c.callbacks.on_testitem_errored(
+                _notify_testitem_errored(c.callbacks,
                     msg.testrun_id,
                     testitem_id,
                     test_env_id,
@@ -1038,7 +1296,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
             if haskey(tr.remaining_work, work_key)
                 delete!(tr.remaining_work, work_key)
                 push!(tr.reported_items, testitem_id)
-                c.callbacks.on_testitem_skipped(msg.testrun_id, testitem_id, test_env_id)
+                _notify_testitem_skipped(c.callbacks, msg.testrun_id, testitem_id, test_env_id)
             end
         end
         _check_testrun_complete!(c, tr)
@@ -1052,23 +1310,38 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
     ps = haskey(c.test_processes, terminated_proc_id) ? c.test_processes[terminated_proc_id] : nothing
     crashed_item_id = ps !== nothing ? ps.current_testitem_id : nothing
 
+    # A memory recycle is a clean, deliberate exit taken *between* items, after the last
+    # result was reported — so there is no in-flight item to blame, and the remaining items
+    # go through the ordinary redistribute-or-respawn path below rather than being errored.
+    recycled = ps !== nothing && ps.last_exit_code == MEMORY_RECYCLE_EXIT_CODE
+    @debug "Termination classification" testprocess_id=terminated_proc_id exit_code=(ps === nothing ? :no_ps : ps.last_exit_code) term_signal=(ps === nothing ? :no_ps : ps.last_term_signal) recycled
+    if recycled
+        @info "Test process '$(terminated_proc_id)' stopped itself to release memory, redistributing $(length(items_to_redistribute)) remaining item(s)"
+        _cancel_timeout!(ps)
+        crashed_item_id = nothing
+    end
+
     crashed_work_key = crashed_item_id !== nothing ? (crashed_item_id, test_env_id) : nothing
     if crashed_item_id !== nothing && haskey(tr.remaining_work, crashed_work_key)
         # A test item was actively running when the process crashed — error it immediately.
-        item = tr.test_items[crashed_item_id]
+        item = _item_for_env(tr, test_env_id, crashed_item_id)
+        # The details are only needed to describe the crash; the item must be reported as
+        # errored either way, so fall back to its id rather than letting a lookup miss
+        # decide whether a test run completes.
+        item_label = item === nothing ? crashed_item_id : item.label
         delete!(tr.remaining_work, crashed_work_key)
         filter!(!isequal(crashed_item_id), items_to_redistribute)
         _cancel_timeout!(ps)
         exit_info = ps !== nothing ? _exit_info_string(ps.last_exit_code, ps.last_term_signal) : nothing
         crash_detail = exit_info !== nothing ? " ($exit_info)" : ""
-        @info "Test process '$(terminated_proc_id)' crashed$(crash_detail) while running test item '$(item.label)', erroring it immediately"
+        @info "Test process '$(terminated_proc_id)' crashed$(crash_detail) while running test item '$(item_label)', erroring it immediately"
         error_message = if exit_info !== nothing
-            "Test process crashed with $exit_info while running test item '$(item.label)'"
+            "Test process crashed with $exit_info while running test item '$(item_label)'"
         else
-            "Test process crashed while running test item '$(item.label)'"
+            "Test process crashed while running test item '$(item_label)'"
         end
         push!(tr.reported_items, crashed_item_id)
-        c.callbacks.on_testitem_errored(
+        _notify_testitem_errored(c.callbacks,
             msg.testrun_id,
             crashed_item_id,
             test_env_id,
@@ -1077,9 +1350,9 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
                     error_message,
                     nothing,
                     nothing,
-                    item.uri,
-                    item.line,
-                    item.column,
+                    item === nothing ? "" : item.uri,
+                    item === nothing ? 0 : item.line,
+                    item === nothing ? 0 : item.column,
                     nothing
                 )
             ],
@@ -1094,12 +1367,12 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
             # True startup crash — process never ran any item. Error all queued items.
             @info "Test process '$(terminated_proc_id)' crashed during startup, erroring $(length(items_to_redistribute)) queued item(s)"
             for testitem_id in items_to_redistribute
-                item = get(tr.test_items, testitem_id, nothing)
+                item = _item_for_env(tr, test_env_id, testitem_id)
                 work_key = (testitem_id, test_env_id)
                 if haskey(tr.remaining_work, work_key) && item !== nothing
                     delete!(tr.remaining_work, work_key)
                     push!(tr.reported_items, testitem_id)
-                    c.callbacks.on_testitem_errored(
+                    _notify_testitem_errored(c.callbacks,
                         msg.testrun_id,
                         testitem_id,
                         test_env_id,
@@ -1125,12 +1398,12 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
             # was received — no item ever began executing. Error all queued items.
             @info "Test process '$(terminated_proc_id)' crashed before starting any test item, erroring $(length(items_to_redistribute)) queued item(s)"
             for testitem_id in items_to_redistribute
-                item = get(tr.test_items, testitem_id, nothing)
+                item = _item_for_env(tr, test_env_id, testitem_id)
                 work_key = (testitem_id, test_env_id)
                 if haskey(tr.remaining_work, work_key) && item !== nothing
                     delete!(tr.remaining_work, work_key)
                     push!(tr.reported_items, testitem_id)
-                    c.callbacks.on_testitem_errored(
+                    _notify_testitem_errored(c.callbacks,
                         msg.testrun_id,
                         testitem_id,
                         test_env_id,
@@ -1151,9 +1424,10 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
             end
             _check_testrun_complete!(c, tr)
             return
-        else
+        elseif !recycled
             # Process was functional and was killed after running items (e.g., timeout).
-            # Fall through to redistribute remaining un-started items.
+            # Fall through to redistribute remaining un-started items. A memory recycle
+            # takes the same path but has already said so above, in accurate terms.
             @info "Test process '$(terminated_proc_id)' terminated after running items, redistributing $(length(items_to_redistribute)) remaining item(s)"
         end
     end
@@ -1164,7 +1438,10 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
         return
     end
 
-    @info "Redistributing $(length(items_to_redistribute)) un-started item(s) from crashed process '$(terminated_proc_id)'"
+    # Never call a memory recycle a crash: this is the diagnostic path the feature exists to
+    # keep readable, and a deliberate exit reported as a crash sends anyone reading a CI log
+    # looking for a fault that isn't there.
+    @info "Redistributing $(length(items_to_redistribute)) un-started item(s) from $(recycled ? "recycled" : "crashed") process '$(terminated_proc_id)'"
 
     # Try to find another live process in the same env
     recipient_pid = nothing
@@ -1182,7 +1459,7 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
         rps = c.test_processes[recipient_pid]
         append!(get!(tr.testitem_ids_by_proc, recipient_pid, String[]), items_to_redistribute)
 
-        items_to_run = [tr.test_items[id] for id in items_to_redistribute if haskey(tr.test_items, id)]
+        items_to_run = _items_for(tr, test_env_id, items_to_redistribute)
         @info "Redistributing $(length(items_to_run)) item(s) to existing process '$(recipient_pid)'"
         _send_run_testitems!(c, rps, items_to_run)
     else
@@ -1251,6 +1528,46 @@ function _handle_termination_during_run!(c::TestItemController, msg::TestProcess
     return
 end
 
+# The outbound half of a process's JSON-RPC connection, when the JSONRPC in use can report
+# it. That queue is unbounded, so a peer that has stopped reading never makes a send fail —
+# the messages simply accumulate, undelivered. Guarded by `isdefined` because the compat
+# bound still allows a JSONRPC without the accessor.
+function _outbound_backlog(ps::TestProcessState)
+    ps.endpoint === nothing && return nothing
+    isdefined(JSONRPC, :outbound_backlog) || return nothing
+    return try
+        JSONRPC.outbound_backlog(ps.endpoint)
+    catch
+        nothing
+    end
+end
+
+"""
+What the controller knows about a process at the moment one of its items timed out, as
+`@warn` key/value pairs.
+
+A test process talks to the controller over two independent channels: the JSON-RPC socket
+that carries every result, and the stdout/stderr pipes that carry captured output. A timeout
+is only evidence that the *result* never arrived, and these two clocks are what separate the
+cases. Output still arriving while the socket has gone quiet means the connection died, not
+the test — which is exactly what happened in
+<https://github.com/JuliaControl/ModelPredictiveControl.jl/actions/runs/32420160289>, where a
+test item that had passed 17/17 in 9.8 seconds was reported as a one-hour hang and the only
+way to tell was to reconstruct it from the run's artifacts afterwards.
+"""
+function _timeout_evidence(ps::TestProcessState, diagnostics::Union{Nothing,AbstractString})
+    now = time()
+    elapsed(t) = t === nothing ? nothing : round(now - t, digits=1)
+    backlog = _outbound_backlog(ps)
+    return (
+        seconds_since_last_message = elapsed(ps.last_message_at),
+        seconds_since_last_output = elapsed(ps.last_output_at),
+        watchdog_dump = diagnostics !== nothing,
+        outbound_queued = backlog === nothing ? nothing : backlog.queued,
+        outbound_blocked_seconds = backlog === nothing ? nothing : round(backlog.blocked_seconds, digits=1),
+    )
+end
+
 function handle!(c::TestItemController, msg::TestItemTimeoutMsg)
     if !haskey(c.test_runs, msg.testrun_id) || !haskey(c.test_processes, msg.testprocess_id)
         return false
@@ -1270,13 +1587,25 @@ function handle!(c::TestItemController, msg::TestItemTimeoutMsg)
     # Resolve test_env_id
     test_env_id = _resolve_test_env_id(tr, ps.env)
 
-    item = get(tr.test_items, msg.testitem_id, nothing)
+    item = _item_for_env(tr, test_env_id, msg.testitem_id)
     work_key = (msg.testitem_id, test_env_id)
     wu = get(tr.remaining_work, work_key, nothing)
     item_label = item !== nothing ? item.label : msg.testitem_id
     timeout_val = wu !== nothing && wu.timeout !== nothing ? wu.timeout : "?"
 
-    @warn "Test item '$(item_label)' timed out after $(timeout_val) seconds"
+    # Read before the warning, so it can report whether the process's own watchdog believed
+    # the item was still running. The dump is absent when the item wedged without ever
+    # reaching a GC safepoint, or when the process has no spare thread to run the watchdog
+    # on — so its absence is evidence, not proof.
+    diagnostics = _read_diagnostics(msg.testprocess_id)
+
+    @warn "Test item '$(item_label)' timed out after $(timeout_val) seconds" testprocess_id=msg.testprocess_id _timeout_evidence(ps, diagnostics)...
+
+    # Attach whatever the watchdog managed to dump, so the backtrace shows up as that item's
+    # output.
+    if diagnostics !== nothing
+        c.callbacks.on_append_output(msg.testrun_id, msg.testitem_id, test_env_id, replace(diagnostics, "\n"=>"\r\n"))
+    end
 
     _cancel_timeout!(ps)
 
@@ -1286,7 +1615,7 @@ function handle!(c::TestItemController, msg::TestItemTimeoutMsg)
         _remove_from_proc_queue!(tr, msg.testprocess_id, msg.testitem_id)
 
         push!(tr.reported_items, msg.testitem_id)
-        c.callbacks.on_testitem_errored(
+        _notify_testitem_errored(c.callbacks,
             msg.testrun_id,
             msg.testitem_id,
             test_env_id,
@@ -1511,11 +1840,11 @@ function handle!(c::TestItemController, msg::ActivationFailedMsg)
         # Error all collected items
         for testitem_id in items_to_error
             work_key = (testitem_id, test_env_id)
-            item = get(tr.test_items, testitem_id, nothing)
+            item = _item_for_env(tr, test_env_id, testitem_id)
             if haskey(tr.remaining_work, work_key) && item !== nothing
                 delete!(tr.remaining_work, work_key)
                 push!(tr.reported_items, testitem_id)
-                c.callbacks.on_testitem_errored(
+                _notify_testitem_errored(c.callbacks,
                     testrun_id,
                     testitem_id,
                     test_env_id,
@@ -1553,11 +1882,11 @@ function handle!(c::TestItemController, msg::ActivationFailedMsg)
         if haskey(tr.testitem_ids_by_proc, ps.id)
             for testitem_id in tr.testitem_ids_by_proc[ps.id]
                 work_key = (testitem_id, test_env_id)
-                item = get(tr.test_items, testitem_id, nothing)
+                item = _item_for_env(tr, test_env_id, testitem_id)
                 if haskey(tr.remaining_work, work_key) && item !== nothing
                     delete!(tr.remaining_work, work_key)
                     push!(tr.reported_items, testitem_id)
-                    c.callbacks.on_testitem_errored(
+                    _notify_testitem_errored(c.callbacks,
                         testrun_id,
                         testitem_id,
                         test_env_id,
@@ -1594,10 +1923,15 @@ function handle!(c::TestItemController, msg::TestProcessIOErrorMsg)
     end
     ps = c.test_processes[msg.testprocess_id]
 
-    if state(ps.fsm) in (ProcessDead, ProcessIdle)
+    if state(ps.fsm) == ProcessDead
         @debug "Ignoring IO error for process in state $(state(ps.fsm))" testprocess_id=msg.testprocess_id
         return false
     end
+    # An *idle* process used to be ignored here too. That left a pooled process whose pipe
+    # had broken registered as alive: it would be handed out again later, and — worse — at
+    # shutdown the reactor waited forever for a `TestProcessTerminatedMsg` that its IO task,
+    # having taken the error path, was never going to post. Fall through: with no test run
+    # attached it cannot take the restart branch, so it is terminated and forgotten below.
 
     @debug "Test process IO error" testprocess_id=msg.testprocess_id error_type=msg.error_type fsm_state=state(ps.fsm) has_testrun=(ps.testrun_id !== nothing) testrun_id=something(ps.testrun_id, "none") exit_code=msg.exit_code term_signal=msg.term_signal
 
@@ -1640,6 +1974,56 @@ end
 # Process management helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Build the environment a subprocess for `penv` runs in, applying the test environment's
+# overlay (a `nothing` value deletes the variable) on top of ours.
+function _subprocess_env(penv::ProcessEnv)
+    jlEnv = copy(ENV)
+
+    # During precompilation, Julia restricts JULIA_LOAD_PATH to dependency paths only
+    # (no "@" entry), which prevents child processes from using their own active project.
+    if ccall(:jl_generating_output, Cint, ()) == 1
+        delete!(jlEnv, "JULIA_LOAD_PATH")
+    end
+
+    for (ek, ev) in pairs(penv.env)
+        if ev !== nothing
+            jlEnv[ek] = ev
+        elseif haskey(jlEnv, ek)
+            delete!(jlEnv, ek)
+        end
+    end
+
+    return jlEnv
+end
+
+# The Julia version a test process for `penv` will run. Two callers need it: the pre-1.10
+# precompile hack, and the launch, which may only pass `--threads=N,M` to Julia >= 1.9.
+#
+# Probing costs a process launch, so the answer is cached per (cmd, args) and the common
+# case — the exact binary this controller runs, with no extra args — short-circuits. (A bare
+# "julia" must still be probed: PATH or a juliaup channel can resolve it to a different
+# version than the running process.) Returns `nothing` when the probe fails, which every
+# caller treats as "assume nothing".
+function _resolve_julia_version(c::TestItemController, penv::ProcessEnv)
+    if isempty(penv.juliaArgs) && penv.juliaCmd == joinpath(Sys.BINDIR, Base.julia_exename())
+        return VERSION
+    end
+
+    key = (penv.juliaCmd, penv.juliaArgs)
+    haskey(c.julia_version_cache, key) && return c.julia_version_cache[key]
+
+    version = try
+        version_as_string = read(Cmd(`$(penv.juliaCmd) $(penv.juliaArgs) --version`, detach=false, env=_subprocess_env(penv)), String)
+        VersionNumber(version_as_string[length("julia version")+2:end])
+    catch err
+        @warn "Could not determine the Julia version of '$(penv.juliaCmd)'" exception=(err, catch_backtrace())
+        nothing
+    end
+
+    version !== nothing && (c.julia_version_cache[key] = version)
+    return version
+end
+
 # Map common POSIX signal numbers to human-readable names.
 const _SIGNAL_NAMES = Dict{Int,String}(
     1  => "SIGHUP",
@@ -1656,9 +2040,22 @@ const _SIGNAL_NAMES = Dict{Int,String}(
     15 => "SIGTERM",
 )
 
+# `Base.Process.termsignal` is `0`, not `nothing`, for a process that exited with a code
+# rather than being killed by a signal — so `0` means "no signal" here.
 function _signal_name(sig::Union{Nothing,Int})
-    sig === nothing && return nothing
+    (sig === nothing || sig <= 0) && return nothing
     return get(_SIGNAL_NAMES, sig, "signal $sig")
+end
+
+# Windows reports fatal errors as NTSTATUS exit codes (e.g. `0xC0000005` for an access
+# violation), which Julia surfaces as a negative `Int32`; show the hex form as well since that
+# is what people recognise.
+function _exit_code_string(exit_code::Int)
+    if exit_code < 0 && exit_code >= typemin(Int32)
+        return string("exit code ", exit_code, " (0x", uppercase(string(reinterpret(UInt32, Int32(exit_code)), base=16, pad=8)), ")")
+    else
+        return "exit code $exit_code"
+    end
 end
 
 function _exit_info_string(exit_code::Union{Nothing,Int}, term_signal::Union{Nothing,Int})
@@ -1666,7 +2063,7 @@ function _exit_info_string(exit_code::Union{Nothing,Int}, term_signal::Union{Not
     if sig !== nothing
         return "$sig (signal $term_signal)"
     elseif exit_code !== nothing
-        return "exit code $exit_code"
+        return _exit_code_string(exit_code)
     else
         return nothing
     end
@@ -1681,7 +2078,14 @@ function _kill_julia_process_resources!(jl_process::Union{Nothing,Base.Process},
         try kill(jl_process) catch end
     end
     if endpoint !== nothing
-        try close(endpoint) catch end
+        # This runs inside a cancellation callback, i.e. synchronously on whichever task
+        # called `cancel` — normally the reactor. `close(::JSONRPCEndpoint)` blocks until the
+        # endpoint's read and write tasks have finished, and if either of those does not
+        # come back the reactor is wedged and can never process the termination message it
+        # is waiting for. Nothing needs this close to be synchronous: the process IO task in
+        # `start` closes the endpoint itself in a `finally`, and its `get_next_message` is
+        # unblocked by the process token, not by this close. So do it off the caller.
+        @async try close(endpoint) catch end
     end
 end
 
@@ -1722,7 +2126,77 @@ function _clear_testrun_on_process!(ps::TestProcessState)
     ps.has_started_items = false
 end
 
+# Drop cached setup state that the incoming run invalidates.
+#
+# `ps.loaded_setups` records what a `@testmodule`/`@testsnippet` cost and printed on this
+# process. The test process re-evaluates a setup whose code changed, so a cost measured
+# against the old body no longer describes it — and the scheduler would go on pricing warm
+# affinity for a setup this process can no longer reproduce.
+#
+# Called for every run on a pooled process, which is what makes it cover the Revise case
+# too: revised source reaches the process as changed setup code here, not through a separate
+# path. Deliberately conservative — a setup cached under an earlier run that this one does
+# not mention is dropped rather than assumed intact. Losing a cost hint only costs us a
+# scheduling opportunity; keeping a wrong one produces a worse schedule and hides why.
+function _invalidate_stale_setups!(ps::TestProcessState, new_setups)
+    isempty(ps.loaded_setups) && return nothing
+
+    previous = ps.test_setups === nothing ? Dict{Tuple{String,String},String}() :
+        Dict((i.packageUri, i.name) => i.code for i in ps.test_setups)
+    incoming = new_setups === nothing ? Dict{Tuple{String,String},String}() :
+        Dict((i.packageUri, i.name) => i.code for i in new_setups)
+
+    filter!(ps.loaded_setups) do (key, _)
+        haskey(incoming, key) && get(previous, key, nothing) == incoming[key]
+    end
+    return nothing
+end
+
+# Every test item in a run must be individually addressable, or the run silently loses one:
+# the state dicts are keyed by `(id, package_uri)`, so a genuine duplicate would overwrite its
+# twin and that item would never run, never report, and never appear in the results.
+#
+# Two items sharing an *id* is legitimate and must not error — that is the same package
+# checked out twice, which the package_uri separates. What cannot happen is a collision on
+# the full key, since discovery already suffixes duplicate labels within a file with `#N`.
+# So this should never fire; it exists so that a future mistake in the id scheme surfaces as
+# an error here rather than as a test that quietly stopped running.
+function _assert_addressable_items(test_items::Vector{TestItemDetail})
+    seen = Dict{Tuple{String,String},TestItemDetail}()
+    for item in test_items
+        key = (item.id, item.package_uri)
+        previous = get(seen, key, nothing)
+        if previous !== nothing
+            throw(ArgumentError(
+                "Two test items in this run share the id '$(item.id)' within the same package " *
+                "('$(item.package_uri)'), so one of them could not be run or reported. " *
+                "First at $(previous.uri):$(previous.line), second at $(item.uri):$(item.line)."))
+        end
+        seen[key] = item
+    end
+    return nothing
+end
+
+# Test item details, looked up for the package a given process is running. Ids are scoped to
+# their package, so the id alone does not identify an item when the same package is checked
+# out twice in one workspace — see the `test_items` field comment in `state.jl`.
+# One test item's details for the environment a process belongs to, or `nothing`.
+#
+# Returns `nothing` rather than throwing on a miss, and tolerates an unknown environment.
+# Both matter here: these lookups run on the process-termination path, and an exception
+# thrown out of a reactor handler does not surface as a failed test item — it kills the
+# reactor loop, so the run never completes and the caller waits until its timeout. A missing
+# detail should degrade to a generic message, not a hang.
+function _item_for_env(tr::TestRunState, test_env_id::Union{Nothing,AbstractString}, testitem_id::AbstractString)
+    test_env_id === nothing && return nothing
+    return get(tr.test_items, (testitem_id, test_env_id), nothing)
+end
+
+_items_for(tr::TestRunState, test_env_id::AbstractString, ids) =
+    TestItemDetail[tr.test_items[(id, test_env_id)] for id in ids if haskey(tr.test_items, (id, test_env_id))]
+
 function _setup_testrun_on_process!(ps::TestProcessState, testrun_id::String, test_setups, coverage_root_uris, log_level::Symbol, testrun_token)
+    _invalidate_stale_setups!(ps, test_setups)
     ps.testrun_id = testrun_id
     ps.testrun_token = testrun_token
     ps.test_setups = test_setups
@@ -1808,6 +2282,23 @@ function _replace_process_state!(
     return new_ps, old_id
 end
 
+# Hand `execute_testrun` its result. `completion_channel` is `Channel{Any}(1)`; a `put!` on a
+# full channel does not throw, it *blocks* — and this runs on the reactor, so the old
+# `try put! catch end` was no protection at all when a run was signalled twice (a shutdown
+# racing a completing run, say). A value already sitting in the channel means the run has
+# been signalled; the waiter only ever takes once.
+function _signal_testrun_completion!(tr::TestRunState, value)
+    ch = tr.completion_channel
+    try
+        if !isready(ch) && isopen(ch)
+            put!(ch, value)
+        end
+    catch err
+        @debug "Could not signal test run completion" testrun_id=tr.id exception=err
+    end
+    return nothing
+end
+
 function _shutdown_test_process!(c::TestItemController, ps::TestProcessState)
     @debug "Shutting down test process" testprocess_id=ps.id
     _kill_julia_process!(ps)
@@ -1825,10 +2316,14 @@ function _launch_julia_process!(c::TestItemController, ps::TestProcessState)
     @debug "Launching Julia process for test process" testprocess_id=ps.id package=ps.env.package_name mode=ps.env.mode is_precompile=ps.is_precompile_process precompile_done=ps.precompile_done testrun_id=something(ps.testrun_id, "none")
     put!(c.reactor_channel, TestProcessStatusChangedMsg(ps.id, "Launching"))
 
+    # Resolved here rather than in `start` so the (possibly probing) lookup stays on the
+    # reactor, where it is serialized and cached, instead of racing across IO tasks.
+    julia_version = _resolve_julia_version(c, ps.env)
+
     t = @async try
         start(ps.id, c.reactor_channel, ps, ps.env, ps.debug_pipe_name,
               c.error_handler_file, c.crash_reporting_pipename,
-              launch_token)
+              julia_version, launch_token)
     catch err
         @error "Error in test process IO" testprocess_id=ps.id exception=(err, catch_backtrace())
     end
@@ -1847,15 +2342,29 @@ function _activate_env!(c::TestItemController, ps::TestProcessState)
             @debug "Activation cancelled: endpoint gone before send" testprocess_id=ps.id
             return
         end
-        result = JSONRPC.send(
-            ps.endpoint,
-            TestItemServerProtocol.testserver_activate_env_request_type,
-            TestItemServerProtocol.ActivateEnvParams(
-                projectUri = something(ps.env.project_uri, missing),
-                packageUri = ps.env.package_uri,
-                packageName = ps.env.package_name
+        # Say so, repeatedly, while this is outstanding. The request covers the test
+        # process's own precompilation, so a slow one is legitimate and is not interrupted
+        # here — but without this the controller goes silent between the "Activating" status
+        # and whatever eventually gives up, and a run that stalls in activation leaves a log
+        # that names neither the stage nor the process.
+        interval = c.activation_progress_seconds
+        started = time()
+        progress_timer = Timer(interval, interval=interval) do _
+            @warn "Environment activation still pending" testprocess_id=ps.id package=ps.env.package_name elapsed_seconds=round(time() - started, digits=1)
+        end
+        result = try
+            JSONRPC.send(
+                ps.endpoint,
+                TestItemServerProtocol.testserver_activate_env_request_type,
+                TestItemServerProtocol.ActivateEnvParams(
+                    projectUri = something(ps.env.project_uri, missing),
+                    packageUri = ps.env.package_uri,
+                    packageName = ps.env.package_name
+                )
             )
-        )
+        finally
+            close(progress_timer)
+        end
 
         if result.status == "failed"
             @warn "Environment activation failed" testprocess_id=ps.id error=coalesce(result.error, "unknown error")
@@ -1871,7 +2380,7 @@ function _activate_env!(c::TestItemController, ps::TestProcessState)
         if err isa JSONRPC.TransportError
             @debug "Activation failed (transport error, likely cancelled)" testprocess_id=ps.id exception=(err, catch_backtrace())
         else
-            @error "Error activating environment" testprocess_id=ps.id exception=(err, catch_backtrace())
+            @warn "Error activating environment" testprocess_id=ps.id exception=(err, catch_backtrace())
             try put!(c.reactor_channel, TestProcessIOErrorMsg(ps.id, :fatal)) catch end
         end
     end
@@ -1883,6 +2392,12 @@ function _configure_testrun!(c::TestItemController, ps::TestProcessState)
         try put!(c.reactor_channel, TestProcessIOErrorMsg(ps.id, :fatal)) catch end
         return
     end
+    # Read off the reactor, before the async send: `ps.testrun_id` may be cleared by the
+    # time the task runs.
+    tr = ps.testrun_id !== nothing ? get(c.test_runs, ps.testrun_id, nothing) : nothing
+    gc_between_testitems = tr !== nothing ? tr.gc_between_testitems : false
+    memory_threshold = tr !== nothing ? tr.memory_threshold : nothing
+
     @async try
         if ps.endpoint === nothing || !isopen(ps.endpoint)
             @debug "Configuration cancelled: endpoint gone before send" testprocess_id=ps.id
@@ -1895,7 +2410,9 @@ function _configure_testrun!(c::TestItemController, ps::TestProcessState)
                 mode = ps.env.mode,
                 logLevel = string(ps.proc_log_level),
                 coverageRootUris = something(ps.coverage_root_uris, missing),
-                testSetups = ps.test_setups
+                testSetups = ps.test_setups,
+                gcBetweenTestitems = gc_between_testitems,
+                memoryThreshold = something(memory_threshold, missing)
             )
         )
         put!(c.reactor_channel, TestProcessTestSetupsLoadedMsg(ps.id))
@@ -1903,11 +2420,17 @@ function _configure_testrun!(c::TestItemController, ps::TestProcessState)
         if err isa JSONRPC.TransportError
             @debug "Configuration failed (transport error, likely cancelled)" testprocess_id=ps.id exception=(err, catch_backtrace())
         else
-            @error "Error configuring test run" testprocess_id=ps.id exception=(err, catch_backtrace())
+            @warn "Error configuring test run" testprocess_id=ps.id exception=(err, catch_backtrace())
             try put!(c.reactor_channel, TestProcessIOErrorMsg(ps.id, :fatal)) catch end
         end
     end
 end
+
+# The wire format carries the `skip` kwarg as source text, because the test process is what
+# evaluates it. A literal is sent as `"true"`/`"false"` rather than being resolved here, so
+# the test process has a reason string to report either way; `false` is left off entirely.
+_skip_source(option_skip::Bool) = option_skip ? "true" : missing
+_skip_source(option_skip::AbstractString) = String(option_skip)
 
 function _send_run_testitems!(c::TestItemController, ps::TestProcessState, items)
     if ps.endpoint === nothing || !isopen(ps.endpoint)
@@ -1916,6 +2439,19 @@ function _send_run_testitems!(c::TestItemController, ps::TestProcessState, items
         return
     end
     put!(c.reactor_channel, TestProcessStatusChangedMsg(ps.id, "Running"))
+
+    # Resolved on the reactor, where the run state is safe to read. The test process arms
+    # its hang watchdog from this; the controller's own timeout stays the backstop.
+    tr = ps.testrun_id !== nothing ? get(c.test_runs, ps.testrun_id, nothing) : nothing
+    test_env_id = tr !== nothing ? _resolve_test_env_id(tr, ps.env) : nothing
+    timeouts_ms = Dict{String,Union{Missing,Float64}}()
+    if tr !== nothing
+        for i in items
+            wu = get(tr.remaining_work, (i.id, test_env_id), nothing)
+            timeouts_ms[i.id] = wu !== nothing && wu.timeout !== nothing ? wu.timeout * 1000 : missing
+        end
+    end
+
     @async try
         if ps.endpoint === nothing || !isopen(ps.endpoint)
             @debug "Run cancelled: endpoint gone before send" testprocess_id=ps.id
@@ -1939,6 +2475,8 @@ function _send_run_testitems!(c::TestItemController, ps::TestProcessState, items
                         line = i.code_line,
                         column = i.code_column,
                         code = i.code,
+                        skip = _skip_source(i.option_skip),
+                        timeoutMs = get(timeouts_ms, i.id, missing),
                     ) for i in items
                 ],
             )
@@ -1947,7 +2485,7 @@ function _send_run_testitems!(c::TestItemController, ps::TestProcessState, items
         if err isa JSONRPC.TransportError
             @debug "Run failed (transport error, likely cancelled)" testprocess_id=ps.id exception=(err, catch_backtrace())
         else
-            @error "Error running testitems" testprocess_id=ps.id exception=(err, catch_backtrace())
+            @warn "Error running testitems" testprocess_id=ps.id exception=(err, catch_backtrace())
             try put!(c.reactor_channel, TestProcessIOErrorMsg(ps.id, :fatal)) catch end
         end
     end
@@ -1974,7 +2512,8 @@ function _send_steal!(c::TestItemController, ps::TestProcessState, testitem_ids:
         if err isa JSONRPC.TransportError
             @debug "Steal failed (transport error, likely cancelled)" testprocess_id=ps.id exception=(err, catch_backtrace())
         else
-            @error "Error stealing testitems" testprocess_id=ps.id exception=(err, catch_backtrace())
+            @warn "Error stealing testitems" testprocess_id=ps.id exception=(err, catch_backtrace())
+            try put!(c.reactor_channel, TestProcessIOErrorMsg(ps.id, :fatal)) catch end
         end
     end
 end
@@ -2011,7 +2550,7 @@ function _start_revise!(c::TestItemController, ps::TestProcessState, new_env_has
         if err isa JSONRPC.TransportError
             @debug "Revise failed (transport error, likely cancelled)" testprocess_id=ps.id exception=(err, catch_backtrace())
         else
-            @error "Error during revise" testprocess_id=ps.id exception=(err, catch_backtrace())
+            @warn "Error during revise" testprocess_id=ps.id exception=(err, catch_backtrace())
         end
         try put!(c.reactor_channel, TestProcessReviseResultMsg(ps.id, true)) catch end
     end
@@ -2066,7 +2605,8 @@ matched the wrong `TestEnvironment` when several share identical `ProcessEnv` fi
 would leave the item unresolvable and hang the run.
 """
 function _log_unexpected_missing_work(tr::TestRunState, testitem_id::String, proc_id::String, test_env_id::String, kind::String)
-    @error "Dropping '$(kind)' result for test item '$(testitem_id)' from its owning test process '$(proc_id)': no work unit for env '$(test_env_id)'. This is an internal inconsistency." known_envs=[e.id for e in tr.test_environments]
+    msg = "Dropping '$(kind)' result for test item '$(testitem_id)' from its owning test process '$(proc_id)': no work unit for env '$(test_env_id)'. This is an internal inconsistency."
+    @error msg known_envs=[e.id for e in tr.test_environments] exception=(ErrorException(msg), backtrace())
 end
 
 """
@@ -2077,21 +2617,37 @@ reported as completed while one item was still "running".
 Diagnostic only — it reports nothing to callbacks and changes no state.
 """
 function _check_all_items_reported(tr::TestRunState)
-    unreported = [id for id in keys(tr.test_items) if id ∉ tr.reported_items]
+    unreported = [k[1] for k in keys(tr.test_items) if k[1] ∉ tr.reported_items]
     if !isempty(unreported)
-        @error "Test run '$(tr.id)' is completing with $(length(unreported)) test item(s) that never produced a result. Consumers will show them as still running." unreported=sort(unreported)
+        msg = "Test run '$(tr.id)' is completing with $(length(unreported)) test item(s) that never produced a result. Consumers will show them as still running."
+        @error msg unreported=sort(unreported) exception=(ErrorException(msg), backtrace())
     end
     return unreported
 end
 
-"""Get items for a ProcessEnv that haven't been assigned to a process yet."""
-function _get_unchunked_items(tr::TestRunState, env::ProcessEnv)
+"""
+Get items for a ProcessEnv that haven't been assigned to a process yet.
+
+`env_pids` are the processes belonging to `env`, and only those may be consulted for what is
+already assigned. `testitem_ids_by_proc` holds bare ids, which are unique only within a
+package: with the same package checked out twice, both checkouts mint the same id under
+different environments. Unioning across *every* process therefore let one environment's
+assignment mask the other's identically-named item, which was then never handed to a process
+— `remaining_work` never emptied and the run hung instead of completing.
+"""
+function _get_unchunked_items(tr::TestRunState, env::ProcessEnv, env_pids)
     assigned = Set{String}()
-    for (_, ids) in tr.testitem_ids_by_proc
-        union!(assigned, ids)
+    for pid in env_pids
+        ids = get(tr.testitem_ids_by_proc, pid, nothing)
+        ids === nothing || union!(assigned, ids)
     end
     test_env_id = _resolve_test_env_id(tr, env)
-    items = [id for (id, _) in tr.test_items if haskey(tr.remaining_work, (id, test_env_id)) && id ∉ assigned]
+    # No package comparison here: `test_items` is keyed by env, and `remaining_work` is too,
+    # so both already scope to this environment.
+    items = [k[1] for (k, _) in tr.test_items
+             if k[2] == test_env_id &&
+                haskey(tr.remaining_work, (k[1], test_env_id)) &&
+                k[1] ∉ assigned]
     return items
 end
 
@@ -2183,7 +2739,7 @@ function _check_stealing!(c::TestItemController, tr::TestRunState, finished_proc
     end
 
     # Send items to thief
-    items_to_run = [tr.test_items[id] for id in testitem_ids_to_steal if haskey(tr.test_items, id)]
+    items_to_run = _items_for(tr, _resolve_test_env_id(tr, ps.env), testitem_ids_to_steal)
     _send_run_testitems!(c, ps, items_to_run)
     return
 end
@@ -2221,7 +2777,7 @@ function _check_testrun_complete!(c::TestItemController, tr::TestRunState)
             end
         end
 
-        try put!(tr.completion_channel, coverage_results) catch end
+        _signal_testrun_completion!(tr, coverage_results)
     else
         @debug "$(remaining) test item(s) remaining ($(pending_stolen) pending stolen confirmation(s))"
     end
@@ -2263,9 +2819,13 @@ function execute_testrun(
     test_setups::Vector{TestSetupDetail},
     max_processes::Int,
     token;
-    coverage_root_uris::Union{Nothing,Vector{String}}=nothing)
+    coverage_root_uris::Union{Nothing,Vector{String}}=nothing,
+    gc_between_testitems::Union{Nothing,Bool}=nothing,
+    memory_threshold::Union{Nothing,Float64}=nothing)
 
     @info "Creating new test run '$(testrun_id)' with $(length(test_items)) test item(s) and $(length(test_environments)) environment(s)"
+
+    _assert_addressable_items(test_items)
 
     # Build TestRunState
     tr = TestRunState(
@@ -2279,7 +2839,8 @@ function execute_testrun(
         ],
         max_processes;
         coverage_root_uris = coverage_root_uris,
-        token = token
+        token = token,
+        memory_threshold = memory_threshold
     )
 
     # Register cancellation bridge
@@ -2319,6 +2880,13 @@ function execute_testrun(
         n_procs = max(1, min(floor(Int, max_processes * as_share), length(test_items)))
         proc_count_by_env[k] = n_procs
     end
+
+    # Collecting between items only pays for itself when memory is contended, which in
+    # practice means more than one test process — so that is the default, matching
+    # ReTestItems' `gc_between_testitems`.
+    tr.gc_between_testitems = gc_between_testitems === nothing ?
+        sum(values(proc_count_by_env), init=0) > 1 :
+        gc_between_testitems
 
     # Resolve log_level from the first work unit
     log_level = !isempty(work_units) ? first(work_units).log_level : :Info

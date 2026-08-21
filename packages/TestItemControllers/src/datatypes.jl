@@ -22,6 +22,8 @@ Describes a Julia process configuration for running test items.
 - `package_uri::String` — file URI of the package root.
 - `project_uri::Union{Nothing,String}` — file URI of a custom project (or `nothing` for the package default).
 - `env_content_hash::Union{Nothing,String}` — opaque hash of the environment content, used to decide whether a pooled process can be reused without a restart.
+- `check_bounds::Union{Nothing,String}` — value for the test process's `--check-bounds` flag: `"auto"` (or `nothing`, the default) respects `@inbounds` annotations and lets the test process reuse the precompile caches of normal dev sessions; `"yes"` forces bounds checks everywhere (the `Pkg.test` behavior) at the cost of precompiling the whole environment into a separate cache slot on the first run.
+- `color::Bool` — run the test process with `--color=yes`, so that its output carries ANSI escapes. Off by default. The escapes are passed through on both streams — per-item output (`on_append_output`) and process-level output (`on_process_output`) alike — and it is up to the client to render or strip them for whatever view each one goes to.
 """
 struct TestEnvironment
     id::String
@@ -34,6 +36,17 @@ struct TestEnvironment
     package_uri::String
     project_uri::Union{Nothing,String}
     env_content_hash::Union{Nothing,String}
+    check_bounds::Union{Nothing,String}
+    color::Bool
+
+    function TestEnvironment(id, julia_cmd, julia_args, julia_num_threads, julia_env, mode,
+            package_name, package_uri, project_uri, env_content_hash, check_bounds=nothing,
+            color::Bool=false)
+        check_bounds in (nothing, "yes", "auto") ||
+            throw(ArgumentError("check_bounds must be \"yes\" or \"auto\", got $(repr(check_bounds))"))
+        return new(id, julia_cmd, julia_args, julia_num_threads, julia_env, mode,
+            package_name, package_uri, project_uri, env_content_hash, check_bounds, color)
+    end
 end
 
 """
@@ -70,6 +83,10 @@ Full metadata for a single `@testitem` block.
 - `line::Int`, `column::Int` — location of the `@testitem` macro call.
 - `code::String` — source code of the test item body.
 - `code_line::Int`, `code_column::Int` — location of the code body start.
+- `option_skip::Union{Bool,String}` — the `skip` kwarg. A `Bool` for a literal, or the
+  source text of an expression that is evaluated *in the test process* immediately before
+  the item would run (so it sees the test process's Julia version and platform, not the
+  controller's). Defaults to `false`.
 """
 struct TestItemDetail
     id::String
@@ -84,6 +101,13 @@ struct TestItemDetail
     code::String
     code_line::Int
     code_column::Int
+    option_skip::Union{Bool,String}
+
+    function TestItemDetail(id, uri, label, package_name, package_uri, option_default_imports,
+            test_setups, line, column, code, code_line, code_column, option_skip=false)
+        return new(id, uri, label, package_name, package_uri, option_default_imports,
+            test_setups, line, column, code, code_line, code_column, option_skip)
+    end
 end
 
 """
@@ -149,6 +173,37 @@ struct TestMessage
     line::Union{Nothing,Int}
     column::Union{Nothing,Int}
     stack_trace::Union{Nothing,Vector{TestMessageStackFrame}}
+end
+
+"""
+    PerfStats
+
+Execution statistics for a single test item, as measured by the test process.
+
+Every field is optional. `elapsed`, `bytes`, `allocs` and `gctime` are always available;
+`compile_time` and `recompile_time` depend on Julia internals that not every version the
+test process supports provides, and are `nothing` there rather than an error.
+
+# Fields
+- `elapsed::Union{Nothing,Float64}` — wall-clock time in milliseconds.
+- `bytes::Union{Nothing,Int}` — bytes allocated.
+- `allocs::Union{Nothing,Int}` — number of allocations.
+- `gctime::Union{Nothing,Float64}` — time spent in GC, in milliseconds.
+- `compile_time::Union{Nothing,Float64}` — time spent compiling, in milliseconds.
+- `recompile_time::Union{Nothing,Float64}` — time spent recompiling, in milliseconds.
+"""
+struct PerfStats
+    elapsed::Union{Nothing,Float64}
+    bytes::Union{Nothing,Int}
+    allocs::Union{Nothing,Int}
+    gctime::Union{Nothing,Float64}
+    compile_time::Union{Nothing,Float64}
+    recompile_time::Union{Nothing,Float64}
+
+    function PerfStats(elapsed=nothing, bytes=nothing, allocs=nothing, gctime=nothing,
+            compile_time=nothing, recompile_time=nothing)
+        return new(elapsed, bytes, allocs, gctime, compile_time, recompile_time)
+    end
 end
 
 """

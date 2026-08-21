@@ -24,6 +24,18 @@ function _to_wire_messages(messages::Vector{TestMessage})
     ]
 end
 
+function _to_wire_perf(perf::Union{Nothing,PerfStats})
+    perf === nothing && return missing
+    return TestItemControllerProtocol.PerfStatsParams(
+        elapsed = something(perf.elapsed, missing),
+        bytes = something(perf.bytes, missing),
+        allocs = something(perf.allocs, missing),
+        gctime = something(perf.gctime, missing),
+        compileTime = something(perf.compile_time, missing),
+        recompileTime = something(perf.recompile_time, missing),
+    )
+end
+
 function _to_wire_coverage(coverage::Vector{FileCoverage})
     return TestItemControllerProtocol.FileCoverage[
         TestItemControllerProtocol.FileCoverage(
@@ -69,15 +81,17 @@ mutable struct JSONRPCTestItemController
         # (e.g. client disconnected), we must not let the exception propagate
         # because it would interrupt the reactor's handle!() mid-execution and
         # could prevent _check_testrun_complete!() from being reached.
+        #
+        # No exception may escape here, whatever its type. A closed endpoint surfaces as a
+        # `TransportError` while its read/write tasks are winding down but as a plain
+        # `ErrorException` ("Endpoint is not running") once they are gone — and that second
+        # form used to be rethrown, which killed the reactor in the middle of the very
+        # shutdown that a client hangup triggers, leaving every test process orphaned.
         function _safe_send(args...)
             try
                 JSONRPC.send(jr.endpoint, args...)
             catch err
-                if err isa JSONRPC.TransportError || err isa JSONRPC.JSONRPCError
-                    @debug "JSONRPC callback send failed (endpoint closed?)" exception=(err,)
-                else
-                    rethrow()
-                end
+                @debug "JSONRPC callback send failed (endpoint closed?)" exception=(err,)
             end
         end
 
@@ -86,44 +100,57 @@ mutable struct JSONRPCTestItemController
                 TestItemControllerProtocol.notficiationTypeTestItemStarted,
                 TestItemControllerProtocol.TestItemStartedParams(
                     testRunId=testrun_id,
-                    testItemId=testitem_id
+                    testItemId=testitem_id,
+                    testEnvId=test_env_id
                 )
             ),
-            on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration) -> _safe_send(
+            on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration, perf=nothing) -> _safe_send(
                 TestItemControllerProtocol.notficiationTypeTestItemPassed,
                 TestItemControllerProtocol.TestItemPassedParams(
                     testRunId=testrun_id,
                     testItemId=testitem_id,
-                    duration=duration
+                    testEnvId=test_env_id,
+                    duration=duration,
+                    perf=_to_wire_perf(perf)
                 )
             ),
-            on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration) -> _safe_send(
+            on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration, perf=nothing) -> _safe_send(
                 TestItemControllerProtocol.notficiationTypeTestItemFailed,
                 TestItemControllerProtocol.TestItemFailedParams(
                     testRunId=testrun_id,
                     testItemId=testitem_id,
+                    testEnvId=test_env_id,
                     messages=_to_wire_messages(messages),
-                    duration=something(duration, missing)
+                    duration=something(duration, missing),
+                    perf=_to_wire_perf(perf)
                 )
             ),
-            on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration) -> _safe_send(
+            on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration, perf=nothing) -> _safe_send(
                 TestItemControllerProtocol.notficiationTypeTestItemErrored,
                 TestItemControllerProtocol.TestItemErroredParams(
                     testRunId=testrun_id,
                     testItemId=testitem_id,
+                    testEnvId=test_env_id,
                     messages=_to_wire_messages(messages),
-                    duration=something(duration, missing)
+                    duration=something(duration, missing),
+                    perf=_to_wire_perf(perf)
                 )
             ),
-            on_testitem_skipped = (testrun_id, testitem_id, test_env_id) -> _safe_send(
+            on_testitem_skipped = (testrun_id, testitem_id, test_env_id, reason=nothing) -> _safe_send(
                 TestItemControllerProtocol.notficiationTypeTestItemSkipped,
-                (testRunId=testrun_id, testItemId=testitem_id)
+                TestItemControllerProtocol.TestItemSkippedParams(
+                    testRunId=testrun_id,
+                    testItemId=testitem_id,
+                    testEnvId=test_env_id,
+                    reason=something(reason, missing)
+                )
             ),
             on_append_output = (testrun_id, testitem_id, test_env_id, output) -> _safe_send(
                 TestItemControllerProtocol.notficiationTypeAppendOutput,
                 TestItemControllerProtocol.AppendOutputParams(
                     testRunId=testrun_id,
                     testItemId=something(testitem_id, missing),
+                    testEnvId=test_env_id,
                     output=output
                 )
             ),
@@ -186,6 +213,8 @@ function create_testrun_request(params::TestItemControllerProtocol.CreateTestRun
             e.packageUri,
             coalesce(e.projectUri, nothing),
             coalesce(e.envContentHash, nothing),
+            coalesce(e.checkBounds, nothing),
+            coalesce(e.color, false),
         )
         for e in params.testEnvironments
     ]
@@ -208,6 +237,7 @@ function create_testrun_request(params::TestItemControllerProtocol.CreateTestRun
             i.code,
             i.codeLine,
             i.codeColumn,
+            i.optionSkip === missing ? false : i.optionSkip,
         )
         for i in params.testItems
     ]
@@ -253,9 +283,15 @@ function terminate_test_process_request(params::TestItemControllerProtocol.Termi
     terminate_test_process(json_controller.controller, params.testProcessId)
 end
 
+function shutdown_notification(params::Nothing, json_controller::JSONRPCTestItemController)
+    @info "Shutdown requested by client"
+    shutdown(json_controller.controller)
+end
+
 JSONRPC.@message_dispatcher dispatch_msg begin
     TestItemControllerProtocol.create_testrun_request_type => create_testrun_request
     TestItemControllerProtocol.terminate_test_process_request_type => terminate_test_process_request
+    TestItemControllerProtocol.shutdown_notification_type => shutdown_notification
 end
 
 function Base.run(jr_controller::JSONRPCTestItemController)
@@ -272,16 +308,27 @@ function Base.run(jr_controller::JSONRPCTestItemController)
                 dispatch_msg(jr_controller.endpoint, msg, jr_controller)
             catch err
                 bt = catch_backtrace()
+                # Reported and fatal on purpose: nothing above this frame can act on a request
+                # that failed to dispatch, and the caller is left waiting for a response that
+                # will never come. Under the crash-reporting logger installed by
+                # `testitemcontroller_main.jl` this is what turns such a bug into a report
+                # instead of a silent hang.
                 @error "Error dispatching message" exception=(err, bt)
             end
         end
     catch err
         if err isa JSONRPC.TransportError || err isa JSONRPC.JSONRPCError
-            @debug "JSONRPC message loop ended" reason=err.msg
+            @info "Client connection closed; shutting down controller and test processes" reason=err.msg
         else
             bt = catch_backtrace()
-            @error "Error in JSONRPC message loop" exception=(err, bt)
+            @error "Error in JSONRPC message loop; shutting down controller and test processes" exception=(err, bt)
         end
+    finally
+        # Whatever ended the message loop — the client exiting, crashing, or an unexpected
+        # error — nobody is going to send us `shutdown` any more. Without this the reactor
+        # below blocks forever and every test process we spawned outlives its client.
+        # `shutdown` is idempotent, so this is harmless if the client did ask first.
+        shutdown(jr_controller.controller)
     end
 
     run(jr_controller.controller)

@@ -94,6 +94,78 @@ end
     end
 end
 
+@testitem "Results JSON round-trip with perf and coverage" begin
+    using TestItemControllers.Results
+
+    result = TestrunResult(
+        TestrunResultDefinitionError[],
+        [TestrunResultTestitem("item", "file:///tmp/a.jl", [
+            TestrunResultTestitemProfile("Default", :passed, 1.0, nothing, nothing,
+                TestrunResultPerfStats(1.0, 2048, 17, 0.5, 100.0, nothing)),
+            TestrunResultTestitemProfile("Other", :passed, 2.0, nothing, nothing),
+        ])],
+        Dict{String,String}(),
+        [TestrunResultFileCoverage("file:///tmp/f.jl", Union{Nothing,Int}[nothing, 3, 0])],
+    )
+
+    io = IOBuffer()
+    write_json(io, result)
+    roundtripped = read_json(IOBuffer(String(take!(io))))
+
+    perf = roundtripped.testitems[1].profiles[1].perf
+    @test perf isa TestrunResultPerfStats
+    @test perf.elapsed == 1.0
+    @test perf.bytes == 2048
+    @test perf.allocs == 17
+    @test perf.gctime == 0.5
+    @test perf.compile_time == 100.0
+    @test perf.recompile_time === nothing
+
+    @test roundtripped.testitems[1].profiles[2].perf === nothing
+
+    @test roundtripped.coverage !== nothing
+    @test length(roundtripped.coverage) == 1
+    @test roundtripped.coverage[1].uri == "file:///tmp/f.jl"
+    @test roundtripped.coverage[1].coverage == Union{Nothing,Int}[nothing, 3, 0]
+end
+
+@testitem "Results JSON reads files written before perf/coverage existed" begin
+    using TestItemControllers.Results
+
+    # Verbatim shape of a result file written by an earlier version: no `perf` key on the
+    # profile and no `coverage` key on the run. `julia-report-ci-results` merges files
+    # across CI matrix legs, so these keep turning up long after a release.
+    old_json = """
+    {
+      "definition_errors": [],
+      "testitems": [
+        {
+          "name": "item",
+          "uri": "file:///tmp/a.jl",
+          "profiles": [
+            {
+              "profile_name": "Default",
+              "status": "passed",
+              "duration": 1.0,
+              "messages": null,
+              "output": null
+            }
+          ]
+        }
+      ],
+      "process_outputs": {"process-1": "hello"}
+    }
+    """
+
+    result = read_json(IOBuffer(old_json))
+
+    @test result isa TestrunResult
+    @test result.testitems[1].profiles[1].status == :passed
+    @test result.testitems[1].profiles[1].perf === nothing
+    @test result.coverage === nothing
+    @test result.process_outputs == Dict("process-1" => "hello")
+end
+
 @testitem "Results names re-exported from TestItemControllers" begin
     using TestItemControllers
 

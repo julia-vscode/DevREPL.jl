@@ -163,7 +163,14 @@ function Base.run(debug_session::DebugSession, error_handler=nothing)
 
                 debug_session.debug_engine = nothing
 
-                DAPRPC.send(endpoint, terminated_notification_type, TerminatedEventArguments(false))
+                # `terminated` means the debuggee has ended, and a client that hears it
+                # ends the debug session and disconnects. A caller that is going to debug
+                # more code in this session — TestItemControllers runs a test item's
+                # `@testsnippet` setups and then its body, as separate chunks — therefore
+                # has to keep it back until the last one.
+                if get(next_cmd, :notify_termination, true)
+                    DAPRPC.send(endpoint, terminated_notification_type, TerminatedEventArguments(false))
+                end
 
                 put!(debug_session.finished_execution, true)
             else
@@ -181,10 +188,20 @@ function Base.run(debug_session::DebugSession, error_handler=nothing)
     end
 end
 
-function debug_code(debug_session::DebugSession, mod::Module, code::String, filename::String)
+"""
+    debug_code(debug_session, mod, code, filename; notify_termination=true)
+
+Debug `code` in `mod` and return once it has finished.
+
+`notify_termination=false` suppresses the `terminated` event that would otherwise be sent
+when the code finishes. Pass it when more code is going to be debugged in the same session:
+a client takes `terminated` as "the debuggee has ended" and disconnects, so a chunk that is
+not the last one must not send it.
+"""
+function debug_code(debug_session::DebugSession, mod::Module, code::String, filename::String; notify_termination::Bool=true)
     fetch(debug_session.attached)
 
-    put!(debug_session.next_cmd, (cmd=:debug, mod=mod, code=code, filename=filename))
+    put!(debug_session.next_cmd, (cmd=:debug, mod=mod, code=code, filename=filename, notify_termination=notify_termination))
 
     take!(debug_session.finished_execution)
 end
@@ -201,3 +218,11 @@ function Base.close(debug_session::DebugSession)
 end
 
 include("debugger_requests.jl")
+
+function _precompile_()
+    ccall(:jl_generating_output, Cint, ()) == 1 || return nothing
+
+    precompile(Base.run, (DebugSession, Nothing))
+end
+
+_precompile_()

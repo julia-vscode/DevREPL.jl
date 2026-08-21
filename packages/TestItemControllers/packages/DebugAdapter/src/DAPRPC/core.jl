@@ -66,7 +66,17 @@ function Base.run(x::DAPEndpoint)
         try
             for msg in x.out_msg_queue
                 if isopen(x.pipe_out)
-                    write_transport_layer(x.pipe_out, msg)
+                    try
+                        write_transport_layer(x.pipe_out, msg)
+                    catch err
+                        if err isa Base.IOError
+                            # The other end closed; stop trying to write quietly.
+                            x.status = :closed
+                            break
+                        else
+                            rethrow()
+                        end
+                    end
                 else
                     # TODO Reconsider at some point whether this should be treated as an error.
                     break
