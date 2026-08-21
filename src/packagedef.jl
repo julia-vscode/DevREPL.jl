@@ -32,6 +32,7 @@ function find_test_detail!(node, testitems, testsetups, testerrors)
             option_tags = nothing
             option_default_imports = nothing
             option_setup = nothing
+            option_skip = nothing
 
             # Now check our keyword args
             for i in child_nodes[3:end-1]
@@ -94,6 +95,20 @@ function find_test_detail!(node, testitems, testsetups, testerrors)
 
                         push!(option_setup, j.val)
                     end
+                elseif kind(i[1]) == K"Identifier" && i[1].val == :skip
+                    if option_skip!==nothing
+                        push!(testerrors, (name = node[2][1].val, message="The keyword argument skip cannot be specified more than once.", range=testitem_range))
+                        return
+                    end
+
+                    # A literal `true`/`false` is resolved here, anything else is
+                    # handed on as a source range so that the expression can be
+                    # evaluated in the test process just before the test item runs.
+                    option_skip = if i[2].val in (true, false)
+                        i[2].val
+                    else
+                        our_range(i[2])
+                    end
                 else
                     push!(testerrors, (name = node[2][1].val, message="Unknown keyword argument.", range=testitem_range))
                     return
@@ -112,6 +127,10 @@ function find_test_detail!(node, testitems, testsetups, testerrors)
                 option_setup = Symbol[]
             end
 
+            if option_skip===nothing
+                option_skip = false
+            end
+
             code_block = child_nodes[end]
             code_range = if _has_children(code_block) && length(children(code_block)) > 0
                 first(our_range(code_block[1])):last(our_range(code_block[end]))
@@ -126,7 +145,8 @@ function find_test_detail!(node, testitems, testsetups, testerrors)
                     code_range=code_range,
                     option_default_imports=option_default_imports,
                     option_tags=option_tags,
-                    option_setup=option_setup
+                    option_setup=option_setup,
+                    option_skip=option_skip
                 )
             )
         end
