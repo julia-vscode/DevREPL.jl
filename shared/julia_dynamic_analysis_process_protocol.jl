@@ -9,10 +9,20 @@ using ..JSONRPC: @dict_readable, RequestType, NotificationType, Outbound
     projectPath::String
     package::Union{Nothing,String}
     storePath::String
+    # Parent-owned dir to persist the materialized environment into. When set,
+    # the child copies the activated Project/Manifest there and returns this
+    # dir instead of the (possibly process-local, temporary) activated one.
+    projectDir::Union{Nothing,String}
 end
 
 @dict_readable struct CreateStandaloneProjectParams <: JSONRPC.Outbound
     packagePath::String
+    storePath::String
+    projectDir::String
+end
+
+@dict_readable struct ResolveEnvironmentParams <: JSONRPC.Outbound
+    envPath::String
     storePath::String
     projectDir::String
 end
@@ -25,6 +35,7 @@ end
 # Messages to the dynamic analysis process
 const index_project_request_type = JSONRPC.RequestType("juliadynamicanalysisprocess/indexProject", IndexProjectParams, String)
 const create_standalone_project_request_type = JSONRPC.RequestType("juliadynamicanalysisprocess/createStandaloneProject", CreateStandaloneProjectParams, String)
+const resolve_environment_request_type = JSONRPC.RequestType("juliadynamicanalysisprocess/resolveEnvironment", ResolveEnvironmentParams, String)
 # const testserver_activate_env_request_type = JSONRPC.RequestType("activateEnv", ActivateEnvParams, Nothing)
 # const configure_testrun_request_type = JSONRPC.RequestType("testserver/ConfigureTestRun", ConfigureTestRunRequestParams, Nothing)
 # const testserver_run_testitems_batch_request_type = JSONRPC.RequestType("testserver/runTestItems", RunTestItemsRequestParams, Nothing)

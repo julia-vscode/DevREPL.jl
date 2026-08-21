@@ -37,6 +37,7 @@
     DuplicateInclude,
     FunctionHasNoMethods,
     UnresolvedImport,
+    ComputedInclude,
 )
 
 const LintCodeDescriptions = Dict{LintCodes,String}(
@@ -47,13 +48,17 @@ const LintCodeDescriptions = Dict{LintCodes,String}(
     ConstIfCondition => "A boolean literal has been used as the conditional of an if statement - it will either always or never run.",
     EqInIfConditional => "Unbracketed assignment in if conditional statements is not allowed, did you mean to use ==?",
     PointlessOR => "The first argument of a `||` call is a boolean literal.",
-    PointlessAND => "The first argument of a `&&` call is a boolean literal.",
+    # check_lazy flags a literal in EITHER position of `&&`, so the message
+    # must not claim it is the first one (`iszero(x) && false` — a real
+    # pattern found in released packages — flags on the SECOND argument).
+    PointlessAND => "An argument of a `&&` call is a boolean literal.",
     UnusedBinding => "Variable has been assigned but not used.",
     InvalidTypeDeclaration => "A non-DataType has been used in a type declaration statement.",
     UnusedTypeParameter => "A DataType parameter has been specified but not used.",
     IncludeLoop => "Circular include detected.",
     DuplicateInclude => "This file has already been included.",
     MissingFile => "The included file can not be found.",
+    ComputedInclude => "The include path could not be determined statically. The included file is analyzed without this module's context, and missing-reference checks are disabled in this module.",
     InvalidModuleName => "Module name matches that of its parent.",
     TypePiracy => "An imported function has been extended without using module defined typed arguments.",
     UnusedFunctionArgument => "An argument is included in a function signature but not used within its body.",
@@ -126,11 +131,24 @@ function check_all(x::EXPR, opts::LintOptions, env::ExternalEnv, meta_dict, tree
     # may contain invalid code
     is_test_throws_macrocall(x, env, meta_dict) && return
 
+    # Value-semantics checks are meaningless inside the arguments of a macro
+    # whose expansion the analyzer does not model: the argument code may be a
+    # DSL (match/capture patterns, recipe attributes, rewrite rules) with
+    # entirely different semantics, and every rule below has measured
+    # 90-100% false-positive rates there. Known macros
+    # (`EFFECT_FREE_MACROS`/`HANDLED_MACROS`, string macros) keep full
+    # checking of their pass-through arguments; the doc wrapper
+    # (`:globalrefdoc`) never matches `ismacroname` and stays transparent.
+    if CSTParser.ismacrocall(x) && x.args !== nothing && length(x.args) >= 1 &&
+            CSTParser.ismacroname(x.args[1]) && !_macro_effects_known(x.args[1])
+        return
+    end
+
     # Do checks
     opts.call && check_call(x, env, meta_dict, tree_visible, tree_extended, tree_arities, tree_in_scope)
     opts.iter && check_loop_iter(x, env, meta_dict)
     opts.nothingcomp && check_nothing_equality(x, env, meta_dict)
-    opts.constif && check_if_conds(x, meta_dict)
+    opts.constif && check_if_conds(x, env, meta_dict)
     opts.lazy && check_lazy(x, meta_dict)
     opts.datadecl && check_datatype_decl(x, env, meta_dict)
     opts.typeparam && check_typeparams(x, meta_dict)
@@ -858,6 +876,12 @@ function check_incorrect_iter_spec(x, body, env, meta_dict)
         elseif iscall(rng) && valof(rng.args[1]) == ":" &&
             length(rng.args) === 3 &&
             headof(rng.args[2]) === :INTEGER &&
+            # Only `1:length(x)` has an `eachindex`/`axes` rewrite. A range
+            # starting elsewhere (`2:length(x)` — Horner tails, look-back
+            # loops using `x[i-1]`) cannot take the suggested fix, so the
+            # diagnostic would only be noise (40% of the flags in a top-100
+            # registry sweep were of this shape).
+            valof(rng.args[2]) == "1" &&
             iscall(rng.args[3]) &&
             length(rng.args[3].args) > 1 && (
                 refof(rng.args[3].args[1], meta_dict) === getsymbols(env)[:Base][:length] ||
@@ -898,7 +922,9 @@ function check_is_used_in_getindex(expr, lhs, arr, meta_dict)
         if hasref(this_arr, meta_dict) && hasref(arr, meta_dict) && refof(this_arr, meta_dict) == refof(arr, meta_dict)
             for index_arg in expr.args[2:end]
                 if hasref(index_arg, meta_dict) && hasref(lhs, meta_dict) && refof(index_arg, meta_dict) == refof(lhs, meta_dict)
-                    seterror!(expr, IndexFromLength, meta_dict)
+                    # One diagnostic per loop: the caller marks the iterator
+                    # spec; marking the use site too reported every such loop
+                    # twice.
                     return true
                 end
             end
@@ -963,10 +989,19 @@ function _get_global_scope(s::Scope)
     end
 end
 
-function check_if_conds(x::EXPR, meta_dict)
+function check_if_conds(x::EXPR, env::ExternalEnv, meta_dict)
     if headof(x) === :if
         cond = x.args[1]
         if headof(cond) === :TRUE || headof(cond) === :FALSE
+            # `@static if false ... end` is a deliberate compile-time toggle
+            # (dead-code switch), not an accidental constant condition. Resolved
+            # by identity, so a local macro that merely shares the name doesn't
+            # buy the same suppression.
+            p = parentof(x)
+            if p isa EXPR && CSTParser.ismacrocall(p) && length(p.args) >= 1 &&
+                    _points_to_Base_macro(p.args[1], Symbol("@static"), env, meta_dict)
+                return
+            end
             seterror!(cond, ConstIfCondition, meta_dict)
         elseif isassignment(cond)
             seterror!(cond, EqInIfConditional, meta_dict)
@@ -988,19 +1023,63 @@ function check_lazy(x::EXPR, meta_dict)
     end
 end
 
-is_never_datatype(b, env::ExternalEnv) = false
-is_never_datatype(b::SymbolServer.DataTypeStore, env::ExternalEnv) = false
-function is_never_datatype(b::SymbolServer.FunctionStore, env::ExternalEnv)
+# The resolved ref of `b`'s assignment RHS (`const Foo = Int16` → `Int16`'s
+# ref), unwrapping `where`s and curlies (`const Foo = Vector{Int}` → `Vector`).
+# `nothing` when `b` isn't a plain assignment or the RHS isn't a name.
+function _aliased_type_ref(b::Binding, meta_dict)
+    v = b.val
+    (v isa EXPR && isassignment(v) && v.args !== nothing && length(v.args) == 2) || return nothing
+    rhs = CSTParser.rem_wheres_decls(v.args[2])
+    if iscurly(rhs) && rhs.args !== nothing && length(rhs.args) >= 1
+        rhs = rhs.args[1]
+    end
+    if isidentifier(rhs)
+        return refof(rhs, meta_dict)
+    elseif is_getfield_w_quotenode(rhs)
+        return refof_maybe_getfield(rhs, meta_dict)
+    end
+    return nothing
+end
+
+is_never_datatype(b, env::ExternalEnv, meta_dict=nothing) = false
+is_never_datatype(b::SymbolServer.DataTypeStore, env::ExternalEnv, meta_dict=nothing) = false
+function is_never_datatype(b::SymbolServer.FunctionStore, env::ExternalEnv, meta_dict=nothing)
     !(SymbolServer._lookup(b.extends, getsymbols(env)) isa SymbolServer.DataTypeStore)
 end
-function is_never_datatype(b::Binding, env::ExternalEnv)
+function is_never_datatype(b::Binding, env::ExternalEnv, meta_dict=nothing, depth=0)
+    depth > 20 && return false
     if b.val isa Binding
-        return is_never_datatype(b.val, env)
+        return is_never_datatype(b.val, env, meta_dict, depth + 1)
     elseif b.val isa SymbolServer.FunctionStore
         return is_never_datatype(b.val, env)
     elseif CoreTypes.isdatatype(b.type)
         return false
-    elseif b.type !== nothing
+    end
+    # `Foo = Int16` / `const A = B` chains: what the alias names decides — the
+    # binding's own inferred type can't (a store type's name resolves to its
+    # constructor FunctionStore, so the alias infers as `Function`).
+    if meta_dict !== nothing && (r = _aliased_type_ref(b, meta_dict)) !== nothing
+        if r isa TreeRef
+            # a cross-file alias target (an inventory item) can't be inspected;
+            # an external one resolves through the env like a direct annotation
+            r.kind === :external_symbol || return false
+            r = resolve_treeref_store(r, env)
+            r === nothing && return false
+        end
+        r isa Binding && return is_never_datatype(r, env, meta_dict, depth + 1)
+        return is_never_datatype(r, env)
+    end
+    # A curly-parameterised function definition (`Fill{T, N}(x) = ...`) is a
+    # CONSTRUCTOR: its name necessarily denotes a type. `@eval` constructor
+    # loops hoist such definitions as bindings that SHADOW the type's own
+    # binding with an assignment inferred as `Function` (FillArrays'
+    # `$STYPE{T, N}(F::$TYPE{T, N}) = F` shadowed `AbstractFill`, flagging
+    # all 53 later `::AbstractFill` declarations in the file), so a
+    # constructor-shaped `val` must count as a type, not a function.
+    if b.val isa EXPR && _defines_constructor_method(b.val)
+        return false
+    end
+    if b.type !== nothing
         if !any(x -> x isa SymbolServer.DataTypeStore, get_eventual_datatype(ref, env) for ref in b.refs)
             return true
         end
@@ -1008,11 +1087,28 @@ function is_never_datatype(b::Binding, env::ExternalEnv)
     return false
 end
 
+# Whether `x` defines a method whose signature name is curly-parameterised
+# (`Name{...}(...)`) — an unambiguous constructor definition.
+function _defines_constructor_method(x::EXPR)
+    CSTParser.defines_function(x) || return false
+    sig = CSTParser.get_sig(x)
+    while sig isa EXPR && (headof(sig) === :where || isbracketed(sig)) &&
+            sig.args !== nothing && !isempty(sig.args)
+        sig = sig.args[1]
+    end
+    (sig isa EXPR && iscall(sig) && sig.args !== nothing && !isempty(sig.args)) || return false
+    name = sig.args[1]
+    while name isa EXPR && isbracketed(name) && name.args !== nothing && !isempty(name.args)
+        name = name.args[1]
+    end
+    return name isa EXPR && headof(name) === :curly
+end
+
 function check_datatype_decl(x::EXPR, env::ExternalEnv, meta_dict)
     # Only call in function signatures?
     if isdeclaration(x) && parentof(x) isa EXPR && iscall(parentof(x))
         if (dt = refof_maybe_getfield(last(x.args), meta_dict)) !== nothing
-            if is_never_datatype(dt, env)
+            if is_never_datatype(dt, env, meta_dict)
                 seterror!(x, InvalidTypeDeclaration, meta_dict)
             end
         elseif CSTParser.isliteral(last(x.args))
@@ -1182,6 +1278,75 @@ function in_unresolved_wildcard_import_scope(x::EXPR, meta_dict)
     return false
 end
 
+# Does `x` reference `Base.name` (or the `Core.name` Base re-exports)? Goes
+# through the resolved binding, so a quoted `:isdefined`, a config's own
+# `.VERSION` field, or a local definition shadowing the name is not a guard.
+# (`_points_to_arbitrary_macro` is a module-binding lookup despite its name, and
+# handles the qualified spelling.)
+function _refers_to_base_name(x::EXPR, name::Symbol, env, meta_dict)
+    # `rhs_of_getfield` passes plain identifiers through, so one test covers
+    # both `VERSION` and `Base.VERSION` - and keeps the lookups below off the
+    # condition nodes that aren't spelled like a guard in the first place.
+    id = rhs_of_getfield(x)
+    (isidentifier(id) && Symbol(valofid(id)) === name) || return false
+    return _points_to_arbitrary_macro(x, :Base, name, env, meta_dict) ||
+        _points_to_arbitrary_macro(x, :Core, name, env, meta_dict)
+end
+
+# Whether the CONDITION expression contains an existence/version test:
+# `isdefined(...)`, `@isdefined x`, or a comparison against `VERSION`.
+function _is_existence_guard(cond::EXPR, env, meta_dict)
+    if _refers_to_base_name(cond, :VERSION, env, meta_dict)
+        return true
+    elseif iscall(cond) && length(cond.args) >= 1 && cond.args[1] isa EXPR &&
+            _refers_to_base_name(cond.args[1], :isdefined, env, meta_dict)
+        return true
+    elseif CSTParser.ismacrocall(cond) && length(cond.args) >= 1 && cond.args[1] isa EXPR &&
+            _refers_to_base_name(cond.args[1], Symbol("@isdefined"), env, meta_dict)
+        return true
+    end
+    cond.args === nothing && return false
+    return any(a -> a isa EXPR && _is_existence_guard(a, env, meta_dict), cond.args)
+end
+
+"""
+    in_existence_guarded_branch(x::EXPR, env, meta_dict) -> Bool
+
+Is `x` inside a branch of an `if`/`elseif` (or the short-circuited side of
+`&&`/`||`) whose condition tests `isdefined`, `@isdefined`, or `VERSION`?
+Such branches deliberately reference names that only exist on other Julia
+versions or when an optional binding is present — on the analyzing version
+one branch is dead code, so missing-reference reporting there is noise
+(`if isdefined(Base, :new_thing); new_thing() else old_thing() end` flags one
+side or the other no matter which Julia runs the analysis).
+
+Since the condition isn't evaluated, no branch of the construct is judged:
+`else` and `elseif` arms are suppressed along with the guarded one, and so are
+the `elseif` conditions, which only run when an earlier arm was not taken. The
+guarding condition itself keeps full checking.
+
+Guard names are matched through their resolved bindings, so code that merely
+borrows the spelling (`mode === :isdefined`, a config's own `.VERSION` field, a
+local `isdefined`) is not a guard.
+"""
+function in_existence_guarded_branch(x::EXPR, env, meta_dict)
+    cur = x
+    while parentof(cur) isa EXPR
+        p = parentof(cur)
+        if headof(p) in (:if, :elseif) && p.args !== nothing && length(p.args) >= 1 &&
+                cur !== p.args[1] && p.args[1] isa EXPR && _is_existence_guard(p.args[1], env, meta_dict)
+            return true
+        end
+        if isbinarysyntax(p) && (valof(headof(p)) == "&&" || valof(headof(p)) == "||") &&
+                length(p.args) == 2 && cur === p.args[2] &&
+                p.args[1] isa EXPR && _is_existence_guard(p.args[1], env, meta_dict)
+            return true
+        end
+        cur = p
+    end
+    return false
+end
+
 """
 collect_hints(x::EXPR, env, missingrefs = :all, isquoted = false, errs = Tuple{Int,EXPR}[], pos = 0)
 
@@ -1201,8 +1366,13 @@ function collect_hints(x::EXPR, env, workspace_packages, meta_dict, missingrefs=
         push!(errs, (pos, x))
     elseif !isquoted
         if haserror(x, meta_dict) && errorof(x, meta_dict) isa StaticLint.LintCodes
-            # collect lint hints
-            push!(errs, (pos, x))
+            # collect lint hints - except an UnresolvedImport under an
+            # existence guard, which is the missing-reference report for
+            # using/import statements and is suppressed like the bare names
+            # below. Other lint codes don't depend on which branch runs.
+            if !(errorof(x, meta_dict) === UnresolvedImport && in_existence_guarded_branch(x, env, meta_dict))
+                push!(errs, (pos, x))
+            end
         elseif missingrefs != :none && isidentifier(x) && !hasref(x, meta_dict) &&
             !(valof(x) == "var" && parentof(x) isa EXPR && isnonstdid(parentof(x))) &&
             !((valof(x) == "stdcall" || valof(x) == "cdecl" || valof(x) == "fastcall" || valof(x) == "thiscall" || valof(x) == "llvmcall") && is_in_fexpr(x, x -> iscall(x) && isidentifier(x.args[1]) && valof(x.args[1]) == "ccall")) &&
@@ -1210,10 +1380,12 @@ function collect_hints(x::EXPR, env, workspace_packages, meta_dict, missingrefs=
             # inside using/import statements the UnresolvedImport marking
             # pass is the sole reporter
             !is_in_fexpr(x, y -> headof(y) === :using || headof(y) === :import) &&
-            !in_unresolved_wildcard_import_scope(x, meta_dict)
+            !in_unresolved_wildcard_import_scope(x, meta_dict) &&
+            !in_existence_guarded_branch(x, env, meta_dict)
             push!(errs, (pos, x))
         end
-    elseif isquoted && missingrefs == :all && should_mark_missing_getfield_ref(x, env, workspace_packages, meta_dict)
+    elseif isquoted && missingrefs == :all && should_mark_missing_getfield_ref(x, env, workspace_packages, meta_dict) &&
+            !in_existence_guarded_branch(x, env, meta_dict)
         push!(errs, (pos, x))
     end
 
@@ -1411,7 +1583,16 @@ end
 
 function refers_to_nonimported_type(arg::EXPR, meta_dict)
     arg = CSTParser.rem_wheres(arg)
-    if hasref(arg, meta_dict) && refof(arg, meta_dict) isa Binding
+    r = hasref(arg, meta_dict) ? refof(arg, meta_dict) : nothing
+    if r isa Binding
+        return true
+    elseif r isa TreeRef && r.kind !== :external_symbol
+        # Per-file traversal mode: a type resolved through the module tree
+        # (defined in a SIBLING file of this package — `HTTP.Stream` used in
+        # http_stream.jl but defined in http_server.jl) is owned by the
+        # package just like a same-file `Binding`; a method mentioning it is
+        # not piracy. `:external_symbol` stand-ins are genuinely foreign and
+        # keep the check.
         return true
     elseif isunarysyntax(arg) && (valof(headof(arg)) == "::" || valof(headof(arg)) == "<:")
         return refers_to_nonimported_type(arg.args[1], meta_dict)
@@ -1437,6 +1618,28 @@ function overwrites_imported_function(b::Binding)
     return false
 end
 
+function _is_direct_eval_quote(q::EXPR)
+    p = parentof(q)
+    while p isa EXPR && isbracketed(p)
+        p = parentof(p)
+    end
+    p isa EXPR && iscall(p) && p.args !== nothing && !isempty(p.args) || return false
+    callee = p.args[1]
+    if isidentifier(callee)
+        return valofid(callee) == "eval"
+    elseif CSTParser.is_getfield_w_quotenode(callee)
+        rhs = rhs_of_getfield(callee)
+        return rhs isa EXPR && valofid(rhs) == "eval"
+    end
+    return false
+end
+
+function _is_in_inert_quote(x::EXPR)
+    q = maybe_get_parent_fexpr(x, quoted)
+    q === nothing && return false
+    return !_is_direct_eval_quote(q)
+end
+
 # Now called from add_binding
 # Should return true/false indicating whether the binding should actually be added?
 function check_const_decl(name::String, b::Binding, scope, meta_dict)
@@ -1445,10 +1648,41 @@ function check_const_decl(name::String, b::Binding, scope, meta_dict)
     # imported/using-ed bindings are never const decls
     is_in_fexpr(b.name, x -> headof(x) === :import || headof(x) === :using) && return
 
+    prev_b = scope.names[name]
+    if prev_b isa Binding
+        # The same definition can reach `add_binding` twice — an `@eval`'d
+        # struct is hoisted by `interpret_eval` AND traversed — and a
+        # definition is never a redefinition of itself.
+        prev_b.val !== nothing && prev_b.val === b.val && return
+        # A previous definition in an inert quote cannot make this declaration
+        # a redefinition. A quote passed directly to `eval` does execute and
+        # must retain the warning.
+        prev_b.val isa EXPR && _is_in_inert_quote(prev_b.val) && return
+    end
+
     b.val isa Binding && return check_const_decl(name, b.val, scope, meta_dict)
     if b.val isa EXPR && (CSTParser.defines_datatype(b.val) || is_const(b))
+        # Mutually exclusive `if`/`elseif`/`else` branches (the standard
+        # platform/version-conditional `const` idiom, usually under
+        # `@static if`) never both execute, so a const/datatype declared once
+        # per branch is not a redeclaration — the same exemption the
+        # InvalidRedefofConst arm below already applies.
+        prev = scope.names[name]
+        if prev isa Binding && prev.val isa EXPR && !in_same_if_branch(b.val, prev.val)
+            return
+        end
         seterror!(b.name, CannotDeclareConst, meta_dict)
     else
+        # Implicit-const redefinition (reassigning a name that holds a
+        # datatype) only exists at module/file top level. In any local-ish
+        # scope (functions, `@generated` bodies, `@testset`/`@testitem`
+        # blocks) reassigning a variable is ordinary rebinding, even when it
+        # happens to hold a type value (`T = c ? Int : Float64; T = ...`).
+        # Explicit `const` redeclarations take the arm above and stay
+        # flagged everywhere.
+        if !(scope.expr isa EXPR && (CSTParser.defines_module(scope.expr) || headof(scope.expr) === :file))
+            return
+        end
         prev = scope.names[name]
         if (CoreTypes.isdatatype(prev.type) && !is_mask_binding_of_datatype(prev, meta_dict)) || is_const(prev)
             if b.val isa EXPR && prev.val isa EXPR && !in_same_if_branch(b.val, prev.val)

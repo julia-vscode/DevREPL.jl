@@ -21,7 +21,10 @@
 
     handle!(df, ProcessIndexFailedMsg(k, ErrorException("unsatisfiable")))
     @test isready(df.out_channel)
-    @test take!(df.out_channel) == FailedResult(k)
+    result = take!(df.out_channel)
+    @test result isa FailedResult
+    @test result.key == k
+    @test occursin("unsatisfiable", result.message)
 
     # Reconcile used to prune `failed_projects` to the required set, so a key
     # that dropped out and came back was launched again — indefinitely, for a
@@ -51,7 +54,9 @@ end
         handle!(df, ReconcileMsg(Set{DJPKey}([k])))
         handle!(df, ProcessIndexFailedMsg(k, ErrorException("unsatisfiable")))
         @test isready(df.out_channel)
-        @test take!(df.out_channel) == FailedResult(k)
+        result = take!(df.out_channel)
+        @test result isa FailedResult
+        @test result.key == k
     end
     @test length(launches) == 2
 
@@ -60,7 +65,12 @@ end
     handle!(df, ReconcileMsg(Set{DJPKey}([k3])))
     @test length(launches) == 2
     @test isready(df.out_channel)
-    @test take!(df.out_channel) == FailedResult(k3)
+    result = take!(df.out_channel)
+    @test result isa FailedResult
+    @test result.key == k3
+    # The exhausted-skip short-circuit replays the identity's recorded cause
+    # rather than a generic sentence.
+    @test occursin("unsatisfiable", result.message)
     @test df.pending_count[] == 0
     @test isempty(df.inflight)
 end
@@ -185,6 +195,7 @@ end
     handle!(df, ResetFailuresMsg())
     @test isempty(df.failed_projects)
     @test isempty(df.failure_attempts)
+    @test isempty(df.failure_messages)
 
     k3 = WatchTestEnvironmentKey("/ws/R", "R", UInt64(3))
     handle!(df, ReconcileMsg(Set{DJPKey}([k3])))
@@ -245,7 +256,7 @@ end
         try
             _send_djp_request(djp, 1,
                 JuliaDynamicAnalysisProtocol.index_project_request_type,
-                JuliaDynamicAnalysisProtocol.IndexProjectParams("/ws/P", nothing, "/tmp/store"))
+                JuliaDynamicAnalysisProtocol.IndexProjectParams("/ws/P", nothing, "/tmp/store", nothing))
         catch e
             err = e
         end
@@ -261,4 +272,27 @@ end
         try close(inbound) catch end
         try close(outbound) catch end
     end
+end
+
+@testitem "Dynamic failures: a depot lock collision is classed as infrastructure" begin
+    using JuliaWorkspaces: _is_infra_failure
+    using JuliaWorkspaces: JSONRPC
+
+    # Raised by the parent's own store work, so the exception itself is
+    # available to inspect: `mkpath`/`mktempdir`/`isfile` all throw `IOError`.
+    @test _is_infra_failure(Base.IOError("mkdir(\"…/_downloads\"): permission denied (EACCES)", Base.UV_EACCES))
+    @test _is_infra_failure(Base.IOError("unlink(\"…/manifest_usage.toml.pid\"): resource busy or locked (EBUSY)", Base.UV_EBUSY))
+    @test !_is_infra_failure(Base.IOError("open: no such file or directory (ENOENT)", Base.UV_ENOENT))
+    @test !_is_infra_failure(Base.IOError("open(\"/workspace/Project.toml\"): permission denied (EACCES)", Base.UV_EACCES))
+
+    # Raised in the child, where only the rendered text crosses the boundary.
+    @test _is_infra_failure(JSONRPC.JSONRPCError(-32000,
+        "Failed to index project at /ws/P: IOError: stat(\"…/manifest_usage.toml.pid\"): permission denied (EACCES)", nothing))
+    @test !_is_infra_failure(JSONRPC.JSONRPCError(-32000,
+        "Failed to index project at /ws/P: IOError: open(\"/ws/P/Project.toml\"): permission denied (EACCES)", nothing))
+    @test !_is_infra_failure(JSONRPC.JSONRPCError(-32000,
+        "Failed to index project at /ws/P: Unsatisfiable requirements detected", nothing))
+
+    # A project failure that merely quotes those words is the project's problem.
+    @test !_is_infra_failure(ErrorException("IOError: EACCES"))
 end

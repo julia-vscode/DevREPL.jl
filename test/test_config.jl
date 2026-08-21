@@ -92,6 +92,97 @@ end
     end
 end
 
+@testitem "Lint rules: preset severities match the pre-registry values" begin
+    # The presets used to be three hand-written dicts; they are now derived from
+    # per-rule severity fields. This pins every value to what the hand-written
+    # dicts contained, so the registry refactor is provably behavior-neutral and
+    # any future change to a preset severity is a conscious test update.
+    expected_default = Dict{Symbol,Symbol}(
+        :incorrect_call_args => :information,
+        :incorrect_iter_spec => :information,
+        :index_from_length => :information,
+        :nothing_comparison => :information,
+        :const_if_condition => :information,
+        :pointless_boolean => :information,
+        :invalid_type_declaration => :information,
+        :unused_type_parameter => :hint,
+        :module_name => :information,
+        :type_piracy => :information,
+        :unused_function_argument => :hint,
+        :duplicate_function_argument => :information,
+        :kw_default_mismatch => :information,
+        :literal_use => :information,
+        :break_continue => :information,
+        :global_const_decl => :information,
+        :unused_binding => :hint,
+        :const_decl => :information,
+        :relative_import => :information,
+        :include_errors => :warning,
+        :missing_reference => :warning,
+        :unresolved_import => :warning,
+        :syntax_errors => :error,
+        :syntax_warnings => :off,
+        :testitem_errors => :error,
+        :toml_syntax_errors => :error,
+        :config_errors => :error,
+        :shadowed_config => :information,
+        :environment_errors => :information,
+        # Syntactic rules added with the rule registry; off outside `strict`.
+        :nan_comparison => :off,
+        :duplicate_branch_condition => :off,
+        :string_concat_style => :off,
+        :bare_using => :off,
+        :debug_statement => :off,
+        :async_task => :off,
+    )
+    @test JuliaWorkspaces.LINT_PRESETS["default"] == expected_default
+
+    # minimal: everything off except the checks that catch outright breakage.
+    expected_minimal = Dict{Symbol,Symbol}(
+        r.id => get(
+            Dict{Symbol,Symbol}(
+                :syntax_errors => :error,
+                :testitem_errors => :error,
+                :toml_syntax_errors => :error,
+                :config_errors => :error,
+                :include_errors => :warning,
+                :const_decl => :warning,
+                :shadowed_config => :information,
+            ),
+            r.id,
+            :off,
+        )
+        for r in JuliaWorkspaces.LINT_RULES
+    )
+    @test JuliaWorkspaces.LINT_PRESETS["minimal"] == expected_minimal
+
+    # strict: everything on, hints/infos/offs promoted to warnings.
+    expected_strict = Dict{Symbol,Symbol}(
+        r.id => begin
+            d = expected_default[r.id]
+            r.id === :syntax_warnings ? :warning :
+            d in (:off, :hint, :information) ? :warning : d
+        end
+        for r in JuliaWorkspaces.LINT_RULES
+    )
+    @test JuliaWorkspaces.LINT_PRESETS["strict"] == expected_strict
+
+    # The env-dependent set, formerly a side table, now derived from rule fields.
+    @test JuliaWorkspaces.ENV_DEPENDENT_LINT_RULES == Set([
+        :incorrect_call_args, :incorrect_iter_spec, :nothing_comparison,
+        :invalid_type_declaration, :type_piracy, :kw_default_mismatch,
+        :missing_reference, :unresolved_import,
+    ])
+
+    # Tags and doc links, formerly side tables.
+    @test JuliaWorkspaces.rule_tags(:unused_binding) == [:unnecessary]
+    @test JuliaWorkspaces.rule_tags(:unused_function_argument) == [:unnecessary]
+    @test JuliaWorkspaces.rule_tags(:unused_type_parameter) == [:unnecessary]
+    @test JuliaWorkspaces.rule_tags(:nothing_comparison) == Symbol[]
+    @test JuliaWorkspaces.rule_code_description(:index_from_length) !== nothing
+    @test JuliaWorkspaces.rule_code_description(:nothing_comparison) === nothing
+end
+
 @testitem "Lint config: a nested config reports that it supersedes the outer one" begin
     using JuliaWorkspaces.URIs2: URI
 
@@ -127,7 +218,7 @@ end
     @test !any(d -> d.code === :shadowed_config, get_diagnostic(jw, URI("file:///sh2/src/JuliaLint.toml")))
 end
 
-@testitem "Config: a nested formatter or test items config reports it too" begin
+@testitem "Config: a nested formatter config reports it too" begin
     using JuliaWorkspaces.URIs2: URI
 
     jw = JuliaWorkspace()
@@ -136,8 +227,15 @@ end
     add_file!(jw, TextFile(URI("file:///sh3/JuliaTestItems.toml"), SourceText("include = [\"src/**\"]\n", "toml")))
     add_file!(jw, TextFile(URI("file:///sh3/src/JuliaTestItems.toml"), SourceText("include = [\"*.jl\"]\n", "toml")))
 
-    @test any(d -> d.code === :shadowed_config, get_diagnostic(jw, URI("file:///sh3/src/JuliaFormat.toml")))
-    @test any(d -> d.code === :shadowed_config, get_diagnostic(jw, URI("file:///sh3/src/JuliaTestItems.toml")))
+    fmt = get_diagnostic(jw, URI("file:///sh3/src/JuliaFormat.toml"))
+    idx = findfirst(d -> d.code === :shadowed_config, fmt)
+    @test idx !== nothing
+    # The message says what still survives the takeover.
+    @test occursin("include", fmt[idx].message) && occursin("narrow", fmt[idx].message)
+
+    # A nested `JuliaTestItems.toml` shadows nothing: v1 of that file has only
+    # scope keys, and scope composes over the chain instead of being replaced.
+    @test !any(d -> d.code === :shadowed_config, get_diagnostic(jw, URI("file:///sh3/src/JuliaTestItems.toml")))
 
     # Different kinds don't shadow each other.
     @test !any(d -> d.code === :shadowed_config, get_diagnostic(jw, URI("file:///sh3/JuliaFormat.toml")))
@@ -167,6 +265,7 @@ end
               diags("JuliaLint.toml", "config-version = \"one\"\n"))
 end
 
+# Settings only — scope composes over the chain instead, see the veto tests below.
 @testitem "Lint config: nearest file governs, no merging" begin
     using JuliaWorkspaces.URIs2: URI
 
@@ -498,4 +597,215 @@ end
     # `ExpandFunction` fixes no rule, so even the most restrictive config keeps it.
     @test "ExpandFunction" in actions_with(nothing)
     @test "ExpandFunction" in actions_with("preset = \"minimal\"")
+end
+
+@testitem "Config chain: ancestor_configs walks outermost to innermost" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    ancestors(uris, u) = JuliaWorkspaces.ancestor_configs(uris, URI(u))
+
+    root = URI("file:///p/JuliaTestItems.toml")
+    mid = URI("file:///p/packages/JuliaTestItems.toml")
+    deep = URI("file:///p/packages/Foo/JuliaTestItems.toml")
+    other = URI("file:///q/JuliaTestItems.toml")
+
+    # Outermost first, and the ordering does not depend on the input order.
+    for input in ([root, mid, deep, other], [deep, other, root, mid])
+        @test ancestors(input, "file:///p/packages/Foo/src/a.jl") == [root, mid, deep]
+    end
+
+    @test ancestors([root, mid, deep], "file:///p/a.jl") == [root]
+    @test isempty(ancestors([root, mid, deep], "file:///elsewhere/a.jl"))
+    @test isempty(ancestors([root], "untitled:Untitled-1"))
+
+    # `nearest_config` is the innermost entry of the same chain.
+    @test JuliaWorkspaces.nearest_config([root, mid, deep], URI("file:///p/packages/Foo/src/a.jl")) == deep
+    @test JuliaWorkspaces.nearest_config([root, mid, deep], URI("file:///elsewhere/a.jl")) === nothing
+
+    # A config never counts as its own strict ancestor.
+    @test JuliaWorkspaces.strict_ancestor_configs([root, mid, deep], deep) == [root, mid]
+    @test isempty(JuliaWorkspaces.strict_ancestor_configs([root, mid, deep], root))
+end
+
+@testitem "Config chain: scope_selected is the intersection over the chain" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    root = URI("file:///p/JuliaTestItems.toml")
+    nested = URI("file:///p/packages/Foo/JuliaTestItems.toml")
+
+    filters = Dict{URI,JuliaWorkspaces.PathFilter}()
+    pf(inc, exc) = JuliaWorkspaces.PathFilter(
+        JuliaWorkspaces.GlobPattern[JuliaWorkspaces.GlobPattern(x) for x in inc],
+        JuliaWorkspaces.GlobPattern[JuliaWorkspaces.GlobPattern(x) for x in exc],
+    )
+    sel(path) = JuliaWorkspaces.scope_selected([root, nested], path, c -> filters[c])
+
+    # The parent excludes the subtree; the nested file cannot take it back.
+    filters[root] = pf(String[], ["packages/**"])
+    filters[nested] = pf(String[], String[])
+    @test !sel("/p/packages/Foo/src/a.jl")
+
+    # Not even with an explicit `include`.
+    filters[nested] = pf(["**/*.jl"], String[])
+    @test !sel("/p/packages/Foo/src/a.jl")
+
+    # A nested file may narrow further.
+    filters[root] = pf(String[], String[])
+    filters[nested] = pf(String[], ["gen/**"])
+    @test sel("/p/packages/Foo/src/a.jl")
+    @test !sel("/p/packages/Foo/gen/a.jl")
+
+    # A nested `include` cannot widen the parent's.
+    filters[root] = pf(["packages/Foo/src/**"], String[])
+    filters[nested] = pf(["**"], String[])
+    @test sel("/p/packages/Foo/src/a.jl")
+    @test !sel("/p/packages/Foo/docs/a.jl")
+end
+
+@testitem "Test items config: a vendored config cannot undo an enclosing exclude" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    content = """
+    module Foo
+    @testitem "t" begin
+        @test true
+    end
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///veto/Project.toml"),
+        SourceText("name = \"Veto\"\nuuid = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee21\"\nversion = \"0.1.0\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///veto/JuliaTestItems.toml"),
+        SourceText("exclude = [\"packages/**\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///veto/src/Veto.jl"), SourceText(content, "julia")))
+
+    # A vendored package carrying its own config, which under nearest-wins would
+    # have resurrected the whole subtree.
+    add_file!(jw, TextFile(URI("file:///veto/packages/Foo/Project.toml"),
+        SourceText("name = \"Foo\"\nuuid = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee22\"\nversion = \"0.1.0\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///veto/packages/Foo/JuliaTestItems.toml"),
+        SourceText("include = [\"**/*.jl\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///veto/packages/Foo/src/Foo.jl"), SourceText(content, "julia")))
+
+    @test !isempty(JuliaWorkspaces.derived_testitems(jw.runtime, URI("file:///veto/src/Veto.jl")).testitems)
+    @test isempty(JuliaWorkspaces.derived_testitems(jw.runtime, URI("file:///veto/packages/Foo/src/Foo.jl")).testitems)
+
+    # And the whole-workspace sweep agrees: it is keyed by file, and the
+    # vendored file contributes no test items to it.
+    sweep = JuliaWorkspaces.derived_all_testitems(jw.runtime)
+    @test !isempty(sweep[URI("file:///veto/src/Veto.jl")].testitems)
+    @test isempty(sweep[URI("file:///veto/packages/Foo/src/Foo.jl")].testitems)
+end
+
+@testitem "Test items config: a nested config may still narrow discovery" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    content = """
+    @testitem "t" begin
+        @test true
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///narrow/Project.toml"),
+        SourceText("name = \"Narrow\"\nuuid = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee23\"\nversion = \"0.1.0\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///narrow/JuliaTestItems.toml"), SourceText("\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///narrow/sub/JuliaTestItems.toml"),
+        SourceText("exclude = [\"gen/**\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///narrow/sub/src/a.jl"), SourceText(content, "julia")))
+    add_file!(jw, TextFile(URI("file:///narrow/sub/gen/b.jl"), SourceText(content, "julia")))
+
+    @test !isempty(JuliaWorkspaces.derived_testitems(jw.runtime, URI("file:///narrow/sub/src/a.jl")).testitems)
+    @test isempty(JuliaWorkspaces.derived_testitems(jw.runtime, URI("file:///narrow/sub/gen/b.jl")).testitems)
+end
+
+@testitem "Test items config: a nested include cannot widen an enclosing one" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    content = """
+    @testitem "t" begin
+        @test true
+    end
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///widen/Project.toml"),
+        SourceText("name = \"Widen\"\nuuid = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee24\"\nversion = \"0.1.0\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///widen/JuliaTestItems.toml"),
+        SourceText("include = [\"src/**\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///widen/docs/JuliaTestItems.toml"),
+        SourceText("include = [\"**\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///widen/src/a.jl"), SourceText(content, "julia")))
+    add_file!(jw, TextFile(URI("file:///widen/docs/b.jl"), SourceText(content, "julia")))
+
+    @test !isempty(JuliaWorkspaces.derived_testitems(jw.runtime, URI("file:///widen/src/a.jl")).testitems)
+    @test isempty(JuliaWorkspaces.derived_testitems(jw.runtime, URI("file:///widen/docs/b.jl")).testitems)
+end
+
+@testitem "Lint config: a vendored config cannot undo an enclosing exclude" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///lveto/JuliaLint.toml"),
+        SourceText("exclude = [\"vendor/**\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///lveto/vendor/JuliaLint.toml"),
+        SourceText("preset = \"strict\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///lveto/a.jl"), SourceText("function foo() end begin", "julia")))
+    add_file!(jw, TextFile(URI("file:///lveto/vendor/b.jl"), SourceText("function foo() end begin", "julia")))
+    add_file!(jw, TextFile(URI("file:///lveto/nested/JuliaLint.toml"),
+        SourceText("preset = \"strict\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///lveto/nested/c.jl"), SourceText("x = 1\n", "julia")))
+
+    @test !isempty(get_diagnostic(jw, URI("file:///lveto/a.jl")))
+    @test isempty(get_diagnostic(jw, URI("file:///lveto/vendor/b.jl")))
+
+    # Settings are unaffected: they still come from the nearest file alone.
+    nested = JuliaWorkspaces.derived_effective_lint_config(jw.runtime, URI("file:///lveto/nested/c.jl"))
+    @test nested.selected
+    @test JuliaWorkspaces.rule_severity(nested, :unused_binding) === :warning
+end
+
+@testitem "Format config: a vendored config cannot undo an enclosing exclude" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///fveto/JuliaFormat.toml"),
+        SourceText("exclude = [\"vendor/**\"]\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///fveto/vendor/JuliaFormat.toml"),
+        SourceText("style = \"blue\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///fveto/a.jl"), SourceText("x = 1\n", "julia")))
+    add_file!(jw, TextFile(URI("file:///fveto/vendor/b.jl"), SourceText("x = 1\n", "julia")))
+    add_file!(jw, TextFile(URI("file:///fveto/nested/JuliaFormat.toml"),
+        SourceText("style = \"blue\"\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///fveto/nested/c.jl"), SourceText("x = 1\n", "julia")))
+
+    @test !is_format_excluded(jw, URI("file:///fveto/a.jl"))
+    @test is_format_excluded(jw, URI("file:///fveto/vendor/b.jl"))
+
+    # Style still comes from the nearest file for a file that is in scope.
+    @test JuliaWorkspaces.derived_format_configuration(jw.runtime, URI("file:///fveto/nested/c.jl")).style == "blue"
+end
+
+@testitem "Config: a config file inside an excluded subtree is silent" begin
+    using JuliaWorkspaces.URIs2: URI
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///quiet/JuliaLint.toml"),
+        SourceText("exclude = [\"vendor/**\"]\n", "toml")))
+    # Deliberately broken configs inside the subtree the project set aside.
+    add_file!(jw, TextFile(URI("file:///quiet/vendor/JuliaTestItems.toml"),
+        SourceText("workers = 4\n", "toml")))
+    add_file!(jw, TextFile(URI("file:///quiet/vendor/JuliaLint.toml"),
+        SourceText("bogus_key = 1\n", "toml")))
+
+    @test isempty(get_diagnostic(jw, URI("file:///quiet/vendor/JuliaTestItems.toml")))
+    @test isempty(get_diagnostic(jw, URI("file:///quiet/vendor/JuliaLint.toml")))
+
+    # But a config excluding its own directory still reports its own mistakes,
+    # or a bad `exclude` could hide the diagnostic that explains it.
+    jw2 = JuliaWorkspace()
+    add_file!(jw2, TextFile(URI("file:///quiet2/JuliaLint.toml"),
+        SourceText("exclude = [\"**\"]\nbogus_key = 1\n", "toml")))
+    @test any(d -> d.code === :config_errors, get_diagnostic(jw2, URI("file:///quiet2/JuliaLint.toml")))
 end

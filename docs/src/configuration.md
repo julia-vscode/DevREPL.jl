@@ -20,9 +20,10 @@ and it applies everywhere. The shared machinery lives in
 
 ## Shared mechanism
 
-### Discovery: the nearest file governs, wholesale
+### Settings: the nearest file governs, wholesale
 
-To resolve configuration for a file, JuliaWorkspaces walks up from that file's
+To resolve the *settings* for a file — `preset`, `[rules]`, `style`,
+`[options]`, `[[override]]` — JuliaWorkspaces walks up from that file's
 directory and uses the **first** config file of the relevant kind it finds. That
 file then applies **as a whole**:
 
@@ -56,13 +57,47 @@ to vary settings by directory**. The normal setup is a single config file of
 each kind at the repository root; when a subtree needs different settings, use
 an [`[[override]]` block](#path-scoped-overrides) in that one file — it changes
 only the keys it names, while a nested file silently resets everything it does
-not restate back to the defaults. Reach for a nested file only when a subtree is
-genuinely independent of the enclosing project and should not follow its
-configuration at all — a vendored repository with its own conventions, say.
+not restate back to the defaults.
 
 Config file names are matched **case-insensitively on the basename**, so
 `JuliaLint.toml` and `julialint.toml` both work. A leading dot does **not**:
 `.JuliaLint.toml` is not recognised.
+
+### Scope: every enclosing file must admit the file
+
+Scope is the one thing that does **not** follow nearest-wins. A file is searched,
+linted or formatted only if **every** config file of that kind above it admits it
+through its [`include`/`exclude`](#file-selection-include-and-exclude) globs,
+each evaluated relative to that config file's own directory. "Above it" stops at
+the root of the tree in question — a workspace folder here — so a config file
+outside that tree has no say.
+
+**A nested config may narrow scope, never widen it.** Given
+
+```
+myproject/
+  JuliaTestItems.toml           # exclude = ["packages/**"]
+  packages/
+    Foo/                        # a vendored repository
+      JuliaTestItems.toml       # include = ["**/*.jl"]
+      src/Foo.jl
+```
+
+`packages/Foo/src/Foo.jl` is **not** searched for test items. The vendored
+config governs the settings of its own subtree, and it may exclude more of it,
+but it cannot take back the enclosing project's decision to leave `packages/`
+alone.
+
+This is how you seal a subtree you do not own: write the exclusion in the
+config file at the root of the project that vendors it. It is also why an
+ancestor's `exclude` is worth reaching for before a nested config file — the
+parent always has the last word on what is in scope.
+
+The rule is the same one git applies to `.gitignore` (a file cannot be
+re-included once a parent directory is excluded), and the same split Ruff makes
+between hierarchical rule settings and top-level file discovery. The alternative
+— letting the innermost file decide scope on its own — hands vendored code a
+veto over the project vendoring it.
 
 ### Precedence within a file
 
@@ -73,7 +108,9 @@ built-in defaults  <  preset / style  <  top-level keys  <  last matching [[over
 ### File selection: `include` and `exclude`
 
 Every config file accepts two top-level glob lists, relative to the directory
-holding the config file:
+holding **that** config file. When several config files of one kind enclose a
+file, each is evaluated against its own directory and the results are
+intersected — see [Scope](#scope-every-enclosing-file-must-admit-the-file):
 
 ```toml
 include = ["src/**", "test/**"]
@@ -84,9 +121,12 @@ exclude = ["**/generated_*.jl"]
 - `exclude` always wins over `include`.
 - An excluded file is not linted / formatted / searched for test items at all.
 
-A config file always validates itself even when its own globs exclude the
+A config file always validates itself even when **its own** globs exclude the
 directory it lives in — otherwise a mistake in `exclude` could hide the very
-diagnostic that would explain it.
+diagnostic that would explain it. That exemption stops at its own file: a config
+inside a subtree an **enclosing** `JuliaLint.toml` excluded reports nothing at
+all, along with the rest of that subtree. Excluding a vendored repository should
+not leave you reading diagnostics about its config files.
 
 ### Glob syntax
 
@@ -105,6 +145,14 @@ Gitignore-style, implemented by
 
 Paths are normalised to `/` before matching, so `test\**` and `test/**` behave
 identically. Matching is case-insensitive on Windows.
+
+One asymmetry in that table is easy to trip over: a pattern **containing** a
+separator anywhere is anchored to the config file's directory even without a
+leading `/`. So `excluded/**` matches `excluded/a.jl` but **not**
+`nested/excluded/a.jl` — write `**/excluded/**` for the latter. Only a pattern
+with no separator at all, like `generated.jl`, matches at every depth. This
+matters more now that a root config's patterns govern subtrees several levels
+down.
 
 ### Path-scoped overrides
 
@@ -143,19 +191,23 @@ does not understand is told to upgrade the tooling.
 
 ### Superseded configuration
 
-Because the nearest config governs wholesale, a config file in a subdirectory
-does not extend the one above it — it *replaces* it, and since nested config
-files are discouraged (use [`[[override]]`](#path-scoped-overrides) instead),
-that replacement is more often an accident than a decision. It is also silent by
-nature, so a config file with another of the same kind in an enclosing directory
-reports a `shadowed_config` diagnostic (`info` by default) naming the file it
-takes over from.
+Because the nearest config governs its settings wholesale, a config file in a
+subdirectory does not extend the one above it — it *replaces* it, and since
+nested config files are discouraged (use
+[`[[override]]`](#path-scoped-overrides) instead), that replacement is more often
+an accident than a decision. It is also silent by nature, so a config file with
+another of the same kind in an enclosing directory reports a `shadowed_config`
+diagnostic (`info` by default) naming the file it takes over from.
 
-This is the price of choosing nearest-wins over cascading. The alternative is
-that a config dropped into a subdirectory — a vendored repository, a copied
-example, a half-finished subpackage extraction — quietly voids the project's own
-configuration for that subtree. It is an ordinary rule, so a project that
-genuinely wants independent subtrees sets `shadowed_config = "off"`.
+Only settings are superseded; the message says so. The outer file's
+`include`/`exclude` keep applying, because
+[scope composes over the whole chain](#scope-every-enclosing-file-must-admit-the-file).
+
+`JuliaTestItems.toml` never reports this: version 1 of that file has nothing but
+scope keys, so a nested one supersedes nothing at all.
+
+It is an ordinary rule, so a project that deliberately keeps nested settings
+files sets `shadowed_config = "off"`.
 
 ### Validation
 
@@ -198,6 +250,21 @@ would want to configure together — `nothing_comparison` covers both
 `NothingEquality` and `NothingNotEq`. The mapping is declared once in
 [`src/lint_rules.jl`](https://github.com/julia-vscode/JuliaWorkspaces.jl/blob/main/src/lint_rules.jl)
 as `LINT_RULES`; `LINTCODE_TO_RULE` inverts it.
+
+Not every rule is backed by the semantic StaticLint pass. Purely syntactic
+rules run on the JuliaSyntax tree of a single file alone
+(see [`src/lint_syntax_rules/`](https://github.com/julia-vscode/JuliaWorkspaces.jl/tree/main/src/lint_syntax_rules), one file per rule):
+
+| Rule | Finds |
+| --- | --- |
+| `nan_comparison` | `x == NaN` / `x != NaN`, which always yield the same answer; use `isnan`. |
+| `duplicate_branch_condition` | An `elseif` condition identical to an earlier condition in the same chain, making the branch unreachable. Conditions containing arbitrary function or macro calls are exempt, since each evaluation may legitimately differ. |
+| `string_concat_style` | A string literal concatenated with `*`; prefer interpolation or `string(...)`. |
+| `bare_using` | `using Foo` without an explicit name list; prefer `using Foo: x, y` or `import Foo`. |
+| `debug_statement` | A leftover `@show`. |
+| `async_task` | `@async`, which pins the task to the current thread; consider `Threads.@spawn`. |
+
+All of these are currently `"off"` outside the `strict` preset.
 
 ### Severities
 
@@ -267,9 +334,10 @@ in everyone's `default` at whatever severity a fallback happened to pick.
 | `toml_syntax_errors` | `error` | TOML syntax errors in config, `Project.toml`, `Manifest.toml` |
 | `config_errors` | `error` | Invalid keys/values in any of the three config files |
 | `shadowed_config` | `info` | A config file that supersedes another of the same kind in an enclosing directory |
+| `environment_errors` | `info` | A project/test environment that could not be resolved, reported on its `Project.toml` |
 | `incorrect_call_args` | `info` | Wrong argument count/type; calls to method-less functions |
 | `incorrect_iter_spec` | `info` | Loop iterators that will likely error |
-| `index_from_length` | `info` | Indexing off `length`/`size` instead of `eachindex`/`axes` |
+| `index_from_length` | `info` | Indexing off `1:length(...)`/`1:size(...)` instead of `eachindex`/`axes`. Ranges that don't start at 1 (`2:length(x)`) are not flagged — they have no direct rewrite |
 | `nothing_comparison` | `info` | `== nothing` / `!= nothing` instead of `isnothing`/`===` |
 | `const_if_condition` | `info` | Boolean literal or unbracketed assignment as an `if` condition |
 | `pointless_boolean` | `info` | `&&`/`\|\|` whose first argument is a boolean literal |
@@ -286,7 +354,7 @@ in everyone's `default` at whatever severity a fallback happened to pick.
 | `const_decl` | `info` | Invalid `const` declarations and redefinitions |
 | `unused_binding` | `hint` | Variables assigned but never used |
 | `relative_import` | `info` | A relative import with more dots than available nesting |
-| `include_errors` | `warning` | Circular, duplicate, missing or unreadable `include`s |
+| `include_errors` | `warning` | Circular, duplicate, missing, unreadable, or statically unresolvable (computed-path) `include`s. A computed include also disables missing-reference checks in the module it appears in, since the included file's contents are unknown to the analyzer |
 | `missing_reference` | `warning` | Unresolved references. Option `scope`: `"none"`, `"symbols"`, `"all"` (default) |
 | `unresolved_import` | `warning` | Imports whose target could not be resolved |
 
@@ -358,23 +426,47 @@ Note the division of labour: this file decides *where test items are found*,
 while the `testitem_errors` rule in `JuliaLint.toml` decides *whether malformed
 test items are reported as diagnostics*.
 
+Because the file has only scope keys, the
+[chain rule](#scope-every-enclosing-file-must-admit-the-file) is all there is to
+its resolution: a `JuliaTestItems.toml` in a subdirectory can exclude more of
+that subdirectory, and nothing else.
+
+TestItemRunner.jl reads the same file with the same semantics, so
+`@run_package_tests` and the VS Code test explorer agree on which files are
+searched. Both root the chain at the tree they are given: config files above a
+workspace folder do not reach the editor, and config files above the path handed
+to the runner do not reach it either. Pointing the runner at a subdirectory
+therefore scopes discovery to that subdirectory, exactly as opening it as a
+workspace folder would.
+
 ## Implementation notes
 
 ### Query structure
 
-Configuration resolution is split into two Salsa queries per file kind so that
-parsing happens once per config file rather than once per configured file:
+Configuration resolution is split into three Salsa queries per file kind so that
+parsing happens once per config file rather than once per configured file, and so
+that scope and settings invalidate independently:
 
-- `derived_parsed_lint_config(rt, config_uri)` — parses one `JuliaLint.toml`
-  into a `ParsedLintConfig` (preset, rule table, filters, override blocks).
-- `derived_effective_lint_config(rt, uri)` — finds the governing config, then
-  resolves preset < `[rules]` < overrides **for that one file**, yielding an
-  [`EffectiveLintConfig`](@ref).
+- `derived_parsed_lint_config(rt, config_uri)` — parses the *settings* of one
+  `JuliaLint.toml` into a `ParsedLintConfig` (preset, rule table, override
+  blocks).
+- `derived_lint_path_filter(rt, config_uri)` — parses the `include`/`exclude`
+  globs of one `JuliaLint.toml`. Deliberately separate from the above: were the
+  globs part of `ParsedLintConfig`, editing `[rules]` would invalidate every
+  file's scope, and editing `exclude` every file's rules.
+- `derived_effective_lint_config(rt, uri)` — resolves scope over the whole
+  `ancestor_configs` chain, then preset < `[rules]` < overrides from the nearest
+  config alone, yielding an [`EffectiveLintConfig`](@ref).
 
 Editing a config file invalidates only through `derived_toml_syntax_tree`;
 adding or removing one invalidates through `derived_text_files`. Formatting has
-the same shape via `derived_format_configuration`, as does test-item discovery
-via `derived_testitems_selected`.
+the same shape via `derived_format_path_filter` and
+`derived_format_configuration`, as does test-item discovery via
+`derived_testitems_path_filter` and `derived_testitems_selected`.
+
+The list of config files of one kind is sorted, not merely collected: it is a
+dependency of every file's scope, and it is built from a `Set`, so an unsorted
+result would change on unrelated file additions and defeat backdating.
 
 Every value reachable from a config struct has well-defined `==` and `hash`
 (`GlobPattern` compares by its written pattern, not its compiled regex) so that
@@ -389,18 +481,23 @@ enabled when **any** rule mapping into it is not `"off"`. Because several rules
 can share one category, and several rules have no category at all, that gate is
 necessarily coarse.
 
-The precise per-rule decision therefore happens where diagnostics are emitted,
-in `_emit_hint_diagnostics!`
-([`src/lint_emission.jl`](https://github.com/julia-vscode/JuliaWorkspaces.jl/blob/main/src/lint_emission.jl)):
-each finding's rule id is looked up, an `"off"` rule is skipped, and the
-configured severity replaces the built-in one. This keeps rule granularity
-independent of StaticLint's internal check structure, at the cost of computing a
-small number of findings that are then discarded.
+The precise per-rule decision therefore happens in exactly one place: every
+producer emits severity-free `LintFinding`s (a range, a rule id, a message),
+and `materialize` in `derived_diagnostics`
+([`src/layer_diagnostics.jl`](https://github.com/julia-vscode/JuliaWorkspaces.jl/blob/main/src/layer_diagnostics.jl))
+turns each finding into a `Diagnostic`: an `"off"` rule is dropped, the
+configured severity is applied, and the rule's tags and documentation link are
+attached. This keeps rule granularity independent of StaticLint's internal
+check structure, at the cost of computing a small number of findings that are
+then discarded — and it means a severity-only config edit re-runs only this
+cheap materialization step, never the producers.
 
-`_emit_hint_diagnostics!` is shared by both static-lint pipelines — the
-whole-closure pass in `layer_static_lint.jl` and the per-file pass in
-`layer_file_analysis.jl` — which differ only in how a call mismatch is described
-and in the container they collect into.
+`_emit_hint_findings!`
+([`src/lint_emission.jl`](https://github.com/julia-vscode/JuliaWorkspaces.jl/blob/main/src/lint_emission.jl))
+maps StaticLint's hints onto rule ids and messages; it is shared by both
+static-lint pipelines — the whole-closure pass in `layer_static_lint.jl` and
+the per-file pass in `layer_file_analysis.jl` — which differ only in how a call
+mismatch is described and in the container they collect into.
 
 ### Migrating from the old schema
 
