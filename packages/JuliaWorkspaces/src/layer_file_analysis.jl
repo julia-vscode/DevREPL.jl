@@ -80,11 +80,21 @@ end
 # outermost-first, read off the scope chain (works after
 # `strip_module_contexts!` — module nesting survives the handle strip).
 # `vcat(splice_path, this)` is `x`'s absolute module path.
+#
+# A `@testitem`/`@testmodule`/`@testsnippet` body is a module too (it opens a
+# `:testitem` node in the tree), but its scope's `expr` is a MACROCALL, so
+# `defines_module` cannot see it — the segment is read from the scope's own
+# `testitem_segment`, recorded by `_seed_testitem_tree_context!`. Without this,
+# every consumer computing an absolute path for a call site inside a test item
+# (the method-set and arity lints, hover, references, completions) would look
+# in the ENCLOSING module and miss everything the test item includes.
 function _in_file_module_names(x, meta_dict)
     names = String[]
     s = StaticLint.retrieve_scope(x, meta_dict)
     while s isa StaticLint.Scope
-        if s.expr isa CSTParser.EXPR && CSTParser.defines_module(s.expr)
+        if s.testitem_segment !== nothing
+            pushfirst!(names, s.testitem_segment)
+        elseif s.expr isa CSTParser.EXPR && CSTParser.defines_module(s.expr)
             mn = CSTParser.get_name(s.expr)
             nm = mn isa CSTParser.EXPR && CSTParser.isidentifier(mn) ? StaticLint.valofid(mn) : nothing
             nm !== nothing && pushfirst!(names, nm)
@@ -335,8 +345,8 @@ end
 # For `using` at module toplevel no `scope.modules` entry is needed: the
 # bring-ins are part of the module's `derived_module_visible_names` face and
 # the seeded `:__tree__` context covers them. A `using` anywhere else (a
-# `@testitem`/`@testset` body — those macrocalls are opaque to the
-# inventory) has no face to lean on, so its exported names are materialized
+# `@testset` body, or a non-toplevel `using` in a testitem-family body) has
+# no face to lean on, so its exported names are materialized
 # as an export-filtered context on the current scope; the wrapper holds a
 # runtime handle and is removed by `strip_module_contexts!` before freezing.
 function StaticLint._mark_import_arg(arg, par::TreeModuleContext, state, usinged, meta_dict)
@@ -348,11 +358,30 @@ function StaticLint._mark_import_arg(arg, par::TreeModuleContext, state, usinged
     end
     if usinged
         if !StaticLint.is_module_toplevel_scope(state.scope)
+            # @testitem/@testsnippet bodies and other non-module-toplevel
+            # `using` sites: the export-filtered injection is the designed
+            # behavior there (macros.jl marks the scope itself when the export
+            # list is unknown), so no extra conservatism here.
             exps = StaticLint.context_exported_names(par)
             if exps !== nothing
                 nm = StaticLint.valofid(arg)
                 nm !== nothing && StaticLint.add_to_imported_modules(
                     state.scope, Symbol(nm), StaticLint.ExportFilteredContext(par, Set{String}(exps)))
+            end
+        else
+            # Module-toplevel wildcard `using` of a module from ANOTHER root
+            # (a workspace package): the bring-ins come from an export view
+            # analyzed from source, which is incomplete under computed
+            # `include` paths and re-exports (`@reexport`). Suppress bare
+            # missing-ref hints in this scope like an unresolved wildcard —
+            # the same conservatism as `_mark_cst_wildcard_using!`
+            # (whole-closure pass) and `_wildcard_using_unresolved`
+            # (file-root splice path); this covers `module TestFoo ... using
+            # Foo ... end` wrappers declared inside the analyzed file, whose
+            # module boundary stops the file-root flag.
+            ctx = StaticLint.enclosing_tree_context(state.scope)
+            if !(ctx isa TreeModuleContext) || ctx.root != par.root
+                StaticLint._mark_cst_wildcard_using!(state.scope)
             end
         end
     else
@@ -396,7 +425,9 @@ The frozen result of one per-file semantic analysis (`derived_file_analysis`).
 - `outbound`: the plain-data outbound-reference table (direct tree-resolved
   refs AND import-bound sites whose binding val is a tree target, see
   `_collect_outbound`), sorted by `(name, origin_module)`.
-- `diagnostics`: the file's lint diagnostics (`check_all` + `collect_hints`).
+- `diagnostics`: the file's lint findings (`check_all` + `collect_hints`),
+  severity-free `LintFinding`s — severity is applied at materialization in
+  `derived_diagnostics`.
 
 Deliberately NOT `@auto_hash_equals` (unlike `OutboundRef`): `meta` is keyed
 by `objectid` of this file's EXPRs, so identity equality is intended — the
@@ -417,10 +448,10 @@ values, not the identity-compared env containers, and the query depends on
 struct FileAnalysis
     meta::Dict{UInt64,StaticLint.Meta}
     outbound::Vector{OutboundRef}
-    diagnostics::Vector{Diagnostic}
+    diagnostics::Vector{LintFinding}
 end
 
-_empty_file_analysis() = FileAnalysis(Dict{UInt64,StaticLint.Meta}(), OutboundRef[], Diagnostic[])
+_empty_file_analysis() = FileAnalysis(Dict{UInt64,StaticLint.Meta}(), OutboundRef[], LintFinding[])
 
 # The full path of a `SymbolServer.VarRef` chain, root-first.
 function _var_ref_path(vr::SymbolServer.VarRef)
@@ -579,7 +610,7 @@ function _call_cross_file_arities(rt, root, path, call, meta_dict)
 end
 
 function _file_analysis_diagnostics(rt, cst, env, meta_dict, lint_config, project_uri, root=nothing, path=String[])
-    diagnostics = Diagnostic[]
+    diagnostics = LintFinding[]
 
     # In-scope external/workspace module set at a call site, for
     # `describe_call_mismatch`'s method-set enumeration (mirrors the
@@ -613,7 +644,7 @@ function _file_analysis_diagnostics(rt, cst, env, meta_dict, lint_config, projec
             StaticLint.describe_call_mismatch(x, env, meta_dict; tree_in_scope)
     end
 
-    _emit_hint_diagnostics!(diagnostics, errs, meta_dict, lint_config, declared_deps; describe_call)
+    _emit_hint_findings!(diagnostics, errs, meta_dict, declared_deps; describe_call)
 
     return diagnostics
 end
@@ -723,6 +754,32 @@ frame reads the whole `derived_module_tree` value. Consequences:
   reference an actually-shifted name re-execute, and those MUST (their
   outbound `ItemRef`s change).
 """
+# Roots we can attribute a splice context to without an include edge: the
+# package entry file, standard tool entry points, and @testitem files (which
+# carry their own analysis context). Every OTHER root exists either because it
+# genuinely is a standalone script or because a computed include loads it —
+# indistinguishable statically.
+function _is_recognized_entry_point(rt, uri)
+    _file_has_testitems(rt, uri) && return true
+
+    fp = uri2filepath(uri)
+    fp === nothing && return false
+    name = lowercase(basename(fp))
+    dir = lowercase(basename(dirname(fp)))
+    name == "runtests.jl" && dir == "test" && return true
+    name == "make.jl" && dir == "docs" && return true
+
+    pkg_folder = derived_package_for_file(rt, uri)
+    if pkg_folder !== nothing
+        pkg = derived_package(rt, pkg_folder)
+        if pkg !== nothing
+            entry = joinpath(uri2filepath(pkg_folder), "src", "$(pkg.name).jl")
+            lowercase(fp) == lowercase(entry) && return true
+        end
+    end
+    return false
+end
+
 Salsa.@derived function derived_file_analysis(rt, root, file)
     @debug "derived_file_analysis" root=root file=file
 
@@ -764,7 +821,35 @@ Salsa.@derived function derived_file_analysis(rt, root, file)
     # keep their hints (matching the old pass's module-boundary rule). The
     # file's OWN failed wildcard usings need no help — `semantic_pass` +
     # `mark_unresolved_imports!` set the flag locally, as always.
-    if derived_module_unresolved_wildcard_using(rt, root, path)
+    # A computed `include` anywhere in the module is the same situation:
+    # unknown code is spliced into the module, so any bare name may be
+    # defined by the unseen file (the ComputedInclude diagnostic at the
+    # include site is the user-visible explanation).
+    # Third case: a top-level macrocall whose effects the analyzer does not
+    # model, anywhere in the module (typically another file) — its expansion
+    # may define arbitrary names in the module.
+    # Fourth case: an ORPHAN root (no include edge reaches it, and it is not a
+    # recognizable entry point) inside a package that has a computed include
+    # somewhere is very likely the *target* of that include — its real module
+    # context (and the usings that come with it) is unknown, so bare
+    # missing-ref reporting against the bare context is unreliable.
+    # Fifth case: the file is spliced INTO a test-item body (a helper a
+    # `@testitem` `include`s). At runtime that body also runs `using Test` and
+    # `using <the package under test>`, which `_inject_testitem_default_imports!`
+    # simulates on the TEST ITEM's scope — but those are not written anywhere in
+    # the tree, so they are invisible from the helper's own analysis, which would
+    # otherwise report `@test` and every package name in it as missing. Worse,
+    # the same helper is typically included from many test items with different
+    # `setup=[...]`, so the real context is not even single-valued. The honest
+    # answer is the same as for an orphan root: names resolve, bare missing-ref
+    # reporting does not.
+    if derived_module_unresolved_wildcard_using(rt, root, path) ||
+            derived_module_has_computed_include(rt, root, path) ||
+            derived_module_has_opaque_macrocall(rt, root, path) ||
+            is_testitem_path(rt, root, path) ||
+            (root == file && pkg_folder !== nothing &&
+                !_is_recognized_entry_point(rt, file) &&
+                derived_folder_has_computed_include(rt, pkg_folder))
         fscope = StaticLint.scopeof(cst, meta_dict)
         fscope isa StaticLint.Scope && (fscope.unresolved_wildcard_import = true)
     end
@@ -830,7 +915,7 @@ Salsa.@derived function derived_file_analysis(rt, root, file)
 end
 
 """
-    derived_new_static_lint_diagnostics(rt, uri) -> Set{Diagnostic}
+    derived_new_static_lint_diagnostics(rt, uri) -> Set{LintFinding}
 
 The per-file consumer face of static-lint diagnostics: for every root `uri`
 belongs to (`derived_roots_for_uri`), take that root's per-file analysis
@@ -853,7 +938,7 @@ project is active, `new == old` again.
 Salsa.@derived function derived_new_static_lint_diagnostics(rt, uri)
     @debug "derived_new_static_lint_diagnostics" uri=uri
 
-    res = Set{Diagnostic}()
+    res = Set{LintFinding}()
     for root in derived_roots_for_uri(rt, uri)
         # A project-less root contributes no diagnostics (parity with the old
         # per-root query, layer_static_lint.jl).

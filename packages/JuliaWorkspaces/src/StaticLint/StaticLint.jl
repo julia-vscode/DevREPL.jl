@@ -3,6 +3,8 @@ module StaticLint
 import ..derived_has_file
 import ..derived_julia_legacy_syntax_tree
 import ..derived_include_dict
+import ..derived_computed_include_ids
+import ..derived_testitem_segments
 import ..ItemRef
 import ..MethodArity
 
@@ -308,6 +310,13 @@ mutable struct Toplevel{RT} <: TraverseState
     # data, and where a nested `@testitem setup=[...]` (including one
     # swallowed into an unclosed enclosing block by parser recovery) would
     # otherwise re-enter this same query and cycle.
+    #
+    # Deliberately does NOT gate `_seed_testitem_tree_context!`: that seeds
+    # the body's own module-tree node, which is structure rather than runtime
+    # simulation, and its dependency chain (`derived_testitem_segments` and
+    # the `derived_module_*` selectors) reaches only the inventory and the
+    # CST — never `derived_test_setups_in_file` or `derived_file_analysis` —
+    # so the re-entry this flag guards against cannot happen there.
     simulate_testitem_runtime::Bool
     flags::Int
     meta_dict::Dict{UInt64,Meta}
@@ -568,6 +577,29 @@ or a file exists on the disc that can be loaded.
 If this is successful it traverses the code associated with the loaded file.
 """
 function followinclude(x, state::Toplevel)
+    # A computed include splices UNKNOWN code into the enclosing module: any
+    # bare name there may be defined by the unseen file, so mark the module
+    # scope like an unresolved wildcard `using` (the ComputedInclude
+    # diagnostic at the include site is the user-visible explanation). This
+    # runs in BOTH traversal modes — the flag feeds `collect_hints` either
+    # way — and before the per-file early-return below.
+    if objectid(x) in derived_computed_include_ids(state.runtime, state.uri)
+        scope = retrieve_scope(x, state.meta_dict)
+        while scope isa Scope
+            # A testitem-family body is its own module at runtime, so a computed
+            # include there splices unknown code into THAT body — stopping only
+            # at a `module`/the file root would suppress every other test item
+            # in the file too.
+            if CSTParser.defines_module(scope.expr) || _is_testitem_scope_macrocall(scope.expr) ||
+                    !(scope.parent isa Scope)
+                scope.unresolved_wildcard_import = true
+                break
+            end
+            scope = scope.parent
+        end
+        return
+    end
+
     # per-file traversal mode: included files are analyzed separately, their
     # names resolve through the module tree context
     state.follow_includes || return

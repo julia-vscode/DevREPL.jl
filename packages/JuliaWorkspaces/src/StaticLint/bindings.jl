@@ -53,6 +53,15 @@ function gotoobjectofref(x::EXPR, meta_dict)
 end
 
 
+# `(a = 1, b = 2)`: a parenthesized tuple whose first arg is an assignment is
+# a NamedTuple literal. Its `name = val` args are field names, not variables:
+# they bind nothing, and their RHS resolves in the enclosing scope (so in
+# `(a = 1, b = a)` the second `a` is the enclosing variable, not the field).
+function is_namedtuple_literal(x)
+    x isa EXPR && CSTParser.istuple(x) && CSTParser.hastrivia(x) &&
+        ispunctuation(x.trivia[1]) && length(x.args) > 0 && isassignment(x.args[1])
+end
+
 """
     mark_bindings!(x::EXPR, state)
 
@@ -72,6 +81,9 @@ function mark_bindings!(x::EXPR, state)
             mark_sig_args!(x.args[1], meta_dict)
         elseif CSTParser.iscurly(x.args[1])
             mark_typealias_bindings!(x, meta_dict)
+        elseif is_namedtuple_literal(parentof(x)) && isidentifier(x.args[1])
+            # NamedTuple literal field name, not a variable — no binding;
+            # resolve_ref gives it a detached self-binding instead
         elseif !is_getfield(x.args[1]) && state.flags & NO_NEW_BINDINGS == 0
             mark_binding!(x.args[1], meta_dict, x)
         end
@@ -185,6 +197,14 @@ function mark_binding!(x::EXPR, meta_dict, val=x)
         # `isidentifier` guard keeps function-definition assignments (`f() = 0`,
         # whose LHS is a call) on the get_name path below.
         mark_binding!(x.args[1], meta_dict, val)
+    elseif isbinarysyntax(x) && valof(headof(x)) == ">:" && length(x.args) == 2 && isidentifier(x.args[1])
+        # `T >: Missing` in a `where` clause: a LOWER-bounded typevar.
+        # `CSTParser.issubtypedecl`/`get_name` only understand `<:`, so the
+        # generic fallback below would create a NAMELESS binding — `T` then
+        # neither resolves in the signature/body (missing_reference) nor
+        # registers as used (unused_type_parameter).
+        ensuremeta(x, meta_dict)
+        getmeta(x, meta_dict).binding = Binding(x.args[1], val, nothing, [])
     elseif !(isunarysyntax(x) && valof(headof(x)) == "::")
         ensuremeta(x, meta_dict)
         getmeta(x, meta_dict).binding = Binding(CSTParser.get_name(x), val, nothing, [])
@@ -450,6 +470,15 @@ function add_binding(x, state, scope=state.scope)
                         # do nothing name of `x` will resolve to the root method
                     elseif is_bare_local_decl(existing_binding)
                         # a bare local decl does not assign a value
+                    elseif is_synthetic_import_binding(tls.names[name])
+                        # an UNRESOLVED `import M: f` bound the name
+                        # synthetically ("assumed to exist and will not be
+                        # checked"): it is almost certainly a function being
+                        # extended (`import Statistics: mean` in an extension
+                        # file whose weakdeps env is unavailable). Flagging
+                        # would turn one unresolvable import into a
+                        # "function already has a value" diagnostic per
+                        # method definition.
                     else
                         seterror!(x, CannotDefineFuncAlreadyHasValue, meta_dict)
                     end

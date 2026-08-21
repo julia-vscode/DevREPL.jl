@@ -1867,7 +1867,7 @@ end
     # `@declare_input` or `@deprecate` to this fixture would break this
     # assertion legitimately — that is not a regression.
     @test new == old
-    @test new isa Set{JuliaWorkspaces.Diagnostic}
+    @test new isa Set{JuliaWorkspaces.LintFinding}
 end
 
 @testitem "derived_new_static_lint_diagnostics: a file in two roots unions both roots' analyses" setup=[FileAnalysisWS] begin
@@ -1939,7 +1939,7 @@ end
 
     @test isempty(JuliaWorkspaces.derived_roots_for_uri(rt, a))
     res = JuliaWorkspaces.derived_new_static_lint_diagnostics(rt, a)
-    @test res isa Set{JuliaWorkspaces.Diagnostic}
+    @test res isa Set{JuliaWorkspaces.LintFinding}
     @test isempty(res)
 end
 
@@ -2113,6 +2113,42 @@ end
     @test any(r -> r.file == utils, mi)
 end
 
+@testitem "file analysis: a type decl through a cross-file const alias is not flagged" setup=[FileAnalysisWS] begin
+    # A `const Foo = Int16` alias declared in a SIBLING file resolves through
+    # the module tree as a `:const` TreeRef, whose target can't be inspected —
+    # the `::Foo` annotation must not be flagged as a non-DataType.
+    jw = ws_with(Dict(
+        ROOT => """
+        module MainPkg
+        include("a.jl")
+        include("b.jl")
+        end
+        """,
+        A => "const Foo = Int16\n",
+        B => "f(x::Foo) = x\n",
+    ))
+    fa = JuliaWorkspaces.derived_file_analysis(jw.runtime, ROOT, B)
+    @test !any(d -> occursin("non-DataType", d.message), fa.diagnostics)
+
+    # Same for an in-file alias of a sibling-file datatype (the alias RHS is a
+    # `:struct` TreeRef).
+    jw = ws_with(Dict(
+        ROOT => """
+        module MainPkg
+        include("a.jl")
+        include("b.jl")
+        end
+        """,
+        A => "struct Bar end\n",
+        B => """
+        const Foo = Bar
+        f(x::Foo) = x
+        """,
+    ))
+    fa = JuliaWorkspaces.derived_file_analysis(jw.runtime, ROOT, B)
+    @test !any(d -> occursin("non-DataType", d.message), fa.diagnostics)
+end
+
 @testitem "file analysis: a nested local closure shadowing a sibling-file datatype stays local" setup=[FileAnalysisWS] begin
     # Companion to the outer-constructor regression above: the method-extension
     # rule for a sibling-file datatype must only fire at MODULE/top-level scope,
@@ -2213,4 +2249,52 @@ end
     fa = JuliaWorkspaces.derived_file_analysis(jw.runtime, ROOT, B)
     @test !any(d -> occursin("method matching", d.message) ||
                     occursin("method call error", d.message), fa.diagnostics)
+end
+
+@testitem "invalidation: a body edit in a testitem-included helper backdates" setup=[FileAnalysisWS] begin
+    import JuliaWorkspaces.Salsa.TraceLogging as TL
+
+    mutable struct TICountReceiver <: TL.AbstractTraceReceiver
+        counts::Dict{String,Int}
+    end
+    TICountReceiver() = TICountReceiver(Dict{String,Int}())
+    TL.receive_span(r::TICountReceiver, span::TL.TraceSpan) =
+        (r.counts[span.name] = get(r.counts, span.name, 0) + 1; nothing)
+
+    TESTS = URI("file:///t/test/tests.jl")
+    SHARED = URI("file:///t/test/shared.jl")
+
+    jw = ws_with(Dict(
+        TESTS => """
+        @testitem "one" begin
+            include("shared.jl")
+            helper(1)
+        end
+        """,
+        SHARED => "helper(x) = x + 1\n",
+    ))
+    rt = jw.runtime
+
+    # untraced baseline
+    fa0 = JuliaWorkspaces.derived_file_analysis(rt, TESTS, TESTS)
+    @test !isempty(fa0.meta)
+    inv0 = JuliaWorkspaces.derived_file_inventory(rt, SHARED)
+    JuliaWorkspaces.derived_module_tree(rt, TESTS)
+
+    # A body-only edit in the helper: the test item's segment must not encode
+    # position, or the inventory would differ and the whole tree would rebuild.
+    JuliaWorkspaces.update_file!(jw, TextFile(SHARED, SourceText("helper(x) = x * 42\n", "julia")))
+    @test isequal(inv0, JuliaWorkspaces.derived_file_inventory(rt, SHARED))
+
+    recv = TICountReceiver()
+    TL.with_tracing(() -> JuliaWorkspaces.derived_file_analysis(rt, TESTS, TESTS), recv)
+    @test get(recv.counts, "derived_file_analysis", 0) == 0
+    @test get(recv.counts, "derived_module_tree", 0) == 0
+
+    # Renaming a top-level name in the helper DOES change what the test item
+    # sees, so that analysis must re-execute.
+    JuliaWorkspaces.update_file!(jw, TextFile(SHARED, SourceText("renamed_helper(x) = x\n", "julia")))
+    recv2 = TICountReceiver()
+    TL.with_tracing(() -> JuliaWorkspaces.derived_file_analysis(rt, TESTS, TESTS), recv2)
+    @test get(recv2.counts, "derived_file_analysis", 0) == 1
 end

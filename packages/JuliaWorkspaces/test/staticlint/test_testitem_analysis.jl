@@ -268,26 +268,45 @@ end
 end
 
 @testitem "the setup index keys files by their containing package" setup=[TestItemAnalysisWS] begin
-    # /pkg and /PKG are distinct packages on a case-sensitive filesystem;
-    # containment must use the same file→package mapping the consumer keys
-    # with (derived_package_for_file), not a case-folded path prefix
+    # /pkgb is a distinct package whose path string-prefix-collides with
+    # /pkg; containment must use the same file→package mapping the consumer
+    # keys with (derived_package_for_file), not a path prefix
     jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
     @testitem "t" begin
     end
     """)
-    add_file!(jw, TextFile(URI("file:///PKG/Project.toml"), SourceText("""
+    add_file!(jw, TextFile(URI("file:///pkgb/Project.toml"), SourceText("""
     name = "OtherPkg"
     uuid = "22345678-1234-1234-1234-123456789012"
     version = "0.1.0"
     """, "toml")))
-    add_file!(jw, TextFile(URI("file:///PKG/Manifest.toml"), SourceText(MANIFEST_TOML, "toml")))
-    add_file!(jw, TextFile(URI("file:///PKG/src/OtherPkg.jl"), SourceText("module OtherPkg end", "julia")))
-    add_file!(jw, TextFile(URI("file:///PKG/test/setups.jl"), SourceText("""
+    add_file!(jw, TextFile(URI("file:///pkgb/Manifest.toml"), SourceText(MANIFEST_TOML, "toml")))
+    add_file!(jw, TextFile(URI("file:///pkgb/src/OtherPkg.jl"), SourceText("module OtherPkg end", "julia")))
+    add_file!(jw, TextFile(URI("file:///pkgb/test/setups.jl"), SourceText("""
     @testmodule OtherTM begin
     end
     """, "julia")))
     setups = JuliaWorkspaces.derived_test_setups(jw.runtime, PKG)
     @test !haskey(setups, :OtherTM)
+
+    if !Sys.iswindows()
+        # /pkg and /PKG are distinct only where file URIs compare
+        # case-sensitively (URIs2 folds case on Windows); a case-folded
+        # prefix match would wrongly claim /PKG's setups for /pkg
+        add_file!(jw, TextFile(URI("file:///PKG/Project.toml"), SourceText("""
+        name = "CasePkg"
+        uuid = "32345678-1234-1234-1234-123456789012"
+        version = "0.1.0"
+        """, "toml")))
+        add_file!(jw, TextFile(URI("file:///PKG/Manifest.toml"), SourceText(MANIFEST_TOML, "toml")))
+        add_file!(jw, TextFile(URI("file:///PKG/src/CasePkg.jl"), SourceText("module CasePkg end", "julia")))
+        add_file!(jw, TextFile(URI("file:///PKG/test/setups.jl"), SourceText("""
+        @testmodule CaseTM begin
+        end
+        """, "julia")))
+        setups = JuliaWorkspaces.derived_test_setups(jw.runtime, PKG)
+        @test !haskey(setups, :CaseTM)
+    end
 end
 
 @testitem "setup-member refs stay out of the outbound table" setup=[TestItemAnalysisWS] begin
@@ -694,4 +713,188 @@ end
     end
     """)
     @test diag_messages(jw) isa Vector
+end
+
+# --- `include(...)` inside a testitem-family body -----------------------------
+#
+# A `@testitem` body is a fresh module at runtime, so an `include` there splices
+# the target into THAT module. The inventory records the body as a `:testitem`
+# node and the ordinary splice machinery does the rest; these tests pin the
+# user-visible consequence.
+
+@testitem "names from a file included in a @testitem body resolve" setup=[TestItemAnalysisWS] begin
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "one" begin
+        include("shared.jl")
+        helper
+    end
+
+    @testitem "two" begin
+        include("shared.jl")
+        helper
+    end
+    """, extra=Dict(shared => "helper(x) = x\n"))
+
+    msgs = diag_messages(jw)
+    # Both bodies, not just the first: the splice rule admits the helper once
+    # per test item.
+    @test !("Missing reference: helper" in msgs)
+end
+
+@testitem "an include in a @testitem body carries transitively" setup=[TestItemAnalysisWS] begin
+    shared = URI("file:///pkg/test/shared.jl")
+    deeper = URI("file:///pkg/test/deeper.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" begin
+        include("shared.jl")
+        deep_helper
+    end
+    """, extra=Dict(
+        shared => "include(\"deeper.jl\")\n",
+        deeper => "deep_helper() = 1\n"))
+
+    @test !("Missing reference: deep_helper" in diag_messages(jw))
+end
+
+@testitem "colon imports in an included helper reach the testitem body" setup=[TestItemAnalysisWS] begin
+    # The shape CSTParser's own `test/shared.jl` uses: the helper's top-level
+    # `using ...: name` bring-ins must be visible too, not just its declarations.
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" begin
+        include("shared.jl")
+        ifn
+    end
+    """, extra=Dict(shared => "using MyPkg: ifn\n"))
+
+    @test !("Missing reference: ifn" in diag_messages(jw))
+end
+
+@testitem "an include in a testitem body is not a blanket suppression" setup=[TestItemAnalysisWS] begin
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" begin
+        include("shared.jl")
+        helper
+        genuinely_undefined
+    end
+    """, extra=Dict(shared => "helper() = 1\n"))
+
+    msgs = diag_messages(jw)
+    @test !("Missing reference: helper" in msgs)
+    @test "Missing reference: genuinely_undefined" in msgs
+end
+
+@testitem "included names stay inside the test item that includes them" setup=[TestItemAnalysisWS] begin
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    helper
+
+    @testitem "with" begin
+        include("shared.jl")
+        helper
+    end
+
+    @testitem "without" begin
+        helper
+    end
+    """, extra=Dict(shared => "helper() = 1\n"))
+
+    msgs = diag_messages(jw)
+    # Two sites must still report: the file top level and the sibling item that
+    # does not include the helper.
+    @test count(==("Missing reference: helper"), msgs) == 2
+end
+
+@testitem "a helper included by a test item is analyzed, but conservatively" setup=[TestItemAnalysisWS] begin
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" begin
+        include("shared.jl")
+    end
+    """, extra=Dict(shared => "helper() = whatever_the_testitem_provides\n"))
+    rt = jw.runtime
+
+    # It now has a module context (it did not before: included only from a body
+    # the inventory refused to descend into, it was spliced nowhere).
+    path = JuliaWorkspaces.derived_file_module_path(rt, TESTF, shared)
+    @test path !== nothing
+    @test JuliaWorkspaces.is_testitem_path(rt, TESTF, path)
+
+    # But the test item's simulated `using Test`/`using MyPkg` are not written
+    # anywhere in the tree, so bare missing-ref reporting there is suppressed
+    # rather than wrong.
+    msgs = [d.message for d in JuliaWorkspaces.derived_file_analysis(rt, TESTF, shared).diagnostics]
+    @test !any(m -> startswith(m, "Missing reference:"), msgs)
+end
+
+@testitem "names declared in a testitem body are not workspace symbols" setup=[TestItemAnalysisWS] begin
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" begin
+        a_testitem_local_name() = 1
+    end
+    """)
+    names = [s.name for s in JuliaWorkspaces.get_workspace_symbols(jw, "a_testitem_local_name")]
+    @test isempty(names)
+end
+
+@testitem "a computed include suppresses only its own test item" setup=[TestItemAnalysisWS] begin
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "computed" begin
+        include(some_path_expression)
+        anything_at_all
+    end
+
+    @testitem "plain" begin
+        undefined_in_sibling
+    end
+    """)
+    msgs = diag_messages(jw)
+    # Unknown code is spliced into the first body, so it abstains...
+    @test !("Missing reference: anything_at_all" in msgs)
+    # ...but the sibling test item and the file top level keep reporting.
+    @test "Missing reference: undefined_in_sibling" in msgs
+end
+
+@testitem "a missing include target in a testitem body does not throw" setup=[TestItemAnalysisWS] begin
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" begin
+        include("no_such_file.jl")
+    end
+    """)
+    @test diag_messages(jw) isa Vector
+end
+
+@testitem "an include in a @testmodule body reaches referencing test items" setup=[TestItemAnalysisWS] begin
+    setups = URI("file:///pkg/test/setups.jl")
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testitem "t" setup=[TM] begin
+        TM.helper
+    end
+    """, extra=Dict(
+        setups => """
+        @testmodule TM begin
+            include("shared.jl")
+        end
+        """,
+        shared => "helper() = 1\n"))
+
+    @test diag_messages(jw) isa Vector
+end
+
+@testitem "an include inside a @testset stays opaque" setup=[TestItemAnalysisWS] begin
+    # `@testset` introduces no module, so it is deliberately NOT descended into
+    # — the include is invisible to the inventory and the name does not resolve.
+    # Pinned so the known gap is a decision, not a surprise.
+    shared = URI("file:///pkg/test/shared.jl")
+    jw = pkg_ws(entry=DEFAULT_ENTRY, testfile="""
+    @testset "s" begin
+        include("shared.jl")
+        helper
+    end
+    """, extra=Dict(shared => "helper() = 1\n"))
+
+    @test "Missing reference: helper" in diag_messages(jw)
 end

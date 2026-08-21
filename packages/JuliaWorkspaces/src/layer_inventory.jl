@@ -4,7 +4,8 @@
 # Strings, Ints, vectors/structs of those) — never an EXPR reference, an
 # objectid, a byte offset, or a docstring — so that body edits produce
 # `isequal` inventories and Salsa's early-exit stops invalidation here.
-# Position/EXPR reattachment lives exclusively in `derived_item_positions`.
+# Position/EXPR reattachment lives exclusively in `derived_item_positions` and
+# `derived_testitem_segments`.
 
 """
     MethodArity(minargs, maxargs, kws, kwsplat)
@@ -111,6 +112,20 @@ end
     parent_module::Vector{String}
 end
 
+"""
+A top-level macrocall whose effects the analyzer does not model (not in
+`StaticLint.EFFECT_FREE_MACROS`/`HANDLED_MACROS`): its expansion may define
+arbitrary names in `parent_module`, so bare missing-reference reporting there
+is unreliable (`derived_module_has_opaque_macrocall`). The macrocall's
+arguments are still walked transparently — visible definitions inside it stay
+in `items`.
+"""
+@auto_hash_equals struct InventoryOpaqueMacro
+    order::Int
+    id::Int64
+    parent_module::Vector{String}
+end
+
 "A `module`/`baremodule` declared in this file."
 @auto_hash_equals struct InventoryModule
     order::Int
@@ -118,6 +133,32 @@ end
     name::String
     bare::Bool
     parent_module::Vector{String}
+end
+
+"""
+A `@testitem`/`@testmodule`/`@testsnippet` declared in this file.
+
+TestItemRunner evaluates each of these bodies in a fresh module, so an
+`include(...)` inside one splices into THAT module rather than the enclosing
+one. The record opens a node in the module tree (`ModuleNode.kind ===
+:testitem`) at `vcat(parent_module, [segment])`, and the body's items/includes/
+imports are recorded with that extended `parent_module` — which is what makes
+the ordinary splice machinery place an included helper's declarations where the
+test item can see them.
+
+A test item is NOT a module in any user-facing sense: it declares nothing in
+its parent node, binds no name of its own, and is filtered out of workspace
+symbols. `segment` is an opaque node key, not a name — see
+`_mint_testitem_segment!` for why it is `#`-prefixed and how it stays
+position-free.
+"""
+@auto_hash_equals struct InventoryTestItem
+    order::Int
+    id::Int64
+    kind::Symbol                   # :testitem | :testmodule | :testsnippet
+    label::String                  # the name as written; "" when malformed
+    segment::String                # the module-tree node key for the body
+    parent_module::Vector{String}  # file-relative path of the ENCLOSING module
 end
 
 """
@@ -134,10 +175,13 @@ whitespace, comments, or docstrings.
     exports::Vector{InventoryExport}
     includes::Vector{InventoryInclude}
     modules::Vector{InventoryModule}
+    opaque_macros::Vector{InventoryOpaqueMacro}
+    testitems::Vector{InventoryTestItem}
 end
 
 const EMPTY_FILE_INVENTORY = FileInventory(
-    InventoryItem[], InventoryImport[], InventoryExport[], InventoryInclude[], InventoryModule[])
+    InventoryItem[], InventoryImport[], InventoryExport[], InventoryInclude[], InventoryModule[],
+    InventoryOpaqueMacro[], InventoryTestItem[])
 
 # Detect a doc-macro wrapper: a 4-arg :macrocall whose first arg is a doc-macro
 # name (`StaticLint.is_doc_macro_name` — the implicit `globalrefdoc` or an
@@ -154,10 +198,16 @@ end
 """
     _foreach_toplevel_item(f, cst)
 
-Call `f(x, order, id, parent_module, offset)` for every top-level item-like node
-of a `:file` CST in pre-order: the file's direct children, plus — for
-`module`/`baremodule` declarations — the module node itself and then the
-children of its body block (never the bodies of functions, structs, etc.).
+Call `f(x, order, id, parent_module, offset, testitem_segment)` for every
+top-level item-like node of a `:file` CST in pre-order: the file's direct
+children, plus — for `module`/`baremodule` declarations — the module node itself
+and then the children of its body block (never the bodies of functions, structs,
+etc.).
+
+`testitem_segment` is `nothing` for every node except a testitem-family
+macrocall (`@testitem`/`@testmodule`/`@testsnippet`) with a body block, where it
+is the module-tree node key minted for that body; the body's own statements are
+then walked with `parent_module` extended by it. See `InventoryTestItem`.
 
 `order` is sequential in visit order and is what the module tree sorts on to
 recover textual-splice semantics. `id` is the statement's identity, which is
@@ -173,6 +223,9 @@ arm for `:if`/`:block`, so definitions inside them bind at the enclosing
 level): their statement lists are walked as if they were direct siblings of
 the container, at the same `parent_module` and continuing the same order
 sequence; the container node itself gets no order/id and is never passed to `f`.
+Testitem-family macrocalls are descended into, but their statements land in a
+`:testitem` node of their own rather than at the enclosing level — see
+`_testitem_family_kind`. `@testset`/`@safetestset` stay opaque.
 Non-isolating macrocalls (everything except the testitem/testset families and
 `@enum`, see `_is_isolated_scope_macrocall`) are transparent the same way:
 StaticLint traverses a macrocall's arguments in the enclosing scope, so
@@ -213,8 +266,10 @@ mutable struct _ItemIdAllocator
     order::Int
     buckets::Dict{_IdKey,Int}
     assigned::Set{Int64}
+    testitem_counts::Dict{Tuple{Symbol,String},Int}
 end
-_ItemIdAllocator() = _ItemIdAllocator(0, Dict{_IdKey,Int}(), Set{Int64}())
+_ItemIdAllocator() = _ItemIdAllocator(0, Dict{_IdKey,Int}(), Set{Int64}(),
+                                     Dict{Tuple{Symbol,String},Int}())
 
 # Mint the `(order, id)` pair for one statement. Called exactly once per visited
 # statement, so every record the classifier derives from it shares both.
@@ -324,15 +379,30 @@ function _walk_one!(f, a, parent_module::Vector{String}, offset::Int, alloc::_It
     # its `?` operator token. So only descend when `trivia[1]` is the
     # real keyword; a ternary falls through to the `else` branch below and
     # is treated as a single opaque item (no descent into its arms).
+    ti_kind = _testitem_family_kind(item)
+    ti_body = ti_kind === nothing ? nothing : _testitem_body(item, item_offset)
+
     if CSTParser.headof(item) === :if && CSTParser.headof(item.trivia[1]) === :IF
         _walk_if_chain!(f, item, parent_module, item_offset, alloc)
     elseif CSTParser.headof(item) === :block
         _walk_transparent_block!(f, item, parent_module, item_offset, alloc)
+    elseif ti_body !== nothing
+        # A testitem-family body is a fresh module at runtime, so it gets its
+        # own node and its statements are recorded under it. The macrocall
+        # itself still produces the `:opaque_macrocall` usage row in the
+        # ENCLOSING module (via `f` below, unchanged) — consumers filter on
+        # that kind and must keep seeing it.
+        order, id = _mint_ids!(alloc, item, parent_module)
+        segment = _mint_testitem_segment!(alloc, ti_kind, _testitem_label(ti_kind, item))
+        f(item, order, id, parent_module, item_offset, segment)
+
+        body, body_offset = ti_body
+        _walk_transparent_block!(f, body, vcat(parent_module, [segment]), body_offset, alloc)
     elseif CSTParser.ismacrocall(item) && !_is_enum_macro(item) && !_is_isolated_scope_macrocall(item)
         _walk_macrocall!(f, item, parent_module, item_offset, alloc)
     else
         order, id = _mint_ids!(alloc, item, parent_module)
-        f(item, order, id, parent_module, item_offset)
+        f(item, order, id, parent_module, item_offset, nothing)
 
         if CSTParser.defines_module(item) && item.args !== nothing && length(item.args) >= 3
             mod_name = CSTParser.isidentifier(item.args[2]) ? StaticLint.valofid(item.args[2]) : nothing
@@ -371,6 +441,91 @@ function _is_isolated_scope_macrocall(x::CSTParser.EXPR)
         mname == "@testmodule" || mname == "@testsnippet"
 end
 
+# The testitem-family subset of `_is_isolated_scope_macrocall`: the three macros
+# whose body really is a fresh MODULE at runtime, so an `include` inside splices
+# into that module. `_walk_one!` descends into these (into a `:testitem` node),
+# while `@testset`/`@safetestset` stay opaque — see `InventoryTestItem` and the
+# module-tree `:testitem` event.
+#
+# Delegates to StaticLint's own matchers rather than restating the names, so the
+# two cannot drift and the qualified `TestItems.@testitem` form is recognised
+# identically on both sides.
+function _testitem_family_kind(x::CSTParser.EXPR)
+    CSTParser.ismacrocall(x) || return nothing
+    (x.args === nothing || isempty(x.args)) && return nothing
+    name = x.args[1]
+    name isa CSTParser.EXPR || return nothing
+    StaticLint._is_testitem_macro(name) && return :testitem
+    StaticLint._is_testmodule_macro(name) && return :testmodule
+    StaticLint._is_testsnippet_macro(name) && return :testsnippet
+    return nothing
+end
+
+# The test item's name as written: the string literal for `@testitem`, the
+# identifier for `@testmodule`/`@testsnippet` (both name a setup, and
+# `derived_test_setups_in_file` reads them the same way). `""` when the
+# macrocall is malformed — the segment stays unique via the occurrence counter
+# regardless.
+function _testitem_label(kind::Symbol, x::CSTParser.EXPR)
+    args = x.args
+    (args === nothing || length(args) < 3) && return ""
+    name_expr = args[3]
+    name_expr isa CSTParser.EXPR || return ""
+    if kind === :testmodule || kind === :testsnippet
+        nm = _item_name(name_expr)
+        return nm === nothing ? "" : nm
+    end
+    CSTParser.isstringliteral(name_expr) || return ""
+    v = CSTParser.str_value(name_expr)
+    return v isa AbstractString ? String(v) : ""
+end
+
+# The body block of a testitem-family macrocall, with its 0-based byte offset:
+# the first `:block` argument. Offsets come from CSTParser's source-order child
+# iteration (`for c in x`, which interleaves args and trivia), the same
+# technique `_walk_macrocall!` uses — summing arg fullspans alone would drift
+# for the call form `@testitem("n", begin … end)`, where paren/comma trivia sit
+# between the args.
+function _testitem_body(x::CSTParser.EXPR, offset::Int)
+    args = x.args
+    args === nothing && return nothing
+    child_offset = offset
+    for c in x
+        if CSTParser.headof(c) === :block && any(j -> args[j] === c, 3:length(args))
+            return (c, child_offset)
+        end
+        child_offset += c.fullspan
+    end
+    return nothing
+end
+
+# The module-tree node key for one test-item body.
+#
+# `"#" * kind * "#" * label * "#" * n`, where `n` is the 1-based occurrence
+# index of that `(kind, label)` pair WITHIN THE FILE — test-item names repeat,
+# so a counter is required.
+#
+# Two properties this scheme exists for:
+#
+#   * Position-free. The header's rule (no offsets in inventory values) is what
+#     makes a body edit produce an `isequal` inventory and stop Salsa's
+#     invalidation here; an offset-derived key would re-invalidate the whole
+#     root's module tree on every keystroke. This is exactly as stable as
+#     `_mint_ids!`'s bucket disambiguator, and keeping the LABEL in the key
+#     (rather than a bare running counter) means inserting a test item shifts
+#     only its same-labelled siblings instead of everything after it.
+#   * Unwritable. The leading `#` makes the segment impossible to name in Julia
+#     source, so no `using` can reach the node and `_classify_import`'s anchor
+#     walk can never land on it. That is a safety guarantee only — the semantic
+#     test for "this is a test item, not a module" is always
+#     `ModuleNode.kind === :testitem`.
+function _mint_testitem_segment!(alloc::_ItemIdAllocator, kind::Symbol, label::String)
+    key = (kind, label)
+    n = get(alloc.testitem_counts, key, 0) + 1
+    alloc.testitem_counts[key] = n
+    return string('#', kind, '#', label, '#', n)
+end
+
 # Walks a non-isolating macrocall's macro ARGUMENTS as top-level items: the
 # macro-name component (`args[1]`) and the parameters placeholder (`args[2]`,
 # a zero-span `:NOTHING` node) are skipped; every remaining arg goes through
@@ -383,6 +538,16 @@ end
 function _walk_macrocall!(f, mc::CSTParser.EXPR, parent_module::Vector{String}, offset::Int, alloc::_ItemIdAllocator)
     margs = mc.args
     (margs === nothing || length(margs) < 3) && return nothing
+
+    # A macrocall whose effects the analyzer does not model may define names
+    # its arguments never spell — record it (the classifier files it under
+    # `opaque_macros`) BEFORE walking the arguments transparently, so visible
+    # definitions inside still become ordinary items.
+    if !StaticLint._macro_name_effects_known(_macro_name_string(margs[1]))
+        order, id = _mint_ids!(alloc, mc, parent_module)
+        f(mc, order, id, parent_module, offset, nothing)
+    end
+
     child_offset = offset
     for c in mc
         if any(j -> margs[j] === c, 3:length(margs))
@@ -448,14 +613,22 @@ Salsa.@derived function derived_file_inventory(rt, uri)
 
     include_records = derived_file_include_records(rt, uri)
     include_targets_by_offset = Dict{Int,Union{Nothing,URI}}(
-        offset => target for (offset, _, target) in include_records)
+        offset => target for (offset, _, target, _) in include_records)
 
     acc = (items=InventoryItem[], imports=InventoryImport[], exports=InventoryExport[],
-           includes=InventoryInclude[], modules=InventoryModule[])
-    _foreach_toplevel_item(cst) do x, order, id, parent_module, offset
-        _classify_item!(acc, x, order, id, copy(parent_module), offset, include_targets_by_offset, include_records)
+           includes=InventoryInclude[], modules=InventoryModule[], opaque_macros=InventoryOpaqueMacro[],
+           testitems=InventoryTestItem[])
+    _foreach_toplevel_item(cst) do x, order, id, parent_module, offset, testitem_segment
+        pm = copy(parent_module)
+        if testitem_segment !== nothing
+            kind = _testitem_family_kind(x)
+            kind === nothing || push!(acc.testitems, InventoryTestItem(
+                order, id, kind, _testitem_label(kind, x), testitem_segment, pm))
+        end
+        _classify_item!(acc, x, order, id, pm, offset, include_targets_by_offset, include_records)
     end
-    return FileInventory(acc.items, acc.imports, acc.exports, acc.includes, acc.modules)
+    return FileInventory(acc.items, acc.imports, acc.exports, acc.includes, acc.modules,
+                         acc.opaque_macros, acc.testitems)
 end
 
 _render_sig(x) = try
@@ -603,10 +776,11 @@ end
 # Match by macro *name* rather than `StaticLint._points_to_Base_macro`, which
 # needs resolution state (a `Binding` ref pointing at the real `Base.@enum`)
 # that the inventory must not depend on — see the module docstring's firewall
-# note. A user shadowing `@enum` with an unrelated macro of the same name will
-# misclassify identically to how `mark_bindings!`'s conservatism already
-# accepts false positives elsewhere; this is a deliberate, spec-directed
-# deviation from macros.jl:55, not an oversight.
+# note. That firewall defers identity, it does not drop it: `MacroDeclarationRule`
+# records an owner and has it confirmed in layer_visibility.jl
+# (`_macro_owner_confirmed`), which is what rules out a local macro shadowing
+# the name. `@enum` rows carry no spelling, so nothing confirms them and a
+# shadowing `@enum` misclassifies — a known hole, not a constraint of this layer.
 _is_enum_macro(x::CSTParser.EXPR) = _macro_name_string(x.args[1]) == "@enum"
 
 # An `@enum` member/type-name argument may be wrapped in an explicit-value
@@ -954,13 +1128,16 @@ function _classify_item!(acc, x, order, id, parent_module, offset, include_targe
                     mname === nothing || push!(acc.items, InventoryItem(order, id,mname, String[], :enum_member, nothing, String[], parent_module))
                 end
             end
-        else
-            # Only the isolated-scope macros (`_is_isolated_scope_macrocall`)
-            # still reach this arm — the walker descends into every other
-            # macrocall transparently, so their contents were classified as
-            # ordinary items and no opaque row is emitted for them.
+        elseif _is_isolated_scope_macrocall(x)
             mname = _macro_name_string(x.args[1])
             push!(acc.items, InventoryItem(order, id,something(mname, ""), String[], :opaque_macrocall, nothing, String[], parent_module))
+        else
+            # A transparently-walked macrocall reaches this arm only when
+            # `_walk_macrocall!` recorded it as effect-unknown: its expansion
+            # may define names its arguments never spell, so file it for
+            # `derived_module_has_opaque_macrocall` (its argument contents
+            # were classified as ordinary items separately).
+            push!(acc.opaque_macros, InventoryOpaqueMacro(order, id, parent_module))
         end
     end
     return
@@ -983,8 +1160,38 @@ Salsa.@derived function derived_item_positions(rt, uri)
     cst = derived_julia_legacy_syntax_tree(rt, uri)
     (cst isa CSTParser.EXPR && CSTParser.headof(cst) === :file) || return result
 
-    _foreach_toplevel_item(cst) do x, _order, id, parent_module, offset
+    _foreach_toplevel_item(cst) do x, _order, id, parent_module, offset, _segment
         result[id] = (expr=x, offset=offset)
+    end
+    return result
+end
+
+"""
+    derived_testitem_segments(rt, uri) -> Dict{UInt64,String}
+
+Map the `objectid` of each testitem-family macrocall EXPR to the module-tree
+segment `derived_file_inventory` recorded for its body.
+
+Volatile and objectid-keyed — the objectids are only valid for the CST instance
+they were built from — so it is deliberately kept OUT of `FileInventory`, which
+must stay position- and identity-free for the cutoff contract. Same shape and
+same lifetime caveat as `derived_include_dict`/`derived_computed_include_ids`,
+and consumed the same way: from inside the semantic pass, which is traversing
+that exact CST. This is how `_handle_testitem` learns the segment the inventory
+walker minted, instead of re-deriving it (and drifting: StaticLint traverses
+everything, the inventory walker only top-level-ish statements).
+"""
+Salsa.@derived function derived_testitem_segments(rt, uri)
+    @debug "derived_testitem_segments" uri=uri
+
+    result = Dict{UInt64,String}()
+
+    derived_has_content(rt, uri) || return result
+    cst = derived_julia_legacy_syntax_tree(rt, uri)
+    (cst isa CSTParser.EXPR && CSTParser.headof(cst) === :file) || return result
+
+    _foreach_toplevel_item(cst) do x, _order, _id, _parent_module, _offset, segment
+        segment === nothing || (result[UInt64(objectid(x))] = segment)
     end
     return result
 end

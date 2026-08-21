@@ -1,5 +1,11 @@
 # Layer 3 (env seam) of the inventory architecture: per-module visible
 # names — the names reachable in a module through its classified imports
+#
+# "Module" here includes the `:testitem` nodes a `@testitem`/`@testmodule`/
+# `@testsnippet` body opens (they really are modules at runtime, and a file
+# `include`d in the body is spliced into one). The single difference is that a
+# test-item node records no SELF-binding: its path segment is an opaque tree
+# key, not a name anything can write.
 # (`derived_module_imports`, from layer_module_tree.jl), gated by the
 # workspace's own packages (`derived_workspace_package_roots`) and, for
 # `:external` targets, the SymbolServer-backed environment
@@ -852,8 +858,10 @@ function _visible_names_pass1(rt, root, path::Vector{String}, visited::Set{URI})
     # `origin_module` is the DECLARING module's path (the parent), consistent
     # with every other `:declared` binding, which is exactly why the ledger
     # entry records the denoted module's FULL path separately.
+    # A `:testitem` node is a runtime module but binds no name — its segment is
+    # an opaque tree key, not an identifier — so it gets no self-binding.
     node = module_node(derived_module_tree(rt, root), path)
-    if node !== nothing && !isempty(path)
+    if node !== nothing && !isempty(path) && node.kind !== :testitem
         _record!(result, modtargets, path[end],
             VisibleName(:module, :declared, node.declared_at, path[1:end - 1]),
             ImportTarget(:tree, path))
@@ -1115,12 +1123,84 @@ Salsa.@derived function derived_module_unresolved_wildcard_using(rt, root, path)
     return false
 end
 
+"""
+    derived_module_has_computed_include(rt, root, path) -> Bool
+
+Whether module `path` in `root`'s tree contains an `include` whose path could
+not be determined statically (any declaring file). Such an include splices
+UNKNOWN code into exactly this module — any bare name used in the module may
+be defined by the unseen file — so bare missing-reference reporting there is
+meaningless noise, the same situation as an unresolved wildcard `using`
+(`derived_module_unresolved_wildcard_using` above). Consumers treat the two
+flags identically. Pollution does not propagate to nested modules: a Julia
+`module` does not inherit its parent's bindings, mirroring the module-boundary
+stop in `in_unresolved_wildcard_import_scope`.
+
+The user-visible explanation is the `ComputedInclude` diagnostic emitted at
+the include site (`_collect_include_diagnostics!`, layer_includes.jl).
+
+Bool-valued and id-free, like its wildcard sibling.
+"""
+Salsa.@derived function derived_module_has_computed_include(rt, root, path)
+    @debug "derived_module_has_computed_include" root=root path=path
+
+    tree = derived_module_tree(rt, root)
+    for (file_uri, file_splice) in tree.file_modules
+        inv = derived_file_inventory(rt, file_uri)
+        for inc in inv.includes
+            inc.target === nothing || continue
+            vcat(file_splice, inc.parent_module) == path && return true
+        end
+    end
+    return false
+end
+
+"""
+    derived_module_has_opaque_macrocall(rt, root, path) -> Bool
+
+Whether module `path` in `root`'s tree contains a top-level macrocall whose
+effects the analyzer does not model (`InventoryOpaqueMacro`,
+layer_inventory.jl). Such an expansion may define arbitrary names in exactly
+this module — invocation shape carries no information about that
+(`@with_kw struct Para ... end` also generates a hidden `@unpack_Para`) — so
+bare missing-reference reporting there is unreliable, the same situation as
+[`derived_module_has_computed_include`](@ref) above; consumers treat all
+these flags identically. Pollution does not cross module boundaries.
+
+Bool-valued and id-free, like its siblings.
+"""
+Salsa.@derived function derived_module_has_opaque_macrocall(rt, root, path)
+    @debug "derived_module_has_opaque_macrocall" root=root path=path
+
+    tree = derived_module_tree(rt, root)
+    for (file_uri, file_splice) in tree.file_modules
+        inv = derived_file_inventory(rt, file_uri)
+        for om in inv.opaque_macros
+            vcat(file_splice, om.parent_module) == path && return true
+        end
+    end
+    return false
+end
+
 # Resolvability of one wildcard `using`'s target, mirroring what the
 # visibility passes would do with it: `:tree` targets always resolve;
-# `:external`/`:workspace_package` targets resolve iff their store/root
-# exists; `:unresolved` targets get the same bounded pass-2 re-attempt as
-# `_visible_names_impl` — and a re-attempt that lands on an external/package
-# target is still checked for store/root existence.
+# `:external` targets resolve iff their store exists; `:unresolved` targets
+# get the same bounded pass-2 re-attempt as `_visible_names_impl`.
+#
+# A `:workspace_package` target always counts as UNRESOLVED here: the
+# package's export view is analyzed from source, and that view is incomplete
+# whenever its include graph has computed `include` paths or it re-exports
+# names from its own deps — reporting bare missing references against it
+# produces storms of false positives (every export defined in a
+# computed-include file). Same conservatism as `_mark_cst_wildcard_using!`
+# on the whole-closure pass.
+#
+# Deliberately NOT narrowed to `derived_module_has_computed_include(target)`:
+# that would cover the computed-include half but not macro-opaque re-exports
+# (`@reexport using InvertedIndices` — DataFrames' `Not`), which the
+# inventory cannot see. Narrow both together once export opacity is tracked;
+# drop entirely once the CST module view chases computed includes and
+# re-exports.
 function _wildcard_using_unresolved(rt, root, path::Vector{String}, ri::ResolvedImport)
     t = ri.target
     if t.sort === :tree
@@ -1128,12 +1208,12 @@ function _wildcard_using_unresolved(rt, root, path::Vector{String}, ri::Resolved
     elseif t.sort === :external
         return _resolve_external_module(rt, root, t.path) === nothing
     elseif t.sort === :workspace_package
-        return !haskey(derived_workspace_package_roots(rt), t.path[1])
+        return true
     else # :unresolved
         re = _reattempt_unresolved(rt, root, path, ri, Set{URI}())
         re === nothing && return true
         re.sort === :external && return _resolve_external_module(rt, root, re.path) === nothing
-        re.sort === :workspace_package && return !haskey(derived_workspace_package_roots(rt), re.path[1])
+        re.sort === :workspace_package && return true
         return false
     end
 end

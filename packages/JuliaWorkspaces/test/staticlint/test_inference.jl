@@ -40,6 +40,22 @@ end
     end
 end
 
+@testitem "infer_const_alias_of_store_type" setup=[shared_static_lint] begin
+    using JuliaWorkspaces.StaticLint: bindingof
+    # `Int16` resolves to its constructor FunctionStore in the symbol store; the
+    # alias names a type, not a function.
+    let (cst, meta_dict) = parse_and_pass("const Foo = Int16")
+        @test JuliaWorkspaces.StaticLint.CoreTypes.isdatatype(bindingof(cst.args[1].args[1].args[1], meta_dict).type)
+    end
+    let (cst, meta_dict) = parse_and_pass("const A = Int16\nconst B = A")
+        @test JuliaWorkspaces.StaticLint.CoreTypes.isdatatype(bindingof(cst.args[2].args[1].args[1], meta_dict).type)
+    end
+    # an alias of a genuine function stays a Function
+    let (cst, meta_dict) = parse_and_pass("const g = rand")
+        @test JuliaWorkspaces.StaticLint.CoreTypes.isfunction(bindingof(cst.args[1].args[1].args[1], meta_dict).type)
+    end
+end
+
 @testitem "infer_integer_literal" setup=[shared_static_lint] begin
     using JuliaWorkspaces.StaticLint: bindingof
     let (cst, meta_dict) = parse_and_pass("x = 1")
@@ -835,13 +851,16 @@ end
     end
     nm(t) = t === nothing ? "nothing" : _isany(t) ? "Any" : string(_basename(t))
 
+    # An integer literal takes the machine `Int`, so its name is word-size dependent.
+    INT = "Core.$(Symbol(Int))"
+
     # Disagreeing assignments: BOTH bindings widen, including the earlier one —
     # a use between them can still see the later value at runtime.
     @test nm.(types_of("function f(c)\n    x = nothing\n    g(x)\n    x = 1\nend\n", "x")) ==
         ["Any", "Any"]
 
     # Agreement is left alone
-    @test nm.(types_of("function f(c)\n    x = 1\n    g(x)\n    x = 2\nend\n", "x")) == ["Core.Int64", "Core.Int64"]
+    @test nm.(types_of("function f(c)\n    x = 1\n    g(x)\n    x = 2\nend\n", "x")) == [INT, INT]
 
     # They settle on the nearest type covering both, not on `Any`: `Real` still
     # rules out a `String` parameter, which `Any` would not.
@@ -855,7 +874,7 @@ end
         ["nothing", "Any"]
 
     # A name assigned once is untouched
-    @test nm.(types_of("function f()\n    x = 1\n    g(x)\nend\n", "x")) == ["Core.Int64"]
+    @test nm.(types_of("function f()\n    x = 1\n    g(x)\nend\n", "x")) == [INT]
 
     # Method accumulation is not rebinding
     @test all(t -> !_isany(t), types_of("f(x) = 1\nf(x, y) = 2\n", "f"))
@@ -875,7 +894,7 @@ end
     end
     """, "x")
     # the outer `x` is assigned once and keeps its type
-    @test nm(outer[1]) == "Core.Int64"
+    @test nm(outer[1]) == INT
     # the closure's parameter stays un-inferred, its two assignments widen
     @test nm.(outer[2:end]) == ["nothing", "Any", "Any"]
 end

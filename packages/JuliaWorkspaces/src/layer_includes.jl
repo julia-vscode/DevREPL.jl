@@ -6,7 +6,8 @@ that produces all three include products at once:
 
   - `edges` — the file's resolved include-graph edges,
   - `include_dict` — `objectid`→target map for the semantic pass, and
-  - `records` — `(offset, span, target)` tuples for include diagnostics.
+  - `records` — `(offset, span, target, guarded, testitem_ctx)` tuples for
+    include diagnostics.
 
 The three are exposed through the thin selectors below. Keeping the selectors
 separate is what preserves Salsa's early-exit: `include_dict` churns on every
@@ -17,7 +18,7 @@ Salsa.@derived function derived_file_include_data(rt, uri)
     @debug "derived_file_include_data" uri=uri
 
     tf = derived_text_file_content(rt, uri)
-    tf === nothing && return (edges=Set{URI}(), include_dict=Dict{UInt64,URI}(), records=Tuple{Int,Int,Union{URI,Nothing}}[])
+    tf === nothing && return (edges=Set{URI}(), include_dict=Dict{UInt64,URI}(), records=Tuple{Int,Int,Union{URI,Nothing},Bool,Union{Nothing,Int}}[], computed_ids=Set{UInt64}())
 
     cst = derived_julia_legacy_syntax_tree(rt, uri)
 
@@ -34,6 +35,35 @@ end
 
 Salsa.@derived function derived_include_dict(rt, uri)
     return derived_file_include_data(rt, uri).include_dict
+end
+
+# `objectid`s of this file's computed (statically unresolvable) include calls;
+# consumed by `StaticLint.followinclude` to mark the enclosing module scope.
+Salsa.@derived function derived_computed_include_ids(rt, uri)
+    return derived_file_include_data(rt, uri).computed_ids
+end
+
+"""
+    derived_folder_has_computed_include(rt, folder_uri) -> Bool
+
+Whether any Julia file under `folder_uri` contains an `include` whose path
+could not be determined statically. Used to decide whether an orphan root (a
+file no other file includes) in that folder plausibly is the *target* of such
+an include — in which case it is analyzed without its real module context and
+bare missing-reference reporting there is unreliable. Bool-valued and id-free.
+"""
+Salsa.@derived function derived_folder_has_computed_include(rt, folder_uri)
+    folder_path = uri2filepath(folder_uri)
+    folder_path === nothing && return false
+    prefix = lowercase(folder_path) * Base.Filesystem.path_separator
+
+    for uri in derived_all_julia_files(rt)
+        fp = uri2filepath(uri)
+        fp === nothing && continue
+        startswith(lowercase(fp), prefix) || continue
+        any(r -> r[3] === nothing, derived_file_include_records(rt, uri)) && return true
+    end
+    return false
 end
 
 Salsa.@derived function derived_all_julia_files(rt)
@@ -218,9 +248,15 @@ end
     derived_file_include_records(rt, uri)
 
 Return the ordered list of `include(...)` call records for the file `uri` as
-`(offset, span, target_uri)` tuples. `target_uri` is the resolved include target
-(or `nothing` when the path could not be determined statically). The records are
-in source order, which the include-graph diagnostics rely on to flag the
+`(offset, span, target_uri, guarded, testitem_ctx)` tuples. `target_uri` is the
+resolved include target (or `nothing` when the path could not be determined
+statically);
+`guarded` marks calls under an existence/definedness-test conditional, for which
+the include diagnostics abstain from MissingFile/DuplicateInclude/ComputedInclude.
+`testitem_ctx` identifies the enclosing testitem-family macrocall for calls
+inside one, which scopes duplicate detection to that body.
+The records
+are in source order, which the include-graph diagnostics rely on to flag the
 *repeated* `include` rather than the first one.
 """
 Salsa.@derived function derived_file_include_records(rt, uri)
@@ -233,14 +269,42 @@ function _include_diagnostic(offset, span, code)
     return Diagnostic(rng, :warning, description, nothing, Symbol[], "StaticLint.jl")
 end
 
-function _collect_include_diagnostics!(rt, uri, stack, visited, result)
+function _collect_include_diagnostics!(rt, uri, stack, visited, guarded_visited, result)
     push!(stack, uri)
 
-    for (offset, span, target) in derived_file_include_records(rt, uri)
-        target === nothing && continue
+    # A `@testitem`/`@testmodule`/`@testsnippet` body runs in a module of its
+    # own, so including a file there says nothing about whether the same file
+    # was included elsewhere: each body gets its own visited sets, keyed by the
+    # macrocall offset. Including the same file twice *within* one body is
+    # still a duplicate, and so is a repeat further down that body's include
+    # subtree, which inherits these sets.
+    testitem_visited = Dict{Int,Tuple{Set{URI},Set{URI}}}()
+
+    for (offset, span, target, guarded, testitem_ctx) in derived_file_include_records(rt, uri)
+        seen, guarded_seen = testitem_ctx === nothing ?
+            (visited, guarded_visited) :
+            get!(() -> (Set{URI}(), Set{URI}()), testitem_visited, testitem_ctx)
+
+        if target === nothing
+            # A computed include path: the target file cannot be attributed,
+            # so it is analyzed without this module's context and bare
+            # missing-reference checking is unreliable in this module (see
+            # `derived_module_has_computed_include`). One honest diagnostic
+            # here replaces the storm of false missing_reference positives
+            # the unattributed file would otherwise produce. Guarded computed
+            # includes (`const depsjl = joinpath(...); isfile(depsjl) &&
+            # include(depsjl)`) abstain like the rest; the missing-reference
+            # relaxation applies either way.
+            guarded || push!(get!(result, uri, Diagnostic[]), _include_diagnostic(offset, span, StaticLint.ComputedInclude))
+            continue
+        end
 
         if derived_text_file_content(rt, target) === nothing
-            push!(get!(result, uri, Diagnostic[]), _include_diagnostic(offset, span, StaticLint.MissingFile))
+            # A guarded include's condition makes file structure runtime-
+            # dependent (`isfile(deps) && include(deps)`, the standard shape
+            # for Pkg.build-generated deps.jl files): whether the target
+            # should exist statically is unknowable, so abstain.
+            guarded || push!(get!(result, uri, Diagnostic[]), _include_diagnostic(offset, span, StaticLint.MissingFile))
             continue
         end
 
@@ -249,13 +313,24 @@ function _collect_include_diagnostics!(rt, uri, stack, visited, result)
             continue
         end
 
-        if target in visited
-            push!(get!(result, uri, Diagnostic[]), _include_diagnostic(offset, span, StaticLint.DuplicateInclude))
+        if target in seen
+            if guarded || target in guarded_seen
+                # Abstain when either side of the duplication is conditional:
+                # this include is guarded (`@isdefined(X) || include("x.jl")`
+                # is idiomatic double-inclusion protection), or every prior
+                # include of the target was — then this is the canonical
+                # include, not a duplicate. The latter pardon is spent here,
+                # so a further unconditional include is a real duplicate.
+                guarded || delete!(guarded_seen, target)
+            else
+                push!(get!(result, uri, Diagnostic[]), _include_diagnostic(offset, span, StaticLint.DuplicateInclude))
+            end
             continue
         end
 
-        push!(visited, target)
-        _collect_include_diagnostics!(rt, target, stack, visited, result)
+        push!(seen, target)
+        guarded && push!(guarded_seen, target)
+        _collect_include_diagnostics!(rt, target, stack, seen, guarded_seen, result)
     end
 
     pop!(stack)
@@ -282,7 +357,8 @@ Salsa.@derived function derived_all_include_diagnostics(rt)
     for root in derived_roots(rt)
         stack = URI[]
         visited = Set{URI}([root])
-        _collect_include_diagnostics!(rt, root, stack, visited, result)
+        guarded_visited = Set{URI}()
+        _collect_include_diagnostics!(rt, root, stack, visited, guarded_visited, result)
     end
 
     # The same statement can be reached from multiple roots; deduplicate.

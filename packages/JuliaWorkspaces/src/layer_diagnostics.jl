@@ -4,16 +4,18 @@
 # rephrasing a message (e.g. the detailed `describe_call_mismatch` text that
 # replaces the generic `IncorrectCallArgs` one) cannot silently opt a finding
 # out of the suppression.
-function _is_env_dependent_diagnostic(d::Diagnostic)
-    d.source != "StaticLint.jl" && return false
-    d.code === nothing && return false
-    return d.code in ENV_DEPENDENT_LINT_RULES
+function _is_env_dependent_finding(f::LintFinding)
+    f.source != "StaticLint.jl" && return false
+    return LINT_RULES_BY_ID[f.rule_id].env_dependent
 end
 
+# Sorted: this vector is now a dependency of every file's scope, and
+# `derived_text_files` is a `Set`, so an unsorted result would change on
+# unrelated file adds and defeat Salsa's backdating.
 Salsa.@derived function derived_lintconfig_files(rt)
     files = derived_text_files(rt)
 
-    return [file for file in files if file.scheme=="file" && is_path_lintconfig_file(uri2filepath(file))]
+    return sort!([file for file in files if file.scheme=="file" && is_path_lintconfig_file(uri2filepath(file))], by=string)
 end
 
 
@@ -145,16 +147,20 @@ end
 One `JuliaLint.toml` file, parsed. Kept separate from the per-file
 [`EffectiveLintConfig`](@ref) so that parsing happens once per config file
 rather than once per linted file.
+
+Carries only the keys the *nearest* config decides. The `include`/`exclude`
+globs are deliberately not here: they compose over the whole ancestor chain and
+live in [`derived_lint_path_filter`](@ref), so that editing `[rules]` does not
+invalidate every file's scope, nor an `exclude` edit every file's rules.
 """
 struct ParsedLintConfig
     preset::String
-    filter::PathFilter
     rules::Dict{Symbol,Tuple{Union{Nothing,Symbol},Dict{Symbol,Any}}}
     overrides::Vector{Any}
 end
 
 ParsedLintConfig() = ParsedLintConfig(
-    DEFAULT_LINT_PRESET, PathFilter(),
+    DEFAULT_LINT_PRESET,
     Dict{Symbol,Tuple{Union{Nothing,Symbol},Dict{Symbol,Any}}}(), Any[],
 )
 
@@ -172,18 +178,39 @@ Salsa.@derived function derived_parsed_lint_config(rt, config_uri)
 
     overrides = parse_overrides!(discard, toml_content, (_, _) -> nothing)
 
-    return ParsedLintConfig(String(preset), parse_path_filter!(discard, toml_content), rules, overrides)
+    return ParsedLintConfig(String(preset), rules, overrides)
+end
+
+"""
+    derived_lint_path_filter(rt, config_uri) -> PathFilter
+
+The `include`/`exclude` globs of one `JuliaLint.toml`. Separate from
+[`derived_parsed_lint_config`](@ref) so scope and settings invalidate
+independently.
+"""
+Salsa.@derived function derived_lint_path_filter(rt, config_uri)
+    discard = Diagnostic[]   # diagnostics are reported by derived_lintconfig_diagnostics
+
+    return parse_path_filter!(discard, derived_toml_syntax_tree(rt, config_uri))
 end
 
 Salsa.@derived function derived_effective_lint_config(rt, uri)
     @debug "derived_effective_lint_config" uri=uri
 
-    config_uri = nearest_config(derived_lintconfig_files(rt), uri)
-    config_uri === nothing && return EffectiveLintConfig()
+    # Scope composes over every enclosing `JuliaLint.toml`, so it is resolved
+    # before the nearest-file lookup that decides the preset and rules.
+    config_files = derived_lintconfig_files(rt)
+    selected = uri.scheme == "file" ? scope_selected(
+        ancestor_configs(config_files, uri), uri2filepath(uri),
+        c -> derived_lint_path_filter(rt, c),
+    ) : true
+
+    config_uri = nearest_config(config_files, uri)
+    config_uri === nothing && return EffectiveLintConfig(selected)
 
     parsed = derived_parsed_lint_config(rt, config_uri)
     relpath = config_relative_path(config_dir_of(config_uri), uri2filepath(uri))
-    relpath === nothing && return EffectiveLintConfig()
+    relpath === nothing && return EffectiveLintConfig(selected)
 
     severities = copy(LINT_PRESETS[parsed.preset])
     options = Dict{Symbol,Dict{Symbol,Any}}()
@@ -204,7 +231,24 @@ Salsa.@derived function derived_effective_lint_config(rt, uri)
         apply_rules!(ov_rules)
     end
 
-    return EffectiveLintConfig(severities, options, path_selected(parsed.filter, relpath))
+    return EffectiveLintConfig(severities, options, selected)
+end
+
+# The user-facing messages of every failed dynamic work item whose project
+# folder contains the project file at `uri`. A test-env failure and an env
+# failure for the same folder both land on that folder's Project.toml.
+# Sorted for a deterministic diagnostic order; identical messages from
+# different keys (e.g. stale content hashes of the same folder) collapse to one.
+Salsa.@derived function derived_environment_error_messages(rt, uri)
+    folder_uri = filepath2uri(dirname(uri2filepath(uri)))
+    messages = String[]
+    for (key, message) in input_dynamic_failure_messages(rt)
+        key_path = _key_folder_path(key)
+        if filepath2uri(key_path) == folder_uri
+            push!(messages, message)
+        end
+    end
+    return unique!(sort!(messages))
 end
 
 Salsa.@derived function derived_diagnostics(rt, uri)
@@ -225,79 +269,102 @@ Salsa.@derived function derived_diagnostics(rt, uri)
 
     results = Diagnostic[]
 
+    # A config file validates itself even when its own globs exclude the
+    # directory it lives in — otherwise a mistake in `exclude` could hide the
+    # very diagnostic that explains it. The exemption covers *self*-exclusion
+    # only: a config inside a subtree an enclosing `JuliaLint.toml` excluded is
+    # part of code the project deliberately set aside (a vendored repository,
+    # typically) and stays silent along with the rest of it.
     is_config_file = uri.scheme == "file" && (
         is_path_lintconfig_file(uri2filepath(uri)) ||
         is_path_formatconfig_file(uri2filepath(uri)) ||
         is_path_testitemsconfig_file(uri2filepath(uri))
     )
 
-    # `include`/`exclude` suppress everything for a file — except a config
-    # file's own validation, so that a config which happens to exclude its own
-    # directory still reports its mistakes.
-    if !lint_config.selected && !is_config_file
+    is_self_validating_config = is_config_file &&
+        scope_selected(
+            strict_ancestor_configs(derived_lintconfig_files(rt), uri), uri2filepath(uri),
+            c -> derived_lint_path_filter(rt, c),
+        )
+
+    if !lint_config.selected && !is_self_validating_config
         return results
     end
 
-    severity_of(rule) = rule_severity(lint_config, rule)
-    enabled(rule) = severity_of(rule) !== :off
+    enabled(rule) = rule_enabled(lint_config, rule)
+
+    # The single point where severity, tags and doc links are applied — every
+    # producer path below funnels its findings through `materialize`.
+    emit_finding!(f::LintFinding) = begin
+        d = materialize(f, lint_config)
+        d === nothing || push!(results, d)
+        nothing
+    end
+    emit!(range, rule_id, message, related_uri, source) =
+        emit_finding!(LintFinding(range, rule_id, message, related_uri, source))
 
     # Julia-content diagnostics run for file-scheme .jl files AND non-file
     # (e.g. untitled) buffers whose language is julia.
     if _is_julia_uri(rt, uri)
+        # The `enabled` guards below do not filter (materialize does); they skip
+        # running a producer query at all when nothing it can emit is on.
         if enabled(:syntax_errors) || enabled(:syntax_warnings)
-            syntax_diagnostics = derived_julia_syntax_diagnostics(rt, uri)
-
-            if enabled(:syntax_errors)
-                sev = severity_of(:syntax_errors)
-                append!(results, Diagnostic(i.range, sev, i.message, i.uri, i.tags, i.source, :syntax_errors)
-                        for i in syntax_diagnostics if i.severity == :error)
-            end
-
-            if enabled(:syntax_warnings)
-                sev = severity_of(:syntax_warnings)
-                append!(results, Diagnostic(i.range, sev, i.message, i.uri, i.tags, i.source, :syntax_warnings)
-                        for i in syntax_diagnostics if i.severity == :warning)
+            for i in derived_julia_syntax_diagnostics(rt, uri)
+                rule = i.severity == :error ? :syntax_errors : :syntax_warnings
+                emit!(i.range, rule, i.message, i.uri, i.source)
             end
         end
 
         if enabled(:testitem_errors)
-            sev = severity_of(:testitem_errors)
-            tis = derived_testitems(rt, uri)
-            append!(results, Diagnostic(i.range, sev, i.message, nothing, Symbol[], "Testitem", :testitem_errors) for i in tis.testerrors)
+            for i in derived_testitems(rt, uri).testerrors
+                emit!(i.range, :testitem_errors, i.message, nothing, "Testitem")
+            end
         end
 
-        # Individual rule severities are applied where the diagnostics are
-        # produced; this only skips the semantic pass entirely when every rule
-        # it can emit is off. `include_errors` is excluded from the test — its
+        # This only skips the semantic pass entirely when every rule it can
+        # emit is off. `include_errors` is excluded from the test — its
         # findings come from the separate structural pass below, so leaving it
         # on is no reason to run the (much more expensive) semantic one.
         if any(enabled(r.id) for r in LINT_RULES if !isempty(r.codes) && r.id !== :include_errors)
-            sl = derived_new_static_lint_diagnostics(rt, uri)
             env_ready = derived_file_env_ready(rt, uri)
-            if env_ready
-                append!(results, sl)
-            else
-                append!(results, d for d in sl if !_is_env_dependent_diagnostic(d))
+            for f in derived_new_static_lint_diagnostics(rt, uri)
+                if !env_ready && _is_env_dependent_finding(f)
+                    continue
+                end
+                emit_finding!(f)
             end
         end
+
+        # Purely syntactic rules (tier `TierSyntax`, see lint_syntax_rules/)
+        # run on the JuliaSyntax tree alone.
+        foreach(emit_finding!, derived_syntax_lint_findings(rt, uri))
 
         # Include-graph diagnostics (DuplicateInclude / IncludeLoop /
         # MissingFile) are a purely structural analysis that does not depend on
         # a project/environment, so they are reported independently of the
         # semantic static-lint pass above.
         if enabled(:include_errors)
-            sev = severity_of(:include_errors)
-            append!(results, Diagnostic(d.range, sev, d.message, d.uri, d.tags, d.source, :include_errors)
-                    for d in derived_include_diagnostics(rt, uri))
+            for d in derived_include_diagnostics(rt, uri)
+                emit!(d.range, :include_errors, d.message, d.uri, d.source)
+            end
         end
     end
 
     # Config/TOML diagnostics are filesystem-file only.
     if uri.scheme == "file"
         if (is_config_file || is_path_project_file(uri2filepath(uri)) || is_path_manifest_file(uri2filepath(uri))) && enabled(:toml_syntax_errors)
-            sev = severity_of(:toml_syntax_errors)
-            append!(results, Diagnostic(d.range, sev, d.message, d.uri, d.tags, d.source, :toml_syntax_errors)
-                    for d in derived_toml_syntax_diagnostics(rt, uri))
+            for d in derived_toml_syntax_diagnostics(rt, uri)
+                emit!(d.range, :toml_syntax_errors, d.message, d.uri, d.source)
+            end
+        end
+
+        # Environment-resolution failures are reported on the project file of
+        # the environment they were about — the closest file the user can act
+        # on. Whole-file range, like `config_diagnostic`.
+        if is_path_project_file(uri2filepath(uri)) && enabled(:environment_errors)
+            for message in derived_environment_error_messages(rt, uri)
+                emit!(1:1, :environment_errors, message, nothing, "JuliaWorkspaces.jl")
+            end
         end
 
         if is_config_file
@@ -314,9 +381,7 @@ Salsa.@derived function derived_diagnostics(rt, uri)
             # `shadowed_config`), so each keeps its own rule id and takes that
             # rule's configured severity rather than being flattened together.
             for d in config_diags
-                rule = d.code === nothing ? :config_errors : d.code
-                enabled(rule) || continue
-                push!(results, Diagnostic(d.range, severity_of(rule), d.message, d.uri, d.tags, d.source, rule))
+                emit!(d.range, d.code === nothing ? :config_errors : d.code, d.message, d.uri, d.source)
             end
         end
     end

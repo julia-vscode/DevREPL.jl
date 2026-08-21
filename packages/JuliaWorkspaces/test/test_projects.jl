@@ -25,8 +25,8 @@
     @test length(projects) == 0
 end
 
-@testitem "Manifest details" tags=[:skip] begin
-    using UUIDs, Pkg
+@testitem "Manifest details" begin
+    using UUIDs, Pkg, TOML
 
     old = Base.active_project()
     try
@@ -45,11 +45,18 @@ end
 
             project_details = JuliaWorkspaces.derived_project(jw.runtime, project_uri)
 
+            # The fixture ships no Manifest.toml, so `instantiate` resolves fresh
+            # against the registry every run. Compare against what Pkg just wrote
+            # rather than a pinned version — what this asserts is that our manifest
+            # parsing agrees with Pkg's, not which 0.3.x the registry currently has.
+            manifest = TOML.parsefile(joinpath(pkg_root, "Manifest.toml"))
+            juliasyntax = only(manifest["deps"]["JuliaSyntax"])
+
             @test haskey(project_details.regular_packages, "JuliaSyntax") === true
             @test project_details.regular_packages["JuliaSyntax"].name == "JuliaSyntax"
-            @test project_details.regular_packages["JuliaSyntax"].git_tree_sha1 == "e09bf943597f83cc7a1fe3ae6c01c2c008d8cde7"
+            @test project_details.regular_packages["JuliaSyntax"].git_tree_sha1 == juliasyntax["git-tree-sha1"]
             @test project_details.regular_packages["JuliaSyntax"].uuid == UUID("70703baa-626e-46a2-a12c-08ffd08c73b4")
-            @test project_details.regular_packages["JuliaSyntax"].version == "0.3.5"
+            @test project_details.regular_packages["JuliaSyntax"].version == juliasyntax["version"]
 
             @test haskey(project_details.stdlib_packages, "Dates") === true
             @test project_details.stdlib_packages["Dates"].name == "Dates"
@@ -176,6 +183,109 @@ end
 
     # A sibling prefix must not match: /nesting/libextra is not inside /nesting/lib
     @test derived_package_for_file(jw.runtime, URI("file:///nesting/libextra/Inner/src/Inner.jl")) == URI("file:///nesting")
+end
+
+@testitem "non-package manifest-less envs are classified disjointly and found for files" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText,
+        derived_package_folders, derived_project_folders, derived_nonpackage_env_folders,
+        derived_nonpackage_env, derived_nonpackage_env_for_file
+    using JuliaWorkspaces.URIs2: URI
+
+    package_project = """
+    name = "Pkg"
+    uuid = "3c9a1b52-1f0f-4a9e-9c7d-7a1e0b7d4c11"
+    version = "1.0.0"
+    """
+    env_project = """
+    [deps]
+    Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+    """
+    manifest = """
+    julia_version = "1.11.0"
+    manifest_format = "2.0"
+
+    [deps]
+    """
+
+    jw = JuliaWorkspace()
+    # /ws/Pkg: package without manifest; /ws/Pkg/docs: non-package env without
+    # manifest; /ws/Pkg/benchmark: non-package env WITH manifest (a project).
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/Project.toml"), SourceText(package_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/src/Pkg.jl"), SourceText("module Pkg end", "julia")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/docs/Project.toml"), SourceText(env_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/docs/make.jl"), SourceText("using Documenter", "julia")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/benchmark/Project.toml"), SourceText(env_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/benchmark/Manifest.toml"), SourceText(manifest, "toml")))
+
+    # The three classes are disjoint.
+    @test derived_package_folders(jw.runtime) == [URI("file:///ws/Pkg")]
+    @test derived_project_folders(jw.runtime) == [URI("file:///ws/Pkg/benchmark")]
+    @test derived_nonpackage_env_folders(jw.runtime) == [URI("file:///ws/Pkg/docs")]
+
+    env = derived_nonpackage_env(jw.runtime, URI("file:///ws/Pkg/docs"))
+    @test env !== nothing
+    @test env.project_file_uri == URI("file:///ws/Pkg/docs/Project.toml")
+    # A package folder or a project folder is never a non-package env.
+    @test derived_nonpackage_env(jw.runtime, URI("file:///ws/Pkg")) === nothing
+    @test derived_nonpackage_env(jw.runtime, URI("file:///ws/Pkg/benchmark")) === nothing
+
+    # Deepest-folder lookup, and sibling prefixes must not match.
+    @test derived_nonpackage_env_for_file(jw.runtime, URI("file:///ws/Pkg/docs/make.jl")) == URI("file:///ws/Pkg/docs")
+    @test derived_nonpackage_env_for_file(jw.runtime, URI("file:///ws/Pkg/src/Pkg.jl")) === nothing
+    @test derived_nonpackage_env_for_file(jw.runtime, URI("file:///ws/Pkg/docsx/make.jl")) === nothing
+    @test derived_nonpackage_env_for_file(jw.runtime, URI("untitled:Untitled-1")) === nothing
+end
+
+@testitem "a manifest-less non-package env owns its files once resolved and gates until then" begin
+    using JuliaWorkspaces: JuliaWorkspace, add_file!, TextFile, SourceText,
+        derived_nonpackage_env, derived_project_uri_for_root, derived_file_env_ready,
+        ResolveEnvironmentKey, set_input_resolved_environments!, set_input_failed_dynamic_keys!,
+        input_resolved_environments, derived_required_dynamic_projects, DJPKey
+    using JuliaWorkspaces.URIs2: URI, uri2filepath
+
+    package_project = """
+    name = "Pkg"
+    uuid = "3c9a1b52-1f0f-4a9e-9c7d-7a1e0b7d4c11"
+    version = "1.0.0"
+    """
+    env_project = """
+    [deps]
+    Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+    """
+
+    jw = JuliaWorkspace()
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/Project.toml"), SourceText(package_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/src/Pkg.jl"), SourceText("module Pkg end", "julia")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/docs/Project.toml"), SourceText(env_project, "toml")))
+    add_file!(jw, TextFile(URI("file:///ws/Pkg/docs/make.jl"), SourceText("using Documenter", "julia")))
+
+    docs_folder = URI("file:///ws/Pkg/docs")
+    make_jl = URI("file:///ws/Pkg/docs/make.jl")
+    env = derived_nonpackage_env(jw.runtime, docs_folder)
+    @test env !== nothing
+    # Match production key construction (uri2filepath uses `\` on Windows).
+    key = ResolveEnvironmentKey(uri2filepath(docs_folder), env.content_hash)
+
+    # The resolve work item is scheduled, so diagnostics for the file gate ...
+    @test key in derived_required_dynamic_projects(jw.runtime)
+    @test !derived_file_env_ready(jw.runtime, make_jl)
+    # ... and selection falls through (no resolved env yet, no active project).
+    @test derived_project_uri_for_root(jw.runtime, make_jl) === nothing
+    # A file of the enclosing package is unaffected by the pending env.
+    @test derived_file_env_ready(jw.runtime, URI("file:///ws/Pkg/src/Pkg.jl"))
+
+    # Once the resolved scratch project is recorded, it owns the file and
+    # readiness settles.
+    scratch = URI("file:///scratch/env-docs-1234")
+    set_input_resolved_environments!(jw.runtime, Dict(key => scratch))
+    @test derived_project_uri_for_root(jw.runtime, make_jl) == scratch
+    @test derived_file_env_ready(jw.runtime, make_jl)
+
+    # A terminal failure also settles readiness (best-effort diagnostics).
+    set_input_resolved_environments!(jw.runtime, Dict{ResolveEnvironmentKey,typeof(scratch)}())
+    set_input_failed_dynamic_keys!(jw.runtime, Set{DJPKey}([key]))
+    @test derived_file_env_ready(jw.runtime, make_jl)
+    @test derived_project_uri_for_root(jw.runtime, make_jl) === nothing
 end
 
 @testitem "derived_project with Manifest.toml but no Project.toml does not crash" begin

@@ -19,6 +19,8 @@ Details of a test item.
 - `option_default_imports`::Bool
 - option_tags::Vector{Symbol}
 - option_setup::Vector{Symbol}
+- `option_skip`::Union{Bool,String} — a literal `true`/`false`, or the source text of an
+  expression that the test process evaluates just before the test item would run.
 """
 struct TestItemDetail
     uri::URI
@@ -30,8 +32,9 @@ struct TestItemDetail
     option_default_imports::Bool
     option_tags::Vector{Symbol}
     option_setup::Vector{Symbol}
+    option_skip::Union{Bool,String}
 end
-_key(x::TestItemDetail) = (x.uri, x.id, x.name, x.code, _range_key(x.range), _range_key(x.code_range), x.option_default_imports, x.option_tags, x.option_setup)
+_key(x::TestItemDetail) = (x.uri, x.id, x.name, x.code, _range_key(x.range), _range_key(x.code_range), x.option_default_imports, x.option_tags, x.option_setup, x.option_skip)
 Base.:(==)(a::TestItemDetail, b::TestItemDetail) = _key(a) == _key(b)
 Base.isequal(a::TestItemDetail, b::TestItemDetail) = isequal(_key(a), _key(b))
 Base.hash(x::TestItemDetail, h::UInt) = hash(_key(x), hash(TestItemDetail, h))
@@ -113,6 +116,23 @@ Details of a Julia package.
     project_file_uri::URI
     name::String
     uuid::UUID
+    content_hash::UInt64
+end
+
+"""
+    struct JuliaNonPackageEnv
+
+A folder whose `Project.toml` is not a package (no name/uuid/version) and that
+has no `Manifest.toml` — e.g. a `docs/`, `benchmark/` or `scripts/` environment.
+Such an environment is treated as merely missing its manifest: a resolved copy
+is created in the scratch store via the dynamic analysis process and used as the
+environment for files under the folder.
+
+- `project_file_uri`::URI
+- `content_hash`::UInt64 — hash of the `Project.toml` text
+"""
+@auto_hash_equals struct JuliaNonPackageEnv
+    project_file_uri::URI
     content_hash::UInt64
 end
 
@@ -360,6 +380,36 @@ end
 
 SContext(dynamic_feature) = SContext(dynamic_feature, nothing)
 
+# Scratch.jl appends an entry to ~/.julia/logs/scratch_usage.toml on the first
+# get_scratch! of every process, without any locking. With many short-lived
+# processes hitting this at once (parallel test workers constructing
+# JuliaWorkspace) the append races Pkg.gc's non-atomic rewrite of the same
+# file and corrupts it. Let the append through at most once per day
+# machine-wide — a marker file inside the scratch dir carries the
+# cross-process state — and suppress it otherwise. The daily append is still
+# needed so Pkg.gc keeps considering the scratch space in use.
+function get_scratch_rate_limited(scratch_key)
+    marker = joinpath(first(Base.DEPOT_PATH), "scratchspaces",
+        string(Base.PkgId(@__MODULE__).uuid), scratch_key, ".usage_stamped")
+    stamped_recently = try
+        isfile(marker) && time() - mtime(marker) < 24 * 60 * 60
+    catch
+        false
+    end
+    if stamped_recently
+        return withenv("JULIA_SCRATCH_TRACK_ACCESS" => "0") do
+            Scratch.@get_scratch!(scratch_key)
+        end
+    else
+        path = Scratch.@get_scratch!(scratch_key)
+        try
+            touch(marker)
+        catch
+        end
+        return path
+    end
+end
+
 """
     struct JuliaWorkspace
 
@@ -425,7 +475,7 @@ struct JuliaWorkspace
             # Tie the local scratch store to the cache format version so a format
             # bump starts fresh instead of reading stale-format caches.
             scratch_key = "store_path_$(SymbolServer.CACHE_STORE_VERSION)"
-            store_path = Scratch.@get_scratch!(scratch_key)
+            store_path = get_scratch_rate_limited(scratch_key)
         end
         need_dynamic_feature = dynamic != DynamicOff || symbolcache_download
         dynamic_feature = need_dynamic_feature ? DynamicFeature(dynamic, store_path; download_enabled=symbolcache_download, upstream_url=symbolcache_upstream, progress_callback=progress_callback, max_concurrent_djps=max_concurrent_djps, max_failure_attempts=max_failure_attempts, djp_request_timeout_seconds=djp_request_timeout_seconds) : nothing
@@ -440,7 +490,9 @@ struct JuliaWorkspace
         set_input_ready_project_environments!(rt, Set{WatchEnvironmentKey}())
         set_input_ready_test_environments!(rt, Dict{WatchTestEnvironmentKey,URI}())
         set_input_standalone_projects!(rt, Dict{CreateStandaloneProjectKey,URI}())
+        set_input_resolved_environments!(rt, Dict{ResolveEnvironmentKey,URI}())
         set_input_failed_dynamic_keys!(rt, Set{DJPKey}())
+        set_input_dynamic_failure_messages!(rt, Dict{DJPKey,String}())
 
         new(rt, dynamic_feature)
     end
@@ -589,11 +641,15 @@ function process_from_dynamic(jw::JuliaWorkspace)
     ready_envs = copy(input_ready_project_environments(jw.runtime))
     ready_test_envs = copy(input_ready_test_environments(jw.runtime))
     standalone_projects = copy(input_standalone_projects(jw.runtime))
+    resolved_envs = copy(input_resolved_environments(jw.runtime))
     failed_keys = copy(input_failed_dynamic_keys(jw.runtime))
+    failure_messages = copy(input_dynamic_failure_messages(jw.runtime))
     envs_dirty = false
     test_envs_dirty = false
     standalone_dirty = false
+    resolved_dirty = false
     failed_dirty = false
+    messages_dirty = false
     saw_result = false
 
     while isready(df.out_channel)
@@ -615,6 +671,12 @@ function process_from_dynamic(jw::JuliaWorkspace)
             # register doesn't exist — so the key is only remembered as failed.
             push!(failed_keys, msg.key)
             failed_dirty = true
+            # An empty message means "skipped, nothing to report" (e.g. dynamic
+            # indexing disabled) — settle readiness without a user-facing entry.
+            if !isempty(msg.message)
+                failure_messages[msg.key] = msg.message
+                messages_dirty = true
+            end
             if msg.key isa WatchEnvironmentKey
                 push!(ready_envs, msg.key)
                 envs_dirty = true
@@ -656,6 +718,21 @@ function process_from_dynamic(jw::JuliaWorkspace)
             standalone_proj_hash = standalone_proj === nothing ? UInt64(0) : standalone_proj.content_hash
             push!(ready_envs, WatchEnvironmentKey(uri2filepath(msg.project_uri), standalone_proj_hash))
             envs_dirty = true
+
+        elseif msg isa ResolvedEnvironmentReadyResult
+            @info "Processing resolved environment" msg.env_folder_uri msg.project_uri
+
+            resolved_envs[ResolveEnvironmentKey(uri2filepath(msg.env_folder_uri), msg.content_hash)] = msg.project_uri
+            resolved_dirty = true
+
+            # Preload package caches and mark the scratch project's own
+            # environment ready, so the next get_diagnostics won't trigger
+            # another round.
+            _load_package_caches_for_project!(jw, msg.project_uri)
+            resolved_proj = derived_project(jw.runtime, msg.project_uri)
+            resolved_proj_hash = resolved_proj === nothing ? UInt64(0) : resolved_proj.content_hash
+            push!(ready_envs, WatchEnvironmentKey(uri2filepath(msg.project_uri), resolved_proj_hash))
+            envs_dirty = true
         else
             error("Unknown message: $msg")
         end
@@ -664,7 +741,9 @@ function process_from_dynamic(jw::JuliaWorkspace)
     envs_dirty && set_input_ready_project_environments!(jw.runtime, ready_envs)
     test_envs_dirty && set_input_ready_test_environments!(jw.runtime, ready_test_envs)
     standalone_dirty && set_input_standalone_projects!(jw.runtime, standalone_projects)
+    resolved_dirty && set_input_resolved_environments!(jw.runtime, resolved_envs)
     failed_dirty && set_input_failed_dynamic_keys!(jw.runtime, failed_keys)
+    messages_dirty && set_input_dynamic_failure_messages!(jw.runtime, failure_messages)
     saw_result && (df.saw_result[] = true)
 
     return
