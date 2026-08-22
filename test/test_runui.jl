@@ -64,7 +64,7 @@ end
 
 # Without a TTY there are no keypresses, so the watch simply runs to completion.
 @testitem "_watch_run returns :completed when the run finishes" begin
-    using TestItemControllers.CancellationTokens: CancellationTokenSource
+    using TestItemRuns.CancellationTokens: CancellationTokenSource
     task = Threads.@spawn (sleep(0.1); :ok)
     pres = DevREPL.RunPresentation(:none)
     @test DevREPL._watch_run(task, CancellationTokenSource(), pres) === :completed
@@ -100,7 +100,7 @@ end
 # was indistinguishable from a successful one in `test history`. Cancellation
 # returns normally from the controller, so only the token can tell them apart.
 @testitem "a cancelled run is recorded as cancelled" setup=[ReplHelper] begin
-    using TestItemControllers.CancellationTokens: CancellationTokenSource, cancel
+    using TestItemRuns.CancellationTokens: CancellationTokenSource, cancel
     cts = CancellationTokenSource()
     cancel(cts)   # already cancelled before it starts: no waiting, same code path
     DevREPL.run_tests(ReplHelper.PRECOMPILEDATA;
@@ -108,19 +108,20 @@ end
                       presentation=DevREPL.RunPresentation(:none), max_workers=1)
     rec = first(DevREPL.get_run_history())
     @test rec.status === :cancelled
-    @test rec.end_time !== nothing          # so history can show a duration
+    @test rec.finished_at !== nothing       # so history can show a duration
 end
 
-@testitem "a run that throws is recorded as errored" setup=[ReplHelper] begin
+@testitem "a run that throws leaves no stranded record" setup=[ReplHelper] begin
+    # A filter that throws fails during discovery, before a run exists: the error
+    # surfaces to the caller and the history gains no record stuck at :running.
+    n_before = length(DevREPL.get_run_history())
     @test_throws Exception DevREPL.run_tests(
         ReplHelper.PRECOMPILEDATA;
         filter = _ -> error("boom"),
         presentation=DevREPL.RunPresentation(:none))
-    rec = first(DevREPL.get_run_history())
-    @test rec.status === :errored
-    # Left at :running it would be un-prunable, since _prune_history! skips
-    # running records — every failure would leak into the history forever.
-    @test rec.end_time !== nothing
+    history = DevREPL.get_run_history()
+    @test length(history) == n_before
+    @test all(r.status !== :running for r in history)
 end
 
 @testitem "a normal run is recorded as completed" setup=[ReplHelper] begin
@@ -128,22 +129,17 @@ end
                       presentation=DevREPL.RunPresentation(:none), max_workers=1)
     rec = first(DevREPL.get_run_history())
     @test rec.status === :completed
-    @test rec.end_time !== nothing
+    @test rec.finished_at !== nothing
 end
 
-@testitem "errored runs can be pruned" setup=[ReplHelper] begin
-    runner = DevREPL.get_runner()
-    rec = DevREPL.TestrunRecord("zz", time(), time(), :errored, nothing, "p", nothing)
-    lock(runner.lock) do
-        pushfirst!(runner.run_history, rec)
-    end
-    # findlast over a non-:running status must be able to see it.
-    @test any(r -> r.status === :errored, DevREPL.get_run_history())
-    lock(runner.lock) do
-        idx = findlast(r -> r.status != :running, runner.run_history)
-        @test idx !== nothing
-        deleteat!(runner.run_history, findfirst(r -> r.id == "zz", runner.run_history))
-    end
+@testitem "run history exposes TestItemRuns runs" setup=[ReplHelper] begin
+    id = DevREPL.run_tests(ReplHelper.PRECOMPILEDATA;
+                           presentation=DevREPL.RunPresentation(:none), max_workers=1)
+    history = DevREPL.get_run_history()
+    @test history[1] isa DevREPL.TestRun
+    @test history[1].id == id
+    @test DevREPL._run_path(history[1]) == ReplHelper.PRECOMPILEDATA
+    @test DevREPL.get_run_result(id) === history[1].result
 end
 
 @testitem "attach with no background run" setup=[ReplHelper] begin

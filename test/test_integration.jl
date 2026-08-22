@@ -12,7 +12,7 @@
         # The failing item carries a message with a location
         fail_item = only(ti for ti in result.testitems if ti.name == "precompile fail")
         msgs = fail_item.profiles[1].messages
-        @test msgs !== missing && !isempty(msgs)
+        @test msgs !== nothing && !isempty(msgs)
         @test msgs[1].line > 0
 
         # 'test failed' can compute the failing selection from this run
