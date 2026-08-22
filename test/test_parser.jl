@@ -106,3 +106,19 @@ end
     out = ReplHelper.run_command("test run $(ReplHelper.PRECOMPILEDATA) --name=pass")
     @test occursin("1 tests ran", out)
 end
+
+# The timeout is opt-in: how long a test item legitimately takes is not something
+# DevREPL can know, and a fired timeout kills the test process and errors the item.
+@testitem "--timeout is opt-in and accepts an opt-out spelling" begin
+    @test DevREPL._parse_timeout("30") == 30.0
+    @test DevREPL._parse_timeout("2.5") == 2.5
+    @test DevREPL._parse_timeout("none") === nothing
+    @test DevREPL._parse_timeout("off") === nothing
+    @test_throws ArgumentError DevREPL._parse_timeout("0")
+    @test_throws ArgumentError DevREPL._parse_timeout("-5")
+    @test_throws ArgumentError DevREPL._parse_timeout("soon")
+
+    # Absent the flag, no deadline reaches the work units at all.
+    _, run_kwargs = DevREPL._build_run_kwargs(String[])
+    @test !haskey(run_kwargs, :timeout)
+end

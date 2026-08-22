@@ -740,7 +740,7 @@ function _run_tests(
             filter=nothing,
             filter_description::Union{Nothing,String}=nothing,
             max_workers::Int=min(Sys.CPU_THREADS, 8),
-            timeout=60*5,
+            timeout=nothing,
             fail_on_detection_error=true,
             return_results=false,
             print_failed_results=true,
@@ -871,6 +871,7 @@ function _run_tests(
             profiles_by_env_id = Dict{String,RunProfile}()
             env_id_by_key = Dict{Any,String}()
             work_units = TestItemControllers.TestRunItem[]
+            item_timeout = timeout === nothing ? nothing : Float64(timeout)
 
             for i in testitems
                 textfile = JuliaWorkspaces.get_text_file(jw, i.uri)
@@ -911,7 +912,7 @@ function _run_tests(
                         profiles_by_env_id[new_id] = profile
                         new_id
                     end
-                    push!(work_units, TestItemControllers.TestRunItem(item.id, env_id, Float64(timeout), :Info))
+                    push!(work_units, TestItemControllers.TestRunItem(item.id, env_id, item_timeout, :Info))
                 end
             end
 
@@ -1341,7 +1342,7 @@ function _print_test_commands()
     println("  --name=<pattern>                Filter by test item name (substring, case-insensitive)")
     println("  --tags=t1,t2                    Filter by tags")
     println("  --workers=N                     Max parallel workers (default: shared across active runs)")
-    println("  --timeout=S                     Timeout in seconds (default: 300)")
+    println("  --timeout=S|none                Per-test-item timeout in seconds (default: none)")
     println("  --coverage                      Enable coverage")
     println("  +channel                        Run using a Juliaup channel, e.g. +lts")
     printstyled("\n  Results flags:\n"; bold=true)
@@ -1686,6 +1687,20 @@ function cmd_failures()
     end
 end
 
+"""
+    _parse_timeout(value::AbstractString)
+
+Parse a `--timeout=` value into seconds, or `nothing` for `none`/`off`.
+Throws an `ArgumentError` whose message `cmd_run` prints as-is.
+"""
+function _parse_timeout(value::AbstractString)
+    value in ("none", "off") && return nothing
+    seconds = tryparse(Float64, value)
+    (seconds === nothing || !isfinite(seconds) || seconds <= 0) &&
+        throw(ArgumentError("invalid value for --timeout: $value (expected a positive number of seconds, or \"none\")"))
+    return seconds
+end
+
 function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{Nothing,String}=nothing)
     positional, kwargs, flags = parse_args(args)
     path = nothing
@@ -1728,7 +1743,7 @@ function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{No
         run_kwargs[:max_workers] = parse(Int, kwargs[:workers])
     end
     if haskey(kwargs, :timeout)
-        run_kwargs[:timeout] = parse(Int, kwargs[:timeout])
+        run_kwargs[:timeout] = _parse_timeout(kwargs[:timeout])
     end
     if :coverage in flags
         run_kwargs[:environments] = [RunProfile("Default", true, Dict{String,Any}())]
