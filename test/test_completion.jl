@@ -26,7 +26,11 @@ end
 
 @testitem "flag completions" begin
     m, _ = DevREPL._devrepl_completions("test run --")
-    @test Set(m) == Set(["--name=", "--tags=", "--workers=", "--timeout=", "--coverage", "--bg"])
+    @test Set(m) == Set(["--name=", "--tags=", "--packages=", "--exclude-packages=",
+        "--workers=", "--timeout=", "--coverage", "--bg"])
+
+    m, _ = DevREPL._devrepl_completions("test list --")
+    @test Set(m) == Set(["--tags=", "--packages=", "--exclude-packages="])
 
     m, _ = DevREPL._devrepl_completions("test results --")
     @test Set(m) == Set(["--name=", "--verbose", "--output"])

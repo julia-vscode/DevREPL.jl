@@ -52,7 +52,9 @@ Every test command takes a subcommand; `t` is a shorthand for `test`.
 | `lint [path]` | Lint a folder (respects `JuliaLint.toml`) |
 | `format [path]` | Format a file or folder in place |
 
-Run flags: `--name=`, `--tags=`, `--workers=`, `--timeout=`, `--coverage`, `--bg`, and `+channel` for a Juliaup channel.
+Run flags: `--name=`, `--tags=`, `--packages=`, `--exclude-packages=`, `--workers=`, `--timeout=`, `--coverage`, `--bg`, and `+channel` for a Juliaup channel.
+
+Discovery is a folder walk, so `test` at the root of a monorepo or a Pkg `[workspace]` runs every package below it, each in its own test environment. `--packages=A,B` narrows that to the members you are working on, which also avoids activating and precompiling the rest.
 
 ## License
 

@@ -106,6 +106,85 @@ end
     @test occursin("1 tests ran", out)
 end
 
+# Discovery is a folder walk, so `test` at the root of a monorepo or a Pkg `[workspace]`
+# covers every package below it. `--packages` is how a run is narrowed back to one member
+# without paying to activate and precompile the others.
+@testitem "--packages and --exclude-packages select by package" begin
+    item(pkg) = (filename="f.jl", name="n", tags=Symbol[], package_name=pkg)
+
+    @test DevREPL._package_filter(Dict{Symbol,String}()) == (nothing, nothing)
+
+    include_only, description = DevREPL._package_filter(Dict(:packages => "A,B"))
+    @test include_only(item("A"))
+    @test include_only(item("B"))
+    @test !include_only(item("C"))
+    # Package names are case sensitive, and an item belonging to no package is not "A".
+    @test !include_only(item("a"))
+    @test !include_only(item(""))
+    @test occursin("packages A, B", description)
+
+    exclude_only, description = DevREPL._package_filter(Dict(Symbol("exclude-packages") => "C"))
+    @test exclude_only(item("A"))
+    @test !exclude_only(item("C"))
+    # Without --packages, an item belonging to no package still runs.
+    @test exclude_only(item(""))
+    @test occursin("not packages C", description)
+
+    # Include first, then exclude.
+    both, _ = DevREPL._package_filter(Dict(:packages => "A,B", Symbol("exclude-packages") => "B"))
+    @test both(item("A"))
+    @test !both(item("B"))
+    @test !both(item("C"))
+
+    # An empty entry is a typo, not "no package".
+    @test_throws ArgumentError DevREPL._package_filter(Dict(:packages => "A,,B"))
+    @test_throws ArgumentError DevREPL._package_filter(Dict(:packages => ""))
+    @test_throws ArgumentError DevREPL._package_filter(Dict(Symbol("exclude-packages") => "A,"))
+end
+
+@testitem "_build_run_kwargs composes the package selection with the other filters" begin
+    item(; name="n", pkg="A", tags=Symbol[]) = (filename="f.jl", name=name, tags=tags, package_name=pkg)
+
+    _, run_kwargs = DevREPL._build_run_kwargs(String["--packages=A"])
+    @test run_kwargs[:filter](item(pkg="A"))
+    @test !run_kwargs[:filter](item(pkg="B"))
+    @test occursin("packages A", run_kwargs[:filter_description])
+
+    # Every given criterion has to hold, and the description names all of them.
+    _, run_kwargs = DevREPL._build_run_kwargs(String["--packages=A", "--name=slow"])
+    @test run_kwargs[:filter](item(name="slow one", pkg="A"))
+    @test !run_kwargs[:filter](item(name="slow one", pkg="B"))
+    @test !run_kwargs[:filter](item(name="fast one", pkg="A"))
+    @test occursin("name \"slow\"", run_kwargs[:filter_description])
+    @test occursin("packages A", run_kwargs[:filter_description])
+
+    # Absent the flags, no filter is installed at all.
+    _, run_kwargs = DevREPL._build_run_kwargs(String[])
+    @test !haskey(run_kwargs, :filter)
+end
+
+@testitem "--packages reaches a real run" setup=[ReplHelper] begin
+    out = ReplHelper.run_command("test run $(ReplHelper.PRECOMPILEDATA) --packages=PrecompileData --name=pass")
+    @test occursin("1 tests ran", out)
+
+    # A package that is not there selects nothing, and says so rather than looking like a
+    # clean run of an empty suite.
+    out = ReplHelper.run_command("test run $(ReplHelper.PRECOMPILEDATA) --packages=NoSuchPackage")
+    @test occursin("No test item matched the filter", out)
+    @test occursin("packages NoSuchPackage", out)
+end
+
+@testitem "test list honours --packages" setup=[ReplHelper] begin
+    out = ReplHelper.run_command("test list $(ReplHelper.PRECOMPILEDATA) --packages=PrecompileData")
+    @test occursin("precompile pass", out)
+
+    out = ReplHelper.run_command("test list $(ReplHelper.PRECOMPILEDATA) --packages=NoSuchPackage")
+    @test occursin("No test items found", out)
+
+    out = ReplHelper.run_command("test list $(ReplHelper.PRECOMPILEDATA) --packages=A,,B")
+    @test occursin("empty package name", out)
+end
+
 # The timeout is opt-in: how long a test item legitimately takes is not something
 # DevREPL can know, and a fired timeout kills the test process and errors the item.
 @testitem "--timeout is opt-in and accepts an opt-out spelling" begin

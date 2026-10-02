@@ -682,6 +682,49 @@ function parse_args(parts)
     return positional, kwargs, flags
 end
 
+# One `--packages`-style value: comma separated names. An empty entry is rejected rather
+# than ignored, because it is always a typo and dropping it would widen the selection.
+function _package_names(kwargs, key::Symbol)
+    haskey(kwargs, key) || return nothing
+    value = kwargs[key]
+    names = String[strip(p) for p in split(value, ',')]
+    any(isempty, names) && throw(ArgumentError("invalid value for --$key: $value (empty package name)"))
+    return Set(names)
+end
+
+"""
+    _package_filter(kwargs) -> (predicate, description)
+
+The `--packages` / `--exclude-packages` selection as an `item -> Bool` predicate plus a
+short description of it, or `(nothing, nothing)` when neither was given. The predicate only
+reads `package_name`, so it works on a `TestItem` and on the NamedTuple a run filter sees
+alike.
+
+Names match exactly and case sensitively, as Julia package names are, and `--packages` is
+applied before `--exclude-packages`. A test item that belongs to no package has an empty
+`package_name` and so is never selected by `--packages` — asking for a named package must
+not drag in items that have none.
+
+This is the knob for a monorepo or a Pkg `[workspace]`: discovery is a folder walk, so a run
+rooted at the workspace covers every package below it, each in its own test environment, and
+narrowing to one member is what avoids activating and precompiling the rest.
+"""
+function _package_filter(kwargs)
+    included = _package_names(kwargs, :packages)
+    excluded = _package_names(kwargs, Symbol("exclude-packages"))
+    included === nothing && excluded === nothing && return nothing, nothing
+
+    predicate = function (item)
+        included === nothing || item.package_name in included || return false
+        return excluded === nothing || !(item.package_name in excluded)
+    end
+
+    parts = String[]
+    included === nothing || push!(parts, "packages $(join(sort!(collect(included)), ", "))")
+    excluded === nothing || push!(parts, "not packages $(join(sort!(collect(excluded)), ", "))")
+    return predicate, join(parts, " and ")
+end
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 """
@@ -712,6 +755,8 @@ function _print_test_commands()
     printstyled("\n  Run flags:\n"; bold=true)
     println("  --name=<pattern>                Filter by test item name (substring, case-insensitive)")
     println("  --tags=t1,t2                    Filter by tags")
+    println("  --packages=A,B                  Only test items of these packages (monorepo/workspace)")
+    println("  --exclude-packages=C            Skip these packages' test items")
     println("  --workers=N                     Max parallel workers (default: shared across active runs)")
     println("  --timeout=S|none                Per-test-item timeout in seconds (default: none)")
     println("  --coverage                      Enable coverage")
@@ -755,9 +800,22 @@ function cmd_list(args)
         nothing
     end
 
+    # Same selection as `test run`, so listing and running agree about what `--packages`
+    # means in a monorepo.
+    pkg_filter = try
+        first(_package_filter(kwargs))
+    catch e
+        printstyled("Error: "; color=:red, bold=true)
+        println(e.msg)
+        return nothing
+    end
+
     count = 0
     for item in d
         if tag_filter !== nothing && isempty(intersect(Set(item.tags), tag_filter))
+            continue
+        end
+        if pkg_filter !== nothing && !pkg_filter(item)
             continue
         end
         tags_str = isempty(item.tags) ? "" : " [$(join(item.tags, ", "))]"
@@ -1110,7 +1168,9 @@ function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{No
         nothing
     end
 
-    if tag_filter !== nothing || name_filter !== nothing
+    pkg_filter, pkg_description = _package_filter(kwargs)
+
+    if tag_filter !== nothing || name_filter !== nothing || pkg_filter !== nothing
         run_kwargs[:filter] = function(info)
             if name_filter !== nothing && !contains(lowercase(string(info.name)), lowercase(name_filter))
                 return false
@@ -1118,11 +1178,15 @@ function _build_run_kwargs(args; return_results=false, juliaup_channel::Union{No
             if tag_filter !== nothing && isempty(intersect(Set(info.tags), tag_filter))
                 return false
             end
+            if pkg_filter !== nothing && !pkg_filter(info)
+                return false
+            end
             return true
         end
         parts = String[]
         name_filter !== nothing && push!(parts, "name \"$name_filter\"")
         tag_filter !== nothing && push!(parts, "tags $(join(sort!(string.(collect(tag_filter))), ", "))")
+        pkg_description === nothing || push!(parts, pkg_description)
         run_kwargs[:filter_description] = join(parts, " and ")
     end
 
@@ -2198,7 +2262,8 @@ struct DevREPLCompletionProvider <: REPL.LineEdit.CompletionProvider end
 const _TOP_COMMANDS = ["test", "lint", "format", "help"]
 const _TEST_SUBCOMMANDS = ["run", "pick", "failed", "repeat", "list", "results",
     "failures", "history", "status", "attach", "cancel", "procs", "kill", "log"]
-const _TEST_RUN_FLAGS = ["--name=", "--tags=", "--workers=", "--timeout=", "--coverage", "--bg"]
+const _TEST_RUN_FLAGS = ["--name=", "--tags=", "--packages=", "--exclude-packages=",
+    "--workers=", "--timeout=", "--coverage", "--bg"]
 const _RESULTS_FLAGS = ["--name=", "--verbose", "--output"]
 
 function _juliaup_channel_names()
@@ -2257,7 +2322,7 @@ function _devrepl_completions(partial::AbstractString)
             elseif sub == "history"
                 cands = ["--active"]
             elseif sub in ("list", "ls", "pick")
-                cands = startswith(cur, "--") ? ["--tags="] : _complete_dirs(cur)
+                cands = startswith(cur, "--") ? ["--tags=", "--packages=", "--exclude-packages="] : _complete_dirs(cur)
             else
                 cands = String[]
             end
